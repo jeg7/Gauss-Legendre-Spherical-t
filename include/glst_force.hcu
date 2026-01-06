@@ -1,0 +1,120 @@
+// BEGINLICENSE
+//
+// This file is part of Gauss-Legendre-Spherical-t, which is distributed under
+// the BSD 3-clause license, as described in the LICENSE file in the top level
+// directory of this project.
+//
+// Author: James E. Gonzales II
+//
+// ENDLICENSE
+
+#ifndef __GLST_GLST_FORCE__
+#define __GLST_GLST_FORCE__
+
+#include "atom_packet.hcu"
+#include "cubature.hcu"
+#include "cuda_container.hcu"
+#include <memory>
+#include <vector>
+
+class glst_force {
+public: // Constructors and destructors
+  glst_force(void);
+  glst_force(const unsigned int natom, const double tol, const double box_dim_x,
+             const double box_dim_y, const double box_dim_z, const double rcut);
+  glst_force(const unsigned int natom, const double tol, const double box_dim_x,
+             const double box_dim_y, const double box_dim_z,
+             const unsigned int ncell_x, const unsigned int ncell_y,
+             const unsigned int ncell_z);
+  ~glst_force(void);
+
+public:
+  const std::vector<cuda_container<double>> &fx(void) const;
+  const std::vector<cuda_container<double>> &fy(void) const;
+  const std::vector<cuda_container<double>> &fz(void) const;
+  const std::vector<cuda_container<double>> &en(void) const;
+  std::vector<cuda_container<double>> &fx(void);
+  std::vector<cuda_container<double>> &fy(void);
+  std::vector<cuda_container<double>> &fz(void);
+  std::vector<cuda_container<double>> &en(void);
+  void get_ef(cuda_container<double> &fx, cuda_container<double> &fy,
+              cuda_container<double> &fz, cuda_container<double> &en);
+
+public: // Initiialization
+  void init(const unsigned int natom, const double tol, const double box_dim_x,
+            const double box_dim_y, const double box_dim_z, const double rcut);
+
+public: // Energy and force calculation
+  void assign_atoms(const double *d_rx, const double *d_ry, const double *d_rz,
+                    const double *d_qc);
+  void calc_sf(void);
+  void sum_rmt_sf(void);
+  void calc_lr_ef(void);
+  void calc_sr_ef(void);
+  void calc_ener_force(const double *d_rx, const double *d_ry,
+                       const double *d_rz, const double *d_qc);
+
+private:
+  void init_alpha_groups(std::vector<unsigned int> &ncell_alpha_group,
+                         std::vector<double> &rmax, std::vector<double> &alpha,
+                         std::vector<double> &zcut, const double tol);
+  void
+  init_cell_nghbr_lists(const std::vector<unsigned int> &ncell_alpha_group);
+
+private:
+  void allocate(void);
+  void deallocate(void);
+
+private:
+  unsigned int natom_;
+  std::vector<cuda_container<unsigned int>> idx_;
+  std::vector<cuda_container<unsigned int>> sorted_idx_;
+  std::vector<cuda_container<double>> rx_;
+  std::vector<cuda_container<double>> ry_;
+  std::vector<cuda_container<double>> rz_;
+  std::vector<cuda_container<double>> qc_;
+  std::vector<cuda_container<atom_packet>> packets_;
+  std::vector<cuda_container<atom_packet>> sorted_packets_;
+  std::vector<cuda_container<double>> fx_;
+  std::vector<cuda_container<double>> fy_;
+  std::vector<cuda_container<double>> fz_;
+  std::vector<cuda_container<double>> en_;
+  std::vector<cuda_container<unsigned int>> atom_cell_idx_;
+  std::vector<cuda_container<unsigned int>> atom_cell_sorted_idx_;
+
+  unsigned int ncell_x_;
+  unsigned int ncell_y_;
+  unsigned int ncell_z_;
+  unsigned int ncell_;
+  double cell_dim_x_;
+  double cell_dim_y_;
+  double cell_dim_z_;
+
+  unsigned int ngroup_;
+  std::vector<cuda_container<unsigned int>> dir_nghbr_point_;
+  std::vector<cuda_container<unsigned int>> dir_nghbr_count_;
+  std::vector<cuda_container<unsigned int>> dir_nghbr_list_;
+  std::vector<cuda_container<unsigned int>> rmt_nghbr_point_;
+  std::vector<cuda_container<unsigned int>> rmt_nghbr_count_;
+  std::vector<cuda_container<unsigned int>> rmt_nghbr_group_;
+  std::vector<cuda_container<unsigned int>> rmt_nghbr_list_;
+
+  std::unique_ptr<cubature> cubature_;
+
+  std::vector<cuda_container<unsigned int>> cell_atom_point_;
+  std::vector<cuda_container<unsigned int>> cell_atom_count_;
+  std::vector<cuda_container<double>> sf_re_;
+  std::vector<cuda_container<double>> sf_im_;
+  std::vector<cuda_container<double>> rmt_sum_re_;
+  std::vector<cuda_container<double>> rmt_sum_im_;
+
+  std::vector<std::vector<cudaStream_t>> cell_stream_;
+
+  std::vector<void *> cub_work_buffer_;
+  std::vector<std::size_t> cub_work_buffer_size_;
+
+  int cuda_count_;
+  std::vector<int> cell_dev_idx_;
+};
+
+#endif

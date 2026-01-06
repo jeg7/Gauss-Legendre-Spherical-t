@@ -1,0 +1,30 @@
+// BEGINLICENSE
+//
+// This file is part of Gauss-Legendre-Spherical-t, which is distributed under
+// the BSD 3-clause license, as described in the LICENSE file in the top level
+// directory of this project.
+//
+// Author: James E. Gonzales II
+//
+// ENDLICENSE
+
+#ifndef __GLST_ATOM_PACKET__
+#define __GLST_ATOM_PACKET__
+
+#include <cstddef>
+
+struct atom_packet {
+public:
+  __device__ __host__ atom_packet(void)
+      : i(0), x(0.0), y(0.0), z(0.0), q(0.0) {}
+  __device__ __host__ atom_packet(const unsigned int id, const double rx,
+                                  const double ry, const double rz,
+                                  const double qc)
+      : i(id), x(rx), y(ry), z(rz), q(qc) {}
+
+public:
+  unsigned int i;
+  double x, y, z, q;
+};
+
+#endif

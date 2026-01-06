@@ -1,0 +1,91 @@
+// BEGINLICENSE
+//
+// This file is part of Gauss-Legendre-Spherical-t, which is distributed under
+// the BSD 3-clause license, as described in the LICENSE file in the top level
+// directory of this project.
+//
+// Author: James E. Gonzales II, Wonmuk Hwang
+//
+// ENDLICENSE
+
+#ifndef __GLST_CUBATURE__
+#define __GLST_CUBATURE__
+
+#include "cuda_container.hcu"
+#include <array>
+#include <string>
+#include <vector>
+
+class cubature {
+public:
+  cubature(void);
+  cubature(const double tol, const unsigned int nalpha,
+           const std::vector<double> &rmax, const std::vector<double> &alpha,
+           const std::vector<double> &zcut);
+
+public:
+  unsigned int num_cubatures(void) const;
+  unsigned int tot_num_nodes(void) const;
+  const std::vector<cuda_container<unsigned int>> &points(void) const;
+  const std::vector<cuda_container<unsigned int>> &num_nodes(void) const;
+  const std::vector<cuda_container<double>> &nodes_x(void) const;
+  const std::vector<cuda_container<double>> &nodes_y(void) const;
+  const std::vector<cuda_container<double>> &nodes_z(void) const;
+  const std::vector<cuda_container<double>> &weights(void) const;
+
+public:
+  void initialize(const double tol, const unsigned int nalpha,
+                  const std::vector<double> &rmax,
+                  const std::vector<double> &alpha,
+                  const std::vector<double> &zcut);
+
+private: // Gauss-Legendre related methods
+  void eval_legendre_poly(double &p, double &dpdx, const double x,
+                          const unsigned int n);
+  void get_wgl(std::vector<double> &wgl, const std::vector<double> &xgl,
+               const unsigned int n);
+  double eval_legendre_root(const double x0, const unsigned int n);
+  void get_xgl(std::vector<double> &xgl, const unsigned int n);
+  void get_gauss_legendre(unsigned int &ngl, unsigned int &ngl0,
+                          std::vector<double> &xgl, std::vector<double> &wgl,
+                          const double tol, const double dist,
+                          const double alpha, const double zcut);
+  void assign_gauss_legendre_quadratures(
+      std::vector<unsigned int> &ngl0, std::vector<std::vector<double>> &xgl,
+      std::vector<std::vector<double>> &wgl, const double tol,
+      const unsigned int nalpha, const std::vector<double> &rmax,
+      const std::vector<double> &alpha, const std::vector<double> &zcut);
+
+private: // Spherical t-design related methods
+  void read_tdesign(std::vector<std::array<double, 3>> &sm,
+                    const std::string &tfname);
+  void get_tdesign_props(std::string &tfname, unsigned int &m,
+                         const unsigned tdeg, const std::string &dir);
+  void get_spherical_tdesign(std::vector<std::array<double, 3>> &sm,
+                             const unsigned int ngl0,
+                             const std::vector<double> &xgl,
+                             const std::vector<double> &wgl, const double tol,
+                             const double dist, const double alpha,
+                             const double zcut);
+  void assign_spherical_tdesigns(
+      std::vector<std::vector<std::array<double, 3>>> &sm,
+      const std::vector<unsigned int> &ngl0,
+      const std::vector<std::vector<double>> &xgl,
+      const std::vector<std::vector<double>> &wgl, const double tol,
+      const unsigned int nalpha, const std::vector<double> &rmax,
+      const std::vector<double> &alpha, const std::vector<double> &zcut);
+
+private:
+  unsigned int num_cubatures_;
+  unsigned int tot_num_nodes_;
+  std::vector<cuda_container<unsigned int>> points_;
+  std::vector<cuda_container<unsigned int>> num_nodes_;
+  std::vector<cuda_container<double>> nodes_x_;
+  std::vector<cuda_container<double>> nodes_y_;
+  std::vector<cuda_container<double>> nodes_z_;
+  std::vector<cuda_container<double>> weights_;
+
+  int cuda_count_;
+};
+
+#endif

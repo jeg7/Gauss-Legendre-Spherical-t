@@ -30,3 +30,11 @@
 *.exe
 *.out
 *.app
+
+*.json
+data/
+SS31-Mar-2016
+clean.sh
+compile.sh
+run.sh
+build/

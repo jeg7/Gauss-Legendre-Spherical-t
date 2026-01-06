@@ -1,0 +1,77 @@
+// BEGINLICENSE
+//
+// This file is part of Gauss-Legendre-Spherical-t, which is distributed under
+// the BSD 3-clause license, as described in the LICENSE file in the top level
+// directory of this project.
+//
+// Author: James E. Gonzales II
+//
+// ENDLICENSE
+
+#ifndef __GLST_DEVICE_VECTOR__
+#define __GLST_DEVICE_VECTOR__
+
+#include "atom_packet.hcu"
+#include <cstddef>
+
+template <typename T> class device_vector {
+public: // Member functions
+  device_vector(void);
+  device_vector(const std::size_t count);
+  device_vector(const device_vector<T> &other);
+  device_vector(const device_vector<T> &&other);
+
+  ~device_vector(void);
+
+  device_vector<T> &operator=(const device_vector<T> &other);
+  device_vector<T> &operator=(const device_vector<T> &&other);
+
+public: // Element access
+  const T *data(void) const;
+  T *data(void);
+
+public: // Capacity
+  bool empty(void) const;
+  std::size_t size(void) const;
+  std::size_t capacity(void) const;
+  void shrink_to_fit(void);
+
+public: // Modifiers
+  void clear(void);
+  void push_back(const T &value);
+  void resize(const std::size_t count);
+  void swap(device_vector<T> &other);
+
+private:
+  void allocate(const std::size_t count);
+  void reallocate(const std::size_t count);
+  void deallocate(void);
+
+private:
+  std::size_t size_;
+  std::size_t capacity_;
+  T *data_;
+};
+
+template class device_vector<int>;
+template class device_vector<int2>;
+template class device_vector<int3>;
+template class device_vector<int4>;
+template class device_vector<unsigned int>;
+template class device_vector<float>;
+template class device_vector<float2>;
+template class device_vector<float3>;
+template class device_vector<float4>;
+template class device_vector<long long int>;
+template class device_vector<longlong2>;
+template class device_vector<longlong3>;
+template class device_vector<longlong4>;
+template class device_vector<unsigned long long int>;
+template class device_vector<std::size_t>;
+template class device_vector<double>;
+template class device_vector<double2>;
+template class device_vector<double3>;
+template class device_vector<double4>;
+template class device_vector<atom_packet>;
+
+#endif

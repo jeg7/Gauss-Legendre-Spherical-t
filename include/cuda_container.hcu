@@ -1,0 +1,89 @@
+// BEGINLICENSE
+//
+// This file is part of Gauss-Legendre-Spherical-t, which is distributed under
+// the BSD 3-clause license, as described in the LICENSE file in the top level
+// directory of this project.
+//
+// Author: James E. Gonzales II
+//
+// ENDLICENSE
+
+#ifndef __GLST_CUDA_CONTAINER__
+#define __GLST_CUDA_CONTAINER__
+
+#include "atom_packet.hcu"
+#include "device_vector.hcu"
+#include <vector>
+
+template <typename T> class cuda_container {
+public: // Member functions
+  cuda_container(void);
+  cuda_container(const std::size_t count);
+  cuda_container(const std::vector<T> &other);
+  cuda_container(const std::vector<T> &&other);
+  cuda_container(const device_vector<T> &other);
+  cuda_container(const device_vector<T> &&other);
+  cuda_container(const cuda_container<T> &other);
+  cuda_container(const cuda_container<T> &&other);
+
+  cuda_container<T> &operator=(const std::vector<T> &other);
+  cuda_container<T> &operator=(const std::vector<T> &&other);
+  cuda_container<T> &operator=(const device_vector<T> &other);
+  cuda_container<T> &operator=(const device_vector<T> &&other);
+  cuda_container<T> &operator=(const cuda_container<T> &other);
+  cuda_container<T> &operator=(const cuda_container<T> &&other);
+
+public: // Element access
+  const T &at(const std::size_t pos) const;
+  T &at(const std::size_t pos);
+
+  const T &operator[](const std::size_t pos) const;
+  T &operator[](const std::size_t pos);
+
+  const std::vector<T> &h_array(void) const;
+  std::vector<T> &h_array(void);
+
+  const device_vector<T> &d_array(void) const;
+  device_vector<T> &d_array(void);
+
+public: // Capacity
+  std::size_t size(void) const;
+
+public: // Modifiers
+  void clear(void);
+  void resize(const std::size_t count);
+
+  void set(const std::vector<T> &values);
+  void set(const device_vector<T> &values);
+  void set(const T &value);
+
+  void transfer_to_device(void);
+  void transfer_to_host(void);
+
+private:
+  std::vector<T> h_array_;
+  device_vector<T> d_array_;
+};
+
+template class cuda_container<int>;
+template class cuda_container<int2>;
+template class cuda_container<int3>;
+template class cuda_container<int4>;
+template class cuda_container<unsigned int>;
+template class cuda_container<float>;
+template class cuda_container<float2>;
+template class cuda_container<float3>;
+template class cuda_container<float4>;
+template class cuda_container<long long int>;
+template class cuda_container<longlong2>;
+template class cuda_container<longlong3>;
+template class cuda_container<longlong4>;
+template class cuda_container<unsigned long long int>;
+template class cuda_container<std::size_t>;
+template class cuda_container<double>;
+template class cuda_container<double2>;
+template class cuda_container<double3>;
+template class cuda_container<double4>;
+template class cuda_container<atom_packet>;
+
+#endif

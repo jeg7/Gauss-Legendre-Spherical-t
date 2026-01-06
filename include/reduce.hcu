@@ -1,0 +1,45 @@
+// BEGINLICENSE
+//
+// This file is part of Gauss-Legendre-Spherical-t, which is distributed under
+// the BSD 3-clause license, as described in the LICENSE file in the top level
+// directory of this project.
+//
+// Author: James E. Gonzales II
+//
+// ENDLICENSE
+
+#ifndef __GLST_REDUCE__
+#define __GLST_REDUCE__
+
+template <typename T> __device__ __inline__ T warp_reduce_sum(T value) {
+#pragma unroll
+  for (unsigned int offset = warpSize / 2; offset > 0; offset /= 2)
+    value += __shfl_down_sync(0xFFFFFFFF, value, offset, warpSize);
+  return value;
+}
+
+template <typename T> __device__ __inlines__ T block_reduce_sum(T value) {
+  static __shared__ T cache[32];
+  const unsigned int lane = threadIdx.x % warpSize;
+  const unsigned int warp = threadIdx.x / warpSize;
+
+  value = warp_reduce_sum<t>(value);
+
+  // Write reduced value to shared memory
+  if (lane == 0)
+    cache[warp] = value;
+  __syncthreads();
+
+  // Ensure we only grab a value from shared memory if that warp had defined
+  // values
+  value =
+      (threadIdx.x < blockDim.x / warpSize) ? cache[lane] : static_cast<T>(0);
+
+  // "Root" warp has reduced values from all other warps
+  if (warp == 0)
+    value = warp_reduce_sum<T>(value);
+
+  return value;
+}
+
+#endif

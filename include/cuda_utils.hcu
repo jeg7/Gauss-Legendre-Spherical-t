@@ -1,0 +1,37 @@
+// BEGINLICENSE
+//
+// This file is part of Gauss-Legendre-Spherical-t, which is distributed under
+// the BSD 3-clause license, as described in the LICENSE file in the top level
+// directory of this project.
+//
+// Author: James E. Gonzales II
+//
+// ENDLICENSE
+
+#ifndef __GLST_CUDA_UTILS__
+#define __GLST_CUDA_UTILS__
+
+#include <stdexcept>
+#include <string>
+
+#ifdef __GLST_DEBUG__
+
+#define cudaCheck(result)                                                      \
+  if (result != cudaSuccess) {                                                 \
+    std::string msg = "CUDA Runtime Error: ";                                  \
+    msg += std::string(cudaGetErrorString(result)) + "\n";                     \
+    msg += "  file(): " + std::string(__FILE__) + "\n";                        \
+    msg += "  line(): " + std::to_string(__LINE__) + "\n";                     \
+    throw std::runtime_error(msg);                                             \
+  }
+
+#else
+
+#define cudaCheck(result) result
+
+#endif
+
+void enable_p2p(const int cuda_count);
+void disable_p2p(const int cuda_count);
+
+#endif

@@ -1,0 +1,22 @@
+// BEGINLICENSE
+//
+// This file is part of Gauss-Legendre-Spherical-t, which is distributed under
+// the BSD 3-clause license, as described in the LICENSE file in the top level
+// directory of this project.
+//
+// Author: James E. Gonzales II
+//
+// ENDLICENSE
+
+#ifndef __UTILS_COULOMB__
+#define __UTILS_COULOMB__
+
+#include <cstddef>
+
+void compute_coulomb_cuda(double *fx, double *fy, double *fz, double *en,
+                          const double *rx, const double *ry, const double *rz,
+                          const double *qc, const std::size_t natom);
+void compute_coulomb_cuda(double4 *fxyzen, const double4 *xyzq,
+                          const std::size_t natom);
+
+#endif
