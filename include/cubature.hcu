@@ -28,10 +28,7 @@ public:
   unsigned int tot_num_nodes(void) const;
   const std::vector<cuda_container<unsigned int>> &points(void) const;
   const std::vector<cuda_container<unsigned int>> &num_nodes(void) const;
-  const std::vector<cuda_container<double>> &nodes_x(void) const;
-  const std::vector<cuda_container<double>> &nodes_y(void) const;
-  const std::vector<cuda_container<double>> &nodes_z(void) const;
-  const std::vector<cuda_container<double>> &weights(void) const;
+  const std::vector<cuda_container<double4>> &xyzw(void) const;
 
 public:
   void initialize(const double tol, const unsigned int nalpha,
@@ -80,10 +77,7 @@ private:
   unsigned int tot_num_nodes_;
   std::vector<cuda_container<unsigned int>> points_;
   std::vector<cuda_container<unsigned int>> num_nodes_;
-  std::vector<cuda_container<double>> nodes_x_;
-  std::vector<cuda_container<double>> nodes_y_;
-  std::vector<cuda_container<double>> nodes_z_;
-  std::vector<cuda_container<double>> weights_;
+  std::vector<cuda_container<double4>> xyzw_;
 
   int cuda_count_;
 };

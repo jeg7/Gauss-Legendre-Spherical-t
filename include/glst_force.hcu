@@ -58,8 +58,7 @@ private:
   void init_alpha_groups(std::vector<unsigned int> &ncell_alpha_group,
                          std::vector<double> &rmax, std::vector<double> &alpha,
                          std::vector<double> &zcut, const double tol);
-  void
-  init_cell_nghbr_lists(const std::vector<unsigned int> &ncell_alpha_group);
+  void init_cell_nghbr_lists(void);
 
 private:
   void allocate(void);
@@ -91,30 +90,26 @@ private:
   double cell_dim_z_;
 
   unsigned int ngroup_;
+  std::vector<cuda_container<unsigned int>> grp_r_in_;
+  std::vector<cuda_container<unsigned int>> grp_r_out_;
   std::vector<cuda_container<unsigned int>> dir_nghbr_point_;
   std::vector<cuda_container<unsigned int>> dir_nghbr_count_;
   std::vector<cuda_container<unsigned int>> dir_nghbr_list_;
-  std::vector<cuda_container<unsigned int>> rmt_nghbr_point_;
-  std::vector<cuda_container<unsigned int>> rmt_nghbr_count_;
-  std::vector<cuda_container<unsigned int>> rmt_nghbr_group_;
-  std::vector<cuda_container<unsigned int>> rmt_nghbr_list_;
 
   std::unique_ptr<cubature> cubature_;
 
   std::vector<cuda_container<unsigned int>> cell_atom_point_;
   std::vector<cuda_container<unsigned int>> cell_atom_count_;
-  std::vector<cuda_container<double>> sf_re_;
-  std::vector<cuda_container<double>> sf_im_;
-  std::vector<cuda_container<double>> rmt_sum_re_;
-  std::vector<cuda_container<double>> rmt_sum_im_;
-
-  std::vector<std::vector<cudaStream_t>> cell_stream_;
+  std::vector<cuda_container<unsigned int>> max_atoms_cell_;
+  std::vector<cuda_container<double2>> sf_;
+  std::vector<cuda_container<double2>> rmt_sum_;
 
   std::vector<void *> cub_work_buffer_;
   std::vector<std::size_t> cub_work_buffer_size_;
 
   int cuda_count_;
   std::vector<int> cell_dev_idx_;
+  std::vector<cuda_container<unsigned int>> dev_cell_idx_;
 };
 
 #endif

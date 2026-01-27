@@ -19,8 +19,8 @@
 #include <stdexcept>
 
 cubature::cubature(void)
-    : num_cubatures_(0), tot_num_nodes_(0), points_(), num_nodes_(), nodes_x_(),
-      nodes_y_(), nodes_z_(), weights_() {
+    : num_cubatures_(0), tot_num_nodes_(0), points_(), num_nodes_(), xyzw_(),
+      cuda_count_(-1) {
   cudaCheck(cudaGetDeviceCount(&this->cuda_count_));
   if (this->cuda_count_ < 1) {
     throw std::runtime_error(
@@ -28,10 +28,7 @@ cubature::cubature(void)
   }
   this->points_.resize(this->cuda_count_);
   this->num_nodes_.resize(this->cuda_count_);
-  this->nodes_x_.resize(this->cuda_count_);
-  this->nodes_y_.resize(this->cuda_count_);
-  this->nodes_z_.resize(this->cuda_count_);
-  this->weights_.resize(this->cuda_count_);
+  this->xyzw_.resize(this->cuda_count_);
 }
 
 cubature::cubature(const double tol, const unsigned int nalpha,
@@ -59,20 +56,8 @@ cubature::num_nodes(void) const {
   return this->num_nodes_;
 }
 
-const std::vector<cuda_container<double>> &cubature::nodes_x(void) const {
-  return this->nodes_x_;
-}
-
-const std::vector<cuda_container<double>> &cubature::nodes_y(void) const {
-  return this->nodes_y_;
-}
-
-const std::vector<cuda_container<double>> &cubature::nodes_z(void) const {
-  return this->nodes_z_;
-}
-
-const std::vector<cuda_container<double>> &cubature::weights(void) const {
-  return this->weights_;
+const std::vector<cuda_container<double4>> &cubature::xyzw(void) const {
+  return this->xyzw_;
 }
 
 void cubature::initialize(const double tol, const unsigned int nalpha,
@@ -93,7 +78,7 @@ void cubature::initialize(const double tol, const unsigned int nalpha,
 
   std::vector<unsigned int> points(nalpha, 0);
   std::vector<unsigned int> num_nodes(nalpha, 0);
-  std::vector<double> nodes_x, nodes_y, nodes_z, weights;
+  std::vector<double4> xyzw;
   for (unsigned int grp = 0; grp < nalpha; grp++) {
     num_nodes[grp] =
         static_cast<unsigned int>(xgl[grp].size() * sm[grp].size());
@@ -103,15 +88,16 @@ void cubature::initialize(const double tol, const unsigned int nalpha,
     const double zcut2 = zcut[grp] * zcut[grp];
     for (std::size_t i = 0; i < xgl[grp].size(); i++) {
       for (std::size_t j = 0; j < sm[grp].size(); j++) {
-        nodes_x.push_back(2.0 * alpha[grp] * zcut[grp] * xgl[grp][i] *
-                          sm[grp][j][0]);
-        nodes_y.push_back(2.0 * alpha[grp] * zcut[grp] * xgl[grp][i] *
-                          sm[grp][j][1]);
-        nodes_z.push_back(2.0 * alpha[grp] * zcut[grp] * xgl[grp][i] *
-                          sm[grp][j][2]);
-        weights.push_back(4.0 * alpha[grp] * zcut[grp] * wgl[grp][i] *
-                          std::exp(-zcut2 * xgl[grp][i] * xgl[grp][i]) /
-                          (M_PI * static_cast<double>(sm[grp].size())));
+        const double x =
+            2.0 * alpha[grp] * zcut[grp] * xgl[grp][i] * sm[grp][j][0];
+        const double y =
+            2.0 * alpha[grp] * zcut[grp] * xgl[grp][i] * sm[grp][j][1];
+        const double z =
+            2.0 * alpha[grp] * zcut[grp] * xgl[grp][i] * sm[grp][j][2];
+        const double w = 4.0 * alpha[grp] * zcut[grp] * wgl[grp][i] *
+                         std::exp(-zcut2 * xgl[grp][i] * xgl[grp][i]) /
+                         (M_PI * static_cast<double>(sm[grp].size()));
+        xyzw.push_back(make_double4(x, y, z, w));
       }
     }
   }
@@ -120,10 +106,7 @@ void cubature::initialize(const double tol, const unsigned int nalpha,
     cudaCheck(cudaSetDevice(dev));
     this->points_[dev] = points;
     this->num_nodes_[dev] = num_nodes;
-    this->nodes_x_[dev] = nodes_x;
-    this->nodes_y_[dev] = nodes_y;
-    this->nodes_z_[dev] = nodes_z;
-    this->weights_[dev] = weights;
+    this->xyzw_[dev] = xyzw;
   }
 
   return;
