@@ -58,11 +58,11 @@ private:
   void init_alpha_groups(std::vector<unsigned int> &ncell_alpha_group,
                          std::vector<double> &rmax, std::vector<double> &alpha,
                          std::vector<double> &zcut, const double tol);
-  void init_cell_nghbr_lists(void);
 
 private:
   void allocate(void);
   void deallocate(void);
+  void cells2dev(void);
 
 private:
   unsigned int natom_;
@@ -92,9 +92,6 @@ private:
   unsigned int ngroup_;
   std::vector<cuda_container<unsigned int>> grp_r_in_;
   std::vector<cuda_container<unsigned int>> grp_r_out_;
-  std::vector<cuda_container<unsigned int>> dir_nghbr_point_;
-  std::vector<cuda_container<unsigned int>> dir_nghbr_count_;
-  std::vector<cuda_container<unsigned int>> dir_nghbr_list_;
 
   std::unique_ptr<cubature> cubature_;
 

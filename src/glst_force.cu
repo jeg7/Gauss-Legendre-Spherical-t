@@ -10,6 +10,7 @@
 
 #include "glst_force.hcu"
 
+#include "cell_decomp.hpp"
 #include "cuda_utils.hcu"
 #include <cub/cub.cuh>
 #include <cuda.h>
@@ -22,8 +23,7 @@ glst_force::glst_force(void)
       sorted_packets_(), fx_(), fy_(), fz_(), en_(), atom_cell_idx_(),
       atom_cell_sorted_idx_(), ncell_x_(0), ncell_y_(0), ncell_z_(0), ncell_(0),
       cell_dim_x_(0.0), cell_dim_y_(0.0), cell_dim_z_(0.0), ngroup_(0),
-      grp_r_in_(), grp_r_out_(), dir_nghbr_point_(), dir_nghbr_count_(),
-      dir_nghbr_list_(), cubature_(nullptr), cell_atom_point_(),
+      grp_r_in_(), grp_r_out_(), cubature_(nullptr), cell_atom_point_(),
       cell_atom_count_(), max_atoms_cell_(), sf_(), rmt_sum_(),
       cub_work_buffer_(), cub_work_buffer_size_(), cuda_count_(-1),
       cell_dev_idx_(), dev_cell_idx_() {
@@ -215,28 +215,7 @@ void glst_force::init(const unsigned int natom, const double tol,
     this->ncell_z_++;
   this->ncell_ = this->ncell_x_ * this->ncell_y_ * this->ncell_z_;
 
-  { // Assign each cell to a CUDA device
-    this->cell_dev_idx_.resize(this->ncell_);
-    int dev = 0;
-    for (unsigned int cell = 0; cell < this->ncell_; cell++) {
-      if (dev >= this->cuda_count_)
-        dev = 0;
-      this->cell_dev_idx_[cell] = dev++;
-    }
-  }
-
-  { // Store a list of each cell each device is responsible for
-    this->dev_cell_idx_.resize(this->cuda_count_);
-    for (int dev = 0; dev < this->cuda_count_; dev++) {
-      cudaCheck(cudaSetDevice(dev));
-      std::vector<unsigned int> tmp;
-      for (unsigned int cell = 0; cell < this->ncell_; cell++) {
-        if (this->cell_dev_idx_[cell] == dev)
-          tmp.push_back(cell);
-      }
-      this->dev_cell_idx_[dev] = tmp;
-    }
-  }
+  this->cells2dev();
 
   std::cout << std::endl;
   std::cout << "          Number of atoms: " << this->natom_ << std::endl;
@@ -251,6 +230,7 @@ void glst_force::init(const unsigned int natom, const double tol,
             << static_cast<double>(this->ncell_y_) * this->cell_dim_y_ << " x "
             << static_cast<double>(this->ncell_z_) * this->cell_dim_z_
             << std::endl;
+  std::cout << "           Number of GPUs: " << this->cuda_count_ << std::endl;
 
   std::vector<unsigned int> ncell_alpha_group;
   std::vector<double> rmax, alpha, zcut;
@@ -258,8 +238,6 @@ void glst_force::init(const unsigned int natom, const double tol,
 
   std::cout << std::endl;
   std::cout << "  Number of alpha groups: " << this->ngroup_ << std::endl;
-
-  this->init_cell_nghbr_lists();
 
   this->cubature_ =
       std::make_unique<cubature>(tol, this->ngroup_, rmax, alpha, zcut);
@@ -377,7 +355,8 @@ void glst_force::assign_atoms(const double *d_rx, const double *d_ry,
     cudaCheck(cudaSetDevice(dev));
     { // Fast reset of cell atom count array
       constexpr unsigned int num_threads = 512;
-      const unsigned int num_blocks = this->ncell_ / num_threads + 1;
+      const unsigned int num_blocks =
+          (this->ncell_ + num_threads - 1) / num_threads;
       init_cell_atom_count_kernel<<<num_blocks, num_threads>>>(
           this->cell_atom_count_[dev].d_array().data(), this->ncell_);
     }
@@ -385,7 +364,8 @@ void glst_force::assign_atoms(const double *d_rx, const double *d_ry,
     { // Determine which cell each atom is in and count how many atoms are in
       // each cell
       constexpr unsigned int num_threads = 512;
-      const unsigned int num_blocks = this->natom_ / num_threads + 1;
+      const unsigned int num_blocks =
+          (this->natom_ + num_threads - 1) / num_threads;
       calc_cell_atom_count_kernel<<<num_blocks, num_threads>>>(
           this->atom_cell_idx_[dev].d_array().data(),
           this->cell_atom_count_[dev].d_array().data(), d_rx, d_ry, d_rz,
@@ -405,7 +385,8 @@ void glst_force::assign_atoms(const double *d_rx, const double *d_ry,
 
     { // Determine where each cell's atom data is stored
       constexpr unsigned int num_threads = 512;
-      const unsigned int num_blocks = this->ncell_ / num_threads + 1;
+      const unsigned int num_blocks =
+          (this->ncell_ + num_threads - 1) / num_threads;
       calc_cell_atom_point_kernel<<<num_blocks, num_threads>>>(
           this->cell_atom_point_[dev].d_array().data(),
           this->cell_atom_count_[dev].d_array().data(), this->ncell_);
@@ -413,7 +394,8 @@ void glst_force::assign_atoms(const double *d_rx, const double *d_ry,
 
     { // Pack atom data
       constexpr unsigned int num_threads = 512;
-      const unsigned int num_blocks = this->natom_ / num_threads + 1;
+      const unsigned int num_blocks =
+          (this->natom_ + num_threads - 1) / num_threads;
       pack_kernel<<<num_blocks, num_threads>>>(
           this->packets_[dev].d_array().data(), d_rx, d_ry, d_rz, d_qc,
           this->idx_[dev].d_array().data(), this->natom_);
@@ -430,7 +412,8 @@ void glst_force::assign_atoms(const double *d_rx, const double *d_ry,
 
     { // Unpack atom data
       constexpr unsigned int num_threads = 512;
-      const unsigned int num_blocks = this->natom_ / num_threads + 1;
+      const unsigned int num_blocks =
+          (this->natom_ + num_threads - 1) / num_threads;
       unpack_kernel<<<num_blocks, num_threads>>>(
           this->rx_[dev].d_array().data(), this->ry_[dev].d_array().data(),
           this->rz_[dev].d_array().data(), this->qc_[dev].d_array().data(),
@@ -450,13 +433,11 @@ calc_sf_kernel(double2 *__restrict__ sf, const double4 *__restrict__ xyzw,
                const double *__restrict__ qc,
                const unsigned int *__restrict__ cell_atom_points,
                const unsigned int *__restrict__ cell_atom_counts,
-               const unsigned int *__restrict__ cells) {
+               const unsigned int *__restrict__ cells,
+               const unsigned int cell_count) {
   __shared__ double s_cache[ATOM_TILE * 4];
 
   const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  const unsigned int cell = cells[blockIdx.y];
-  const unsigned int apnt = cell_atom_points[cell];
-  const unsigned int acnt = cell_atom_counts[cell];
   const bool active = (idx < nc);
 
   double xc = 0.0, yc = 0.0, zc = 0.0;
@@ -466,42 +447,49 @@ calc_sf_kernel(double2 *__restrict__ sf, const double4 *__restrict__ xyzw,
     zc = xyzw[idx].z;
   }
 
-  double2 sf0 = make_double2(0.0, 0.0);
-  for (unsigned int i = 0; i < acnt; i += ATOM_TILE) {
-    __syncthreads();
-    if ((threadIdx.x < ATOM_TILE) && (i + threadIdx.x < acnt)) {
-      s_cache[threadIdx.x * 4 + 0] = rx[apnt + i + threadIdx.x];
-      s_cache[threadIdx.x * 4 + 1] = ry[apnt + i + threadIdx.x];
-      s_cache[threadIdx.x * 4 + 2] = rz[apnt + i + threadIdx.x];
-      s_cache[threadIdx.x * 4 + 3] = qc[apnt + i + threadIdx.x];
-    }
-    __syncthreads();
+  for (unsigned int c = blockIdx.y; c < cell_count; c += gridDim.y) {
+    const unsigned int cell = cells[c];
+    const unsigned int apnt = cell_atom_points[cell];
+    const unsigned int acnt = cell_atom_counts[cell];
 
-    if (active) { // Only "active" threads do expensive sincos work
-      const unsigned int n = min(ATOM_TILE, acnt - i);
-      for (unsigned int j = 0; j < n; j++) {
-        const double xa = s_cache[j * 4 + 0];
-        const double ya = s_cache[j * 4 + 1];
-        const double za = s_cache[j * 4 + 2];
-        const double qa = s_cache[j * 4 + 3];
+    double2 sf0 = make_double2(0.0, 0.0);
+    for (unsigned int i = 0; i < acnt; i += ATOM_TILE) {
+      __syncthreads();
+      if ((threadIdx.x < ATOM_TILE) && (i + threadIdx.x < acnt)) {
+        s_cache[threadIdx.x * 4 + 0] = rx[apnt + i + threadIdx.x];
+        s_cache[threadIdx.x * 4 + 1] = ry[apnt + i + threadIdx.x];
+        s_cache[threadIdx.x * 4 + 2] = rz[apnt + i + threadIdx.x];
+        s_cache[threadIdx.x * 4 + 3] = qc[apnt + i + threadIdx.x];
+      }
+      __syncthreads();
 
-        const double theta = xc * xa + yc * ya + zc * za;
-        double re = 0.0, im = 0.0;
-        sincos(theta, &im, &re);
+      if (active) { // Only "active" threads do expensive sincos work
+        const unsigned int n = min(ATOM_TILE, acnt - i);
+        for (unsigned int j = 0; j < n; j++) {
+          const double xa = s_cache[j * 4 + 0];
+          const double ya = s_cache[j * 4 + 1];
+          const double za = s_cache[j * 4 + 2];
+          const double qa = s_cache[j * 4 + 3];
 
-        // const float theta = static_cast<float>(xc * xa + yc * ya + zc *
-        // za); float ref = 0.0f, imf = 0.0f; sincosf(theta, &imf, &ref);
-        // const double re = static_cast<double>(ref);
-        // const double im = static_cast<double>(imf);
+          // const double theta = xc * xa + yc * ya + zc * za;
+          // double re = 0.0, im = 0.0;
+          // sincos(theta, &im, &re);
 
-        sf0.x += qa * re;
-        sf0.y -= qa * im;
+          const float theta = static_cast<float>(xc * xa + yc * ya + zc * za);
+          float ref = 0.0f, imf = 0.0f;
+          sincosf(theta, &imf, &ref);
+          const double re = static_cast<double>(ref);
+          const double im = static_cast<double>(imf);
+
+          sf0.x += qa * re;
+          sf0.y -= qa * im;
+        }
       }
     }
-  }
 
-  if (active)
-    sf[cell * nc + idx] = sf0;
+    if (active)
+      sf[cell * nc + idx] = sf0;
+  }
 
   return;
 }
@@ -514,9 +502,12 @@ void glst_force::calc_sf(void) {
 
   for (int dev = 0; dev < this->cuda_count_; dev++) {
     cudaCheck(cudaSetDevice(dev));
-    constexpr unsigned int num_threads = 128;
-    const dim3 num_blocks((nc + num_threads - 1) / num_threads,
-                          this->dev_cell_idx_[dev].size(), 1);
+    constexpr dim3 num_threads(128, 1, 1);
+    const dim3 num_blocks(
+        (nc + num_threads.x - 1) / num_threads.x,
+        std::min(65535u,
+                 static_cast<unsigned int>(this->dev_cell_idx_[dev].size())),
+        1);
     calc_sf_kernel<96><<<num_blocks, num_threads>>>(
         this->sf_[dev].d_array().data(),
         this->cubature_->xyzw()[dev].d_array().data(), nc,
@@ -524,7 +515,8 @@ void glst_force::calc_sf(void) {
         this->rz_[dev].d_array().data(), this->qc_[dev].d_array().data(),
         this->cell_atom_point_[dev].d_array().data(),
         this->cell_atom_count_[dev].d_array().data(),
-        this->dev_cell_idx_[dev].d_array().data());
+        this->dev_cell_idx_[dev].d_array().data(),
+        static_cast<unsigned int>(this->dev_cell_idx_[dev].size()));
   }
 
   return;
@@ -699,22 +691,25 @@ __global__ static void calc_rmt_sum_kernel(
     const double4 *__restrict__ xyzw, const unsigned int nc,
     const unsigned int cub_point, const unsigned int cub_count,
     const unsigned int inner, const unsigned int outer, const unsigned int nx,
-    const unsigned int ny, const unsigned int nz) {
+    const unsigned int ny, const unsigned int nz, const unsigned int ncell) {
   const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  const unsigned int cell = blockIdx.y;
-  const unsigned int x = cell / (ny * nz);
-  const unsigned int y = (cell / nz) % ny;
-  const unsigned int z = cell % nz;
 
   if (idx >= cub_count)
     return;
 
-  double2 shell =
-      shell_sum(sf, x, y, z, inner, outer, nx, ny, nz, idx, cub_point, nc);
   const double wc = xyzw[cub_point + idx].w;
-  shell.x *= wc;
-  shell.y *= wc;
-  rmt_sum[cell * nc + cub_point + idx] = shell;
+
+  for (unsigned int cell = blockIdx.y; cell < ncell; cell += gridDim.y) {
+    const unsigned int x = cell / (ny * nz);
+    const unsigned int y = (cell / nz) % ny;
+    const unsigned int z = cell % nz;
+
+    double2 shell =
+        shell_sum(sf, x, y, z, inner, outer, nx, ny, nz, idx, cub_point, nc);
+    shell.x *= wc;
+    shell.y *= wc;
+    rmt_sum[cell * nc + cub_point + idx] = shell;
+  }
 
   return;
 }
@@ -725,7 +720,8 @@ void glst_force::sum_rmt_sf(void) {
 
   const unsigned int nc = this->cubature_->tot_num_nodes();
 
-  // Avoid race condition
+  // Synchronize to ensure that all devices are done computing their structure
+  // factors
   for (int dev = 0; dev < this->cuda_count_; dev++) {
     cudaCheck(cudaSetDevice(dev));
     cudaCheck(cudaDeviceSynchronize());
@@ -737,8 +733,8 @@ void glst_force::sum_rmt_sf(void) {
       if (idev == jdev)
         continue;
       cudaCheck(cudaSetDevice(jdev));
-      constexpr unsigned int num_threads = 512;
-      const dim3 num_blocks(nc / num_threads + 1,
+      constexpr dim3 num_threads(512, 1, 1);
+      const dim3 num_blocks((nc + num_threads.x - 1) / num_threads.x,
                             this->dev_cell_idx_[idev].size(), 1);
       copy_kernel<<<num_blocks, num_threads>>>(
           this->sf_[jdev].d_array().data(), this->sf_[idev].d_array().data(),
@@ -746,11 +742,18 @@ void glst_force::sum_rmt_sf(void) {
     }
   }
 
+  // Synchronize to ensure that all devices are done copying before computing
+  // in-place prefix sum
+  for (int dev = 0; dev < this->cuda_count_; dev++) {
+    cudaCheck(cudaSetDevice(dev));
+    cudaCheck(cudaDeviceSynchronize());
+  }
+
   for (int dev = 0; dev < this->cuda_count_; dev++) {
     cudaCheck(cudaSetDevice(dev));
     {
       constexpr dim3 num_threads(512, 1, 1);
-      const dim3 num_blocks(nc / num_threads.x + 1,
+      const dim3 num_blocks((nc + num_threads.x - 1) / num_threads.x,
                             this->ncell_x_ * this->ncell_y_, 1);
       calc_prefix_sum_z_kernel<<<num_blocks, num_threads>>>(
           this->sf_[dev].d_array().data(), nc, this->ncell_x_, this->ncell_y_,
@@ -759,7 +762,7 @@ void glst_force::sum_rmt_sf(void) {
 
     {
       constexpr dim3 num_threads(512, 1, 1);
-      const dim3 num_blocks(nc / num_threads.x + 1,
+      const dim3 num_blocks((nc + num_threads.x - 1) / num_threads.x,
                             this->ncell_x_ * this->ncell_z_, 1);
       calc_prefix_sum_y_kernel<<<num_blocks, num_threads>>>(
           this->sf_[dev].d_array().data(), nc, this->ncell_x_, this->ncell_y_,
@@ -768,7 +771,7 @@ void glst_force::sum_rmt_sf(void) {
 
     {
       constexpr dim3 num_threads(512, 1, 1);
-      const dim3 num_blocks(nc / num_threads.x + 1,
+      const dim3 num_blocks((nc + num_threads.x - 1) / num_threads.x,
                             this->ncell_y_ * this->ncell_z_, 1);
       calc_prefix_sum_x_kernel<<<num_blocks, num_threads>>>(
           this->sf_[dev].d_array().data(), nc, this->ncell_x_, this->ncell_y_,
@@ -779,12 +782,13 @@ void glst_force::sum_rmt_sf(void) {
       const unsigned int cub_point = this->cubature_->points()[dev][group];
       const unsigned int cub_count = this->cubature_->num_nodes()[dev][group];
       constexpr dim3 num_threads(512, 1, 1);
-      const dim3 num_blocks(cub_count / num_threads.x + 1, this->ncell_, 1);
+      const dim3 num_blocks((cub_count + num_threads.x - 1) / num_threads.x,
+                            std::min(65535u, this->ncell_), 1);
       calc_rmt_sum_kernel<<<num_blocks, num_threads>>>(
           this->rmt_sum_[dev].d_array().data(), this->sf_[dev].d_array().data(),
           this->cubature_->xyzw()[dev].d_array().data(), nc, cub_point,
           cub_count, this->grp_r_in_[dev][group], this->grp_r_out_[dev][group],
-          this->ncell_x_, this->ncell_y_, this->ncell_z_);
+          this->ncell_x_, this->ncell_y_, this->ncell_z_, this->ncell_);
     }
   }
 
@@ -801,68 +805,73 @@ calc_lr_ef_kernel(double *__restrict__ fx, double *__restrict__ fy,
                   const unsigned int *__restrict__ cell_atom_counts,
                   const double4 *__restrict__ xyzw,
                   const double2 *__restrict__ rmt_sum, const unsigned int nc,
-                  const unsigned int *__restrict__ cells) {
+                  const unsigned int *__restrict__ cells,
+                  const unsigned int cell_count) {
   __shared__ double s_cache[BLOCK * 5];
 
   const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  const unsigned int cell = cells[blockIdx.y];
-  const unsigned int apnt = cell_atom_points[cell];
-  const unsigned int acnt = cell_atom_counts[cell];
-  const bool active = (idx < acnt);
 
-  double xa = 0.0, ya = 0.0, za = 0.0, qa = 0.0;
-  if (active) {
-    xa = rx[apnt + idx];
-    ya = ry[apnt + idx];
-    za = rz[apnt + idx];
-    qa = qc[apnt + idx];
-  }
+  for (unsigned int c = blockIdx.y; c < cell_count; c += gridDim.y) {
+    const unsigned int cell = cells[c];
+    const unsigned int apnt = cell_atom_points[cell];
+    const unsigned int acnt = cell_atom_counts[cell];
+    const bool active = (idx < acnt);
 
-  double fx0 = 0.0, fy0 = 0.0, fz0 = 0.0, en0 = 0.0;
-  for (unsigned int i = 0; i < nc; i += BLOCK) {
-    __syncthreads();
-    if (i + threadIdx.x < nc) {
-      s_cache[threadIdx.x * 5 + 0] = xyzw[i + threadIdx.x].x;
-      s_cache[threadIdx.x * 5 + 1] = xyzw[i + threadIdx.x].y;
-      s_cache[threadIdx.x * 5 + 2] = xyzw[i + threadIdx.x].z;
-      s_cache[threadIdx.x * 5 + 3] = rmt_sum[cell * nc + i + threadIdx.x].x;
-      s_cache[threadIdx.x * 5 + 4] = rmt_sum[cell * nc + i + threadIdx.x].y;
+    double xa = 0.0, ya = 0.0, za = 0.0, qa = 0.0;
+    if (active) {
+      xa = rx[apnt + idx];
+      ya = ry[apnt + idx];
+      za = rz[apnt + idx];
+      qa = qc[apnt + idx];
     }
-    __syncthreads();
 
-    if (active) { // Only "active" threads do expensive sincos work
-      const unsigned int n = min(BLOCK, nc - i);
-      for (unsigned int j = 0; j < n; j++) {
-        const double xc = s_cache[j * 5 + 0];
-        const double yc = s_cache[j * 5 + 1];
-        const double zc = s_cache[j * 5 + 2];
-        const double rmt_re = s_cache[j * 5 + 3];
-        const double rmt_im = s_cache[j * 5 + 4];
+    double fx0 = 0.0, fy0 = 0.0, fz0 = 0.0, en0 = 0.0;
+    for (unsigned int i = 0; i < nc; i += BLOCK) {
+      __syncthreads();
+      if (i + threadIdx.x < nc) {
+        s_cache[threadIdx.x * 5 + 0] = xyzw[i + threadIdx.x].x;
+        s_cache[threadIdx.x * 5 + 1] = xyzw[i + threadIdx.x].y;
+        s_cache[threadIdx.x * 5 + 2] = xyzw[i + threadIdx.x].z;
+        s_cache[threadIdx.x * 5 + 3] = rmt_sum[cell * nc + i + threadIdx.x].x;
+        s_cache[threadIdx.x * 5 + 4] = rmt_sum[cell * nc + i + threadIdx.x].y;
+      }
+      __syncthreads();
 
-        const double theta = xc * xa + yc * ya + zc * za;
-        double re = 0.0, im = 0.0;
-        sincos(theta, &im, &re);
+      if (active) { // Only "active" threads do expensive sincos work
+        const unsigned int n = min(BLOCK, nc - i);
+        for (unsigned int j = 0; j < n; j++) {
+          const double xc = s_cache[j * 5 + 0];
+          const double yc = s_cache[j * 5 + 1];
+          const double zc = s_cache[j * 5 + 2];
+          const double rmt_re = s_cache[j * 5 + 3];
+          const double rmt_im = s_cache[j * 5 + 4];
 
-        // const float theta = static_cast<float>(xc * xa + yc * ya + zc *
-        // za); float ref = 0.0f, imf = 0.0f; sincosf(theta, &imf, &ref);
-        // const double re = static_cast<double>(ref);
-        // const double im = static_cast<double>(imf);
+          // const double theta = xc * xa + yc * ya + zc * za;
+          // double re = 0.0, im = 0.0;
+          // sincos(theta, &im, &re);
 
-        const double dre = qa * (re * rmt_re - im * rmt_im);
-        const double dim = qa * (re * rmt_im + im * rmt_re);
-        fx0 += dim * xc;
-        fy0 += dim * yc;
-        fz0 += dim * zc;
-        en0 += dre;
+          const float theta = static_cast<float>(xc * xa + yc * ya + zc * za);
+          float ref = 0.0f, imf = 0.0f;
+          sincosf(theta, &imf, &ref);
+          const double re = static_cast<double>(ref);
+          const double im = static_cast<double>(imf);
+
+          const double dre = qa * (re * rmt_re - im * rmt_im);
+          const double dim = qa * (re * rmt_im + im * rmt_re);
+          fx0 += dim * xc;
+          fy0 += dim * yc;
+          fz0 += dim * zc;
+          en0 += dre;
+        }
       }
     }
-  }
 
-  if (active) {
-    fx[apnt + idx] += fx0;
-    fy[apnt + idx] += fy0;
-    fz[apnt + idx] += fz0;
-    en[apnt + idx] += en0;
+    if (active) {
+      fx[apnt + idx] += fx0;
+      fy[apnt + idx] += fy0;
+      fz[apnt + idx] += fz0;
+      en[apnt + idx] += en0;
+    }
   }
 
   return;
@@ -874,11 +883,13 @@ void glst_force::calc_lr_ef(void) {
 
   for (int dev = 0; dev < this->cuda_count_; dev++) {
     cudaCheck(cudaSetDevice(dev));
-    constexpr unsigned int num_threads = 64;
-    const dim3 num_blocks((this->max_atoms_cell_[dev][0] + num_threads - 1) /
-                              num_threads,
-                          this->dev_cell_idx_[dev].size(), 1);
-    calc_lr_ef_kernel<num_threads><<<num_blocks, num_threads>>>(
+    constexpr dim3 num_threads(64, 1, 1);
+    const dim3 num_blocks(
+        (this->max_atoms_cell_[dev][0] + num_threads.x - 1) / num_threads.x,
+        std::min(65535u,
+                 static_cast<unsigned int>(this->dev_cell_idx_[dev].size())),
+        1);
+    calc_lr_ef_kernel<num_threads.x><<<num_blocks, num_threads>>>(
         this->fx_[dev].d_array().data(), this->fy_[dev].d_array().data(),
         this->fz_[dev].d_array().data(), this->en_[dev].d_array().data(),
         this->rx_[dev].d_array().data(), this->ry_[dev].d_array().data(),
@@ -887,148 +898,194 @@ void glst_force::calc_lr_ef(void) {
         this->cell_atom_count_[dev].d_array().data(),
         this->cubature_->xyzw()[dev].d_array().data(),
         this->rmt_sum_[dev].d_array().data(), this->cubature_->tot_num_nodes(),
-        this->dev_cell_idx_[dev].d_array().data());
+        this->dev_cell_idx_[dev].d_array().data(),
+        static_cast<unsigned int>(this->dev_cell_idx_[dev].size()));
   }
 
   return;
 }
 
-template <unsigned int num_threads>
+template <unsigned int BLOCK>
 __global__ static void calc_sr_ef_intra_kernel(
     double *__restrict__ fx, double *__restrict__ fy, double *__restrict__ fz,
     double *__restrict__ en, const double *__restrict__ rx,
     const double *__restrict__ ry, const double *__restrict__ rz,
-    const double *__restrict__ qc, const unsigned int natom) {
-  __shared__ double s_cache[num_threads * 4];
-
+    const double *__restrict__ qc,
+    const unsigned int *__restrict__ cell_atom_points,
+    const unsigned int *__restrict__ cell_atom_counts,
+    const unsigned int *__restrict__ cells, const unsigned int cell_count) {
+  __shared__ double s_cache[BLOCK * 4];
   const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
-  double xi = 0.0, yi = 0.0, zi = 0.0, qi = 0.0;
-  if (idx < natom) {
-    xi = rx[idx];
-    yi = ry[idx];
-    zi = rz[idx];
-    qi = qc[idx];
-  }
+  for (unsigned int c = blockIdx.y; c < cell_count; c += gridDim.y) {
+    const unsigned int cell = cells[c];
+    const unsigned int apnt = cell_atom_points[cell];
+    const unsigned int acnt = cell_atom_counts[cell];
+    const bool active = (idx < acnt);
 
-  double fx0 = 0.0, fy0 = 0.0, fz0 = 0.0, en0 = 0.0;
-  for (unsigned int j = 0; j < natom; j += num_threads) {
-    // Read block of atom data into shared memory
-    __syncthreads();
-    s_cache[threadIdx.x * 4 + 0] = 0.0;
-    s_cache[threadIdx.x * 4 + 1] = 0.0;
-    s_cache[threadIdx.x * 4 + 2] = 0.0;
-    s_cache[threadIdx.x * 4 + 3] = 0.0;
-    if (j + threadIdx.x < natom) {
-      s_cache[threadIdx.x * 4 + 0] = rx[j + threadIdx.x];
-      s_cache[threadIdx.x * 4 + 1] = ry[j + threadIdx.x];
-      s_cache[threadIdx.x * 4 + 2] = rz[j + threadIdx.x];
-      s_cache[threadIdx.x * 4 + 3] = qc[j + threadIdx.x];
+    double xi = 0.0, yi = 0.0, zi = 0.0, qi = 0.0;
+    if (active) {
+      xi = rx[apnt + idx];
+      yi = ry[apnt + idx];
+      zi = rz[apnt + idx];
+      qi = qc[apnt + idx];
     }
-    __syncthreads();
 
-    // Process block of atom data
-    for (unsigned int k = 0; k < num_threads; k++) {
-      if (j + k == idx) // Do not interact self
-        continue;
-      const double xj = s_cache[k * 4 + 0];
-      const double yj = s_cache[k * 4 + 1];
-      const double zj = s_cache[k * 4 + 2];
-      const double qj = s_cache[k * 4 + 3];
-      const double qij = qi * qj;
-      const double xij = xi - xj;
-      const double yij = yi - yj;
-      const double zij = zi - zj;
-      const double rij2 = xij * xij + yij * yij + zij * zij;
-      const double rij = sqrt(rij2);
-      const double irij = 1.0 / rij;
-      const double dudr = qij / rij2; // u = qij / rij
-      const double drdx = xij * irij;
-      const double drdy = yij * irij;
-      const double drdz = zij * irij;
-      fx0 += dudr * drdx;
-      fy0 += dudr * drdy;
-      fz0 += dudr * drdz;
-      en0 += qij * irij;
+    double fx0 = 0.0, fy0 = 0.0, fz0 = 0.0, en0 = 0.0;
+    for (unsigned int j = 0; j < acnt; j += BLOCK) {
+      // Read block of atom data into shared memory
+      __syncthreads();
+      if (j + threadIdx.x < acnt) {
+        s_cache[threadIdx.x * 4 + 0] = rx[apnt + j + threadIdx.x];
+        s_cache[threadIdx.x * 4 + 1] = ry[apnt + j + threadIdx.x];
+        s_cache[threadIdx.x * 4 + 2] = rz[apnt + j + threadIdx.x];
+        s_cache[threadIdx.x * 4 + 3] = qc[apnt + j + threadIdx.x];
+      }
+      __syncthreads();
+
+      if (active) { // Only "active" threads do expensive calculations
+        const unsigned int n = min(BLOCK, acnt - j);
+        for (unsigned int k = 0; k < n; k++) {
+          if (j + k == idx) // Do not interact self
+            continue;
+          const double xj = s_cache[k * 4 + 0];
+          const double yj = s_cache[k * 4 + 1];
+          const double zj = s_cache[k * 4 + 2];
+          const double qj = s_cache[k * 4 + 3];
+          const double qij = qi * qj;
+          const double xij = xi - xj;
+          const double yij = yi - yj;
+          const double zij = zi - zj;
+          const double rij2 = xij * xij + yij * yij + zij * zij;
+          const double rij = sqrt(rij2);
+          const double irij = 1.0 / rij;
+          const double dudr = qij / rij2; // u = qij / rij
+          const double drdx = xij * irij;
+          const double drdy = yij * irij;
+          const double drdz = zij * irij;
+          fx0 += dudr * drdx;
+          fy0 += dudr * drdy;
+          fz0 += dudr * drdz;
+          en0 += qij * irij;
+        }
+      }
     }
-  }
 
-  if (idx < natom) {
-    fx[idx] += fx0;
-    fy[idx] += fy0;
-    fz[idx] += fz0;
-    en[idx] += en0;
+    if (active) {
+      fx[apnt + idx] += fx0;
+      fy[apnt + idx] += fy0;
+      fz[apnt + idx] += fz0;
+      en[apnt + idx] += en0;
+    }
   }
 
   return;
 }
 
-template <unsigned int num_threads>
+template <unsigned int BLOCK>
 __global__ static void calc_sr_ef_inter_kernel(
     double *__restrict__ fx, double *__restrict__ fy, double *__restrict__ fz,
-    double *__restrict__ en, const double *__restrict__ rx1,
-    const double *__restrict__ ry1, const double *__restrict__ rz1,
-    const double *__restrict__ qc1, const unsigned int natom1,
-    const double *__restrict__ rx2, const double *__restrict__ ry2,
-    const double *__restrict__ rz2, const double *__restrict__ qc2,
-    const unsigned int natom2) {
-  __shared__ double s_cache[num_threads * 4];
-
+    double *__restrict__ en, const double *__restrict__ rx,
+    const double *__restrict__ ry, const double *__restrict__ rz,
+    const double *__restrict__ qc,
+    const unsigned int *__restrict__ cell_atom_points,
+    const unsigned int *__restrict__ cell_atom_counts,
+    const unsigned int *__restrict__ cells, const unsigned int cell_count,
+    const unsigned int ncell_x, const unsigned int ncell_y,
+    const unsigned int ncell_z) {
+  __shared__ double s_cache[BLOCK * 4];
   const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
-  double xi = 0.0, yi = 0.0, zi = 0.0, qi = 0.0;
-  if (idx < natom1) {
-    xi = rx1[idx];
-    yi = ry1[idx];
-    zi = rz1[idx];
-    qi = qc1[idx];
-  }
+  for (unsigned int c = blockIdx.y; c < cell_count; c += gridDim.y) {
+    const unsigned int cell = cells[c];
+    const unsigned int xcell = cell / (ncell_y * ncell_z);
+    const unsigned int ycell = (cell / ncell_z) % ncell_y;
+    const unsigned int zcell = cell % ncell_z;
+    const unsigned int apnt = cell_atom_points[cell];
+    const unsigned int acnt = cell_atom_counts[cell];
+    const bool active = (idx < acnt);
 
-  double fx0 = 0.0, fy0 = 0.0, fz0 = 0.0, en0 = 0.0;
-  for (unsigned int j = 0; j < natom2; j += num_threads) {
-    // Read block of atom data into shared memory
-    __syncthreads();
-    s_cache[threadIdx.x * 4 + 0] = 0.0;
-    s_cache[threadIdx.x * 4 + 1] = 0.0;
-    s_cache[threadIdx.x * 4 + 2] = 0.0;
-    s_cache[threadIdx.x * 4 + 3] = 0.0;
-    if (j + threadIdx.x < natom2) {
-      s_cache[threadIdx.x * 4 + 0] = rx2[j + threadIdx.x];
-      s_cache[threadIdx.x * 4 + 1] = ry2[j + threadIdx.x];
-      s_cache[threadIdx.x * 4 + 2] = rz2[j + threadIdx.x];
-      s_cache[threadIdx.x * 4 + 3] = qc2[j + threadIdx.x];
+    double xi = 0.0, yi = 0.0, zi = 0.0, qi = 0.0;
+    if (active) {
+      xi = rx[apnt + idx];
+      yi = ry[apnt + idx];
+      zi = rz[apnt + idx];
+      qi = qc[apnt + idx];
     }
-    __syncthreads();
 
-    // Process block of atom data
-    for (unsigned int k = 0; k < num_threads; k++) {
-      const double xj = s_cache[k * 4 + 0];
-      const double yj = s_cache[k * 4 + 1];
-      const double zj = s_cache[k * 4 + 2];
-      const double qj = s_cache[k * 4 + 3];
-      const double qij = qi * qj;
-      const double xij = xi - xj;
-      const double yij = yi - yj;
-      const double zij = zi - zj;
-      const double rij2 = xij * xij + yij * yij + zij * zij;
-      const double rij = sqrt(rij2);
-      const double irij = 1.0 / rij;
-      const double dudr = qij / rij2; // u = qij / rij
-      const double drdx = xij * irij;
-      const double drdy = yij * irij;
-      const double drdz = zij * irij;
-      fx0 += dudr * drdx;
-      fy0 += dudr * drdy;
-      fz0 += dudr * drdz;
-      en0 += qij * irij;
+    double fx0 = 0.0, fy0 = 0.0, fz0 = 0.0, en0 = 0.0;
+    for (int a = -1; a <= 1; a++) {
+      if ((xcell == 0) && (a == -1))
+        continue;
+      if ((xcell == ncell_x - 1) && (a == 1))
+        continue;
+      const unsigned int nbrx =
+          static_cast<unsigned int>(static_cast<int>(xcell) + a);
+      for (int b = -1; b <= 1; b++) {
+        if ((ycell == 0) && (b == -1))
+          continue;
+        if ((ycell == ncell_y - 1) && (b == 1))
+          continue;
+        const unsigned int nbry =
+            static_cast<unsigned int>(static_cast<int>(ycell) + b);
+        for (int c = -1; c <= 1; c++) {
+          if ((zcell == 0) && (c == -1))
+            continue;
+          if ((zcell == ncell_z - 1) && (c == 1))
+            continue;
+          const unsigned int nbrz =
+              static_cast<unsigned int>(static_cast<int>(zcell) + c);
+          if ((a == 0) && (b == 0) && (c == 0))
+            continue;
+          const unsigned int nbr = (nbrx * ncell_y + nbry) * ncell_z + nbrz;
+          const unsigned int bpnt = cell_atom_points[nbr];
+          const unsigned int bcnt = cell_atom_counts[nbr];
+          for (unsigned int j = 0; j < bcnt; j += BLOCK) {
+            // Read block of atom data into shared memory
+            __syncthreads();
+            if (j + threadIdx.x < bcnt) {
+              s_cache[threadIdx.x * 4 + 0] = rx[bpnt + j + threadIdx.x];
+              s_cache[threadIdx.x * 4 + 1] = ry[bpnt + j + threadIdx.x];
+              s_cache[threadIdx.x * 4 + 2] = rz[bpnt + j + threadIdx.x];
+              s_cache[threadIdx.x * 4 + 3] = qc[bpnt + j + threadIdx.x];
+            }
+            __syncthreads();
+
+            if (active) { // Only "active" threads do expensive calculations
+              const unsigned int n = min(BLOCK, bcnt - j);
+              for (unsigned int k = 0; k < n; k++) {
+                const double xj = s_cache[k * 4 + 0];
+                const double yj = s_cache[k * 4 + 1];
+                const double zj = s_cache[k * 4 + 2];
+                const double qj = s_cache[k * 4 + 3];
+                const double qij = qi * qj;
+                const double xij = xi - xj;
+                const double yij = yi - yj;
+                const double zij = zi - zj;
+                const double rij2 = xij * xij + yij * yij + zij * zij;
+                const double rij = sqrt(rij2);
+                const double irij = 1.0 / rij;
+                const double dudr = qij / rij2; // u = qij / rij
+                const double drdx = xij * irij;
+                const double drdy = yij * irij;
+                const double drdz = zij * irij;
+                fx0 += dudr * drdx;
+                fy0 += dudr * drdy;
+                fz0 += dudr * drdz;
+                en0 += qij * irij;
+              }
+            }
+          }
+        }
+      }
     }
-  }
 
-  if (idx < natom1) {
-    fx[idx] += fx0;
-    fy[idx] += fy0;
-    fz[idx] += fz0;
-    en[idx] += en0;
+    if (active) {
+      fx[apnt + idx] += fx0;
+      fy[apnt + idx] += fy0;
+      fz[apnt + idx] += fz0;
+      en[apnt + idx] += en0;
+    }
   }
 
   return;
@@ -1036,55 +1093,32 @@ __global__ static void calc_sr_ef_inter_kernel(
 
 void glst_force::calc_sr_ef(void) {
   for (int dev = 0; dev < this->cuda_count_; dev++) {
-    this->cell_atom_count_[dev].transfer_to_host();
-    this->cell_atom_point_[dev].transfer_to_host();
-  }
-
-  for (unsigned int icell = 0; icell < this->ncell_; icell++) {
-    const int idev = this->cell_dev_idx_[icell];
-    cudaCheck(cudaSetDevice(idev));
-    const unsigned int ipoint = this->cell_atom_point_[idev][icell];
-    const unsigned int icount = this->cell_atom_count_[idev][icell];
-    if (icount == 0)
-      continue;
-
-    constexpr unsigned int num_threads = 32;
-    const unsigned int num_blocks = icount / num_threads + 1;
-    calc_sr_ef_intra_kernel<num_threads><<<num_blocks, num_threads>>>(
-        this->fx_[idev].d_array().data() + ipoint,
-        this->fy_[idev].d_array().data() + ipoint,
-        this->fz_[idev].d_array().data() + ipoint,
-        this->en_[idev].d_array().data() + ipoint,
-        this->rx_[idev].d_array().data() + ipoint,
-        this->ry_[idev].d_array().data() + ipoint,
-        this->rz_[idev].d_array().data() + ipoint,
-        this->qc_[idev].d_array().data() + ipoint, icount);
-
-    const unsigned int dir_nghbr_point = this->dir_nghbr_point_[idev][icell];
-    const unsigned int dir_nghbr_count = this->dir_nghbr_count_[idev][icell];
-    const unsigned int *dir_nghbr_list =
-        this->dir_nghbr_list_[idev].h_array().data() + dir_nghbr_point;
-    for (unsigned int nghbr = 0; nghbr < dir_nghbr_count; nghbr++) {
-      const unsigned int jcell = dir_nghbr_list[nghbr];
-      const unsigned int jpoint = this->cell_atom_point_[idev][jcell];
-      const unsigned int jcount = this->cell_atom_count_[idev][jcell];
-      if (jcount == 0)
-        continue;
-
-      calc_sr_ef_inter_kernel<num_threads><<<num_blocks, num_threads>>>(
-          this->fx_[idev].d_array().data() + ipoint,
-          this->fy_[idev].d_array().data() + ipoint,
-          this->fz_[idev].d_array().data() + ipoint,
-          this->en_[idev].d_array().data() + ipoint,
-          this->rx_[idev].d_array().data() + ipoint,
-          this->ry_[idev].d_array().data() + ipoint,
-          this->rz_[idev].d_array().data() + ipoint,
-          this->qc_[idev].d_array().data() + ipoint, icount,
-          this->rx_[idev].d_array().data() + jpoint,
-          this->ry_[idev].d_array().data() + jpoint,
-          this->rz_[idev].d_array().data() + jpoint,
-          this->qc_[idev].d_array().data() + jpoint, jcount);
-    }
+    cudaCheck(cudaSetDevice(dev));
+    constexpr dim3 num_threads(64, 1, 1);
+    const dim3 num_blocks(
+        (this->max_atoms_cell_[dev][0] + num_threads.x - 1) / num_threads.x,
+        std::min(65535u,
+                 static_cast<unsigned int>(this->dev_cell_idx_[dev].size())),
+        1);
+    calc_sr_ef_intra_kernel<num_threads.x><<<num_blocks, num_threads>>>(
+        this->fx_[dev].d_array().data(), this->fy_[dev].d_array().data(),
+        this->fz_[dev].d_array().data(), this->en_[dev].d_array().data(),
+        this->rx_[dev].d_array().data(), this->ry_[dev].d_array().data(),
+        this->rz_[dev].d_array().data(), this->qc_[dev].d_array().data(),
+        this->cell_atom_point_[dev].d_array().data(),
+        this->cell_atom_count_[dev].d_array().data(),
+        this->dev_cell_idx_[dev].d_array().data(),
+        static_cast<unsigned int>(this->dev_cell_idx_[dev].size()));
+    calc_sr_ef_inter_kernel<num_threads.x><<<num_blocks, num_threads>>>(
+        this->fx_[dev].d_array().data(), this->fy_[dev].d_array().data(),
+        this->fz_[dev].d_array().data(), this->en_[dev].d_array().data(),
+        this->rx_[dev].d_array().data(), this->ry_[dev].d_array().data(),
+        this->rz_[dev].d_array().data(), this->qc_[dev].d_array().data(),
+        this->cell_atom_point_[dev].d_array().data(),
+        this->cell_atom_count_[dev].d_array().data(),
+        this->dev_cell_idx_[dev].d_array().data(),
+        static_cast<unsigned int>(this->dev_cell_idx_[dev].size()),
+        this->ncell_x_, this->ncell_y_, this->ncell_z_);
   }
 
   return;
@@ -1192,7 +1226,8 @@ void glst_force::init_alpha_groups(std::vector<unsigned int> &ncell_alpha_group,
 
   this->ngroup_ = static_cast<unsigned int>(ncell_alpha_group.size());
 
-  std::vector<unsigned int> r_in(this->ngroup_), r_out(this->ngroup_);
+  std::vector<unsigned int> r_in((this->ngroup_ > 0) ? this->ngroup_ : 1);
+  std::vector<unsigned int> r_out((this->ngroup_ > 0) ? this->ngroup_ : 1);
   r_in[0] = 1;
   for (unsigned int group = 0; group < this->ngroup_; group++) {
     if (group > 0)
@@ -1205,69 +1240,6 @@ void glst_force::init_alpha_groups(std::vector<unsigned int> &ncell_alpha_group,
   for (int dev = 0; dev < this->cuda_count_; dev++) {
     this->grp_r_in_[dev] = r_in;
     this->grp_r_out_[dev] = r_out;
-  }
-
-  return;
-}
-
-void glst_force::init_cell_nghbr_lists(void) {
-  std::vector<unsigned int> dir_nghbr_point(this->ncell_, 0);
-  std::vector<unsigned int> dir_nghbr_count(this->ncell_, 0);
-  std::vector<unsigned int> dir_nghbr_list;
-
-  for (int cx = 0; cx < static_cast<int>(this->ncell_x_); cx++) {
-    for (int cy = 0; cy < static_cast<int>(this->ncell_y_); cy++) {
-      for (int cz = 0; cz < static_cast<int>(this->ncell_z_); cz++) {
-        const unsigned int cell =
-            (static_cast<unsigned int>(cx) * this->ncell_y_ +
-             static_cast<unsigned int>(cy)) *
-                this->ncell_z_ +
-            static_cast<unsigned int>(cz);
-
-        // Generate direct neighbor lists
-        int width0 = 1;
-        for (int sx = -width0; sx <= width0; sx++) {
-          const int nx = cx + sx;
-          if ((nx < 0) || (nx >= static_cast<int>(this->ncell_x_)))
-            continue;
-          for (int sy = -width0; sy <= width0; sy++) {
-            const int ny = cy + sy;
-            if ((ny < 0) || (ny >= static_cast<int>(this->ncell_y_)))
-              continue;
-            for (int sz = -width0; sz <= width0; sz++) {
-              const int nz = cz + sz;
-              if ((nz < 0) || (nz >= static_cast<int>(this->ncell_z_)))
-                continue;
-              if ((sx == 0) && (sy == 0) && (sz == 0)) // Skip self
-                continue;
-              const unsigned int nbr =
-                  (static_cast<unsigned int>(nx) * this->ncell_y_ +
-                   static_cast<unsigned int>(ny)) *
-                      this->ncell_z_ +
-                  static_cast<unsigned int>(nz);
-              dir_nghbr_list.push_back(nbr);
-              dir_nghbr_count[cell]++;
-            }
-          }
-        }
-
-        // Set starting indices for direct and remote neighbor lists
-        if (cell < this->ncell_ - 1) {
-          dir_nghbr_point[cell + 1] =
-              dir_nghbr_point[cell] + dir_nghbr_count[cell];
-        }
-      }
-    }
-  }
-
-  this->dir_nghbr_point_.resize(this->cuda_count_);
-  this->dir_nghbr_count_.resize(this->cuda_count_);
-  this->dir_nghbr_list_.resize(this->cuda_count_);
-  for (int dev = 0; dev < this->cuda_count_; dev++) {
-    cudaCheck(cudaSetDevice(dev));
-    this->dir_nghbr_point_[dev] = dir_nghbr_point;
-    this->dir_nghbr_count_[dev] = dir_nghbr_count;
-    this->dir_nghbr_list_[dev] = dir_nghbr_list;
   }
 
   return;
@@ -1326,6 +1298,84 @@ void glst_force::deallocate(void) {
       }
     }
   }
+
+  return;
+}
+
+void glst_force::cells2dev(void) {
+  /* */
+  { // Assign each cell to a CUDA device
+    this->cell_dev_idx_.resize(this->ncell_);
+    int dev = 0;
+    for (unsigned int cell = 0; cell < this->ncell_; cell++) {
+      if (dev >= this->cuda_count_)
+        dev = 0;
+      this->cell_dev_idx_[cell] = dev++;
+    }
+  }
+
+  { // Store a list of the cells each device is responsible for
+    this->dev_cell_idx_.resize(this->cuda_count_);
+    for (int dev = 0; dev < this->cuda_count_; dev++) {
+      cudaCheck(cudaSetDevice(dev));
+      std::vector<unsigned int> tmp;
+      for (unsigned int cell = 0; cell < this->ncell_; cell++) {
+        if (this->cell_dev_idx_[cell] == dev)
+          tmp.push_back(cell);
+      }
+      this->dev_cell_idx_[dev] = tmp;
+    }
+  }
+  /* */
+
+  /* *
+  { // Assign each cell to a CUDA device
+    // Each device owns a continguous range of x-cell indices
+    this->cell_dev_idx_.resize(this->ncell_);
+    const unsigned int nx = this->ncell_x_ / this->cuda_count_;
+    const unsigned int rem = this->ncell_x_ % this->cuda_count_;
+    std::vector<unsigned int> xpoint(this->cuda_count_, 0);
+    std::vector<unsigned int> xcount(this->cuda_count_, 0);
+    for (int dev = 0; dev < this->cuda_count_; dev++) {
+      if (dev > 0)
+        xpoint[dev] = xpoint[dev - 1] + xcount[dev - 1];
+      xcount[dev] = (dev < static_cast<int>(rem)) ? nx + 1 : nx;
+    }
+    for (int dev = 0; dev < this->cuda_count_; dev++) {
+      for (unsigned int x0 = 0; x0 < xcount[dev]; x0++) {
+        const unsigned int x = xpoint[dev] + x0;
+        for (unsigned int y = 0; y < this->ncell_y_; y++) {
+          for (unsigned int z = 0; z < this->ncell_z_; z++) {
+            const unsigned int cell =
+                (x * this->ncell_y_ + y) * this->ncell_z_ + z;
+            this->cell_dev_idx_[cell] = dev;
+          }
+        }
+      }
+    }
+  }
+  * */
+
+  /* *
+  // Build a brick decomposition over (ncell_x, ncell_y, ncell_z)
+  CellDistribution dist = distribute_cells_to_gpus(
+      static_cast<int>(this->ncell_x_), static_cast<int>(this->ncell_y_),
+      static_cast<int>(this->ncell_z_), this->cuda_count_);
+
+  this->cell_dev_idx_ = dist.cell_dev_idx;
+
+  this->dev_cell_idx_.resize(this->cuda_count_);
+  for (int dev = 0; dev < this->cuda_count_; dev++) {
+    cudaCheck(cudaSetDevice(dev));
+    this->dev_cell_idx_[dev] = dist.dev_cell_idx[dev];
+  }
+
+  // Optional: print chosen proc grid
+  std::cout << "Proc grid: Px=" << dist.grid.Px << " Py=" << dist.grid.Py
+            << " Pz=" << dist.grid.Pz << " (ngpu_used=" << dist.ngpu_used <<
+  ")"
+            << std::endl;
+  * */
 
   return;
 }
