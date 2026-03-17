@@ -16,7 +16,12 @@
 #include <string>
 #include <vector>
 
-class cubature {
+// CT = Cubature Type
+// Type of the cubature nodes and weights. Computing the cubature nodes and
+// weights is done in double precision, but can be stored as single (float) or
+// double precision.
+
+template <typename CT> class cubature {
 public:
   cubature(void);
   cubature(const double tol, const unsigned int nalpha,
@@ -28,7 +33,10 @@ public:
   unsigned int tot_num_nodes(void) const;
   const std::vector<cuda_container<unsigned int>> &points(void) const;
   const std::vector<cuda_container<unsigned int>> &num_nodes(void) const;
-  const std::vector<cuda_container<double4>> &xyzw(void) const;
+  const std::vector<cuda_container<CT>> &x(void) const;
+  const std::vector<cuda_container<CT>> &y(void) const;
+  const std::vector<cuda_container<CT>> &z(void) const;
+  const std::vector<cuda_container<CT>> &w(void) const;
 
 public:
   void initialize(const double tol, const unsigned int nalpha,
@@ -77,9 +85,15 @@ private:
   unsigned int tot_num_nodes_;
   std::vector<cuda_container<unsigned int>> points_;
   std::vector<cuda_container<unsigned int>> num_nodes_;
-  std::vector<cuda_container<double4>> xyzw_;
+  std::vector<cuda_container<CT>> x_;
+  std::vector<cuda_container<CT>> y_;
+  std::vector<cuda_container<CT>> z_;
+  std::vector<cuda_container<CT>> w_;
 
   int cuda_count_;
 };
+
+template class cubature<float>;
+template class cubature<double>;
 
 #endif

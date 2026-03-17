@@ -5,8 +5,10 @@ add_library(GLST
   ${GLST_SOURCE_DIR}/src/cubature.cu
   ${GLST_SOURCE_DIR}/src/cuda_container.cu
   ${GLST_SOURCE_DIR}/src/cuda_utils.cu
+  ${GLST_SOURCE_DIR}/src/device_comm.cu
   ${GLST_SOURCE_DIR}/src/device_vector.cu
   ${GLST_SOURCE_DIR}/src/glst_force.cu
+  ${GLST_SOURCE_DIR}/src/string_utils.cpp
 )
 set_target_properties(GLST PROPERTIES
   CUDA_ARCHITECTURES "80"
@@ -29,4 +31,5 @@ target_link_libraries(GLST
   CUDA::cudart
   # CUDA::cublas
   CUDA::cuda_driver
+  nccl
 )

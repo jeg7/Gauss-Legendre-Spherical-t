@@ -13,18 +13,18 @@
 
 #include <cstddef>
 
-struct atom_packet {
+template <typename T> struct atom_packet {
 public:
   __device__ __host__ atom_packet(void)
-      : i(0), x(0.0), y(0.0), z(0.0), q(0.0) {}
-  __device__ __host__ atom_packet(const unsigned int id, const double rx,
-                                  const double ry, const double rz,
-                                  const double qc)
+      : i(0), x(static_cast<T>(0.0)), y(static_cast<T>(0.0)),
+        z(static_cast<T>(0.0)), q(static_cast<T>(0.0)) {}
+  __device__ __host__ atom_packet(const unsigned int id, const T rx, const T ry,
+                                  const T rz, const T qc)
       : i(id), x(rx), y(ry), z(rz), q(qc) {}
 
 public:
   unsigned int i;
-  double x, y, z, q;
+  T x, y, z, q;
 };
 
 #endif

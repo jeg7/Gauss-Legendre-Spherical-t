@@ -27,6 +27,22 @@ endif()
 
 find_package(CUDAToolkit REQUIRED)
 
+# NCCL
+if(NOT DEFINED ENV{NCCL_ROOT})
+  message(FATAL_ERROR "NCCL_ROOT was not defined in your environment")
+endif()
+set(NCCL_LIB $ENV{NCCL_ROOT})
+set(NCCL_INCLUDE $ENV{NCCL_ROOT})
+string(APPEND NCCL_LIB "/lib/libnccl.so")
+string(APPEND NCCL_INCLUDE "/include")
+message("-- NCCL lib: ${NCCL_LIB}")
+message("-- NCCL include: ${NCCL_INCLUDE}")
+add_library(nccl SHARED IMPORTED)
+set_target_properties(nccl PROPERTIES
+  IMPORTED_LOCATION ${NCCL_LIB}
+  INTERFACE_INCLUDE_DIRECTORIES ${NCCL_INCLUDE}
+)
+
 add_subdirectory(${GLST_SOURCE_DIR}/src)
 add_subdirectory(${GLST_SOURCE_DIR}/utils)
 add_subdirectory(${GLST_SOURCE_DIR}/test)

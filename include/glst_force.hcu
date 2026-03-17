@@ -15,9 +15,13 @@
 #include "cubature.hcu"
 #include "cuda_container.hcu"
 #include <memory>
+#include <nccl.h>
+#include <string>
 #include <vector>
 
-class glst_force {
+// CT = Calculation Type
+
+template <typename CT> class glst_force {
 public: // Constructors and destructors
   glst_force(void);
   glst_force(const unsigned int natom, const double tol, const double box_dim_x,
@@ -68,12 +72,12 @@ private:
   unsigned int natom_;
   std::vector<cuda_container<unsigned int>> idx_;
   std::vector<cuda_container<unsigned int>> sorted_idx_;
-  std::vector<cuda_container<double>> rx_;
-  std::vector<cuda_container<double>> ry_;
-  std::vector<cuda_container<double>> rz_;
-  std::vector<cuda_container<double>> qc_;
-  std::vector<cuda_container<atom_packet>> packets_;
-  std::vector<cuda_container<atom_packet>> sorted_packets_;
+  std::vector<cuda_container<CT>> rx_;
+  std::vector<cuda_container<CT>> ry_;
+  std::vector<cuda_container<CT>> rz_;
+  std::vector<cuda_container<CT>> qc_;
+  std::vector<cuda_container<atom_packet<CT>>> packets_;
+  std::vector<cuda_container<atom_packet<CT>>> sorted_packets_;
   std::vector<cuda_container<double>> fx_;
   std::vector<cuda_container<double>> fy_;
   std::vector<cuda_container<double>> fz_;
@@ -85,21 +89,23 @@ private:
   unsigned int ncell_y_;
   unsigned int ncell_z_;
   unsigned int ncell_;
-  double cell_dim_x_;
-  double cell_dim_y_;
-  double cell_dim_z_;
+  CT cell_dim_x_;
+  CT cell_dim_y_;
+  CT cell_dim_z_;
 
   unsigned int ngroup_;
   std::vector<cuda_container<unsigned int>> grp_r_in_;
   std::vector<cuda_container<unsigned int>> grp_r_out_;
 
-  std::unique_ptr<cubature> cubature_;
+  std::unique_ptr<cubature<CT>> cubature_;
 
   std::vector<cuda_container<unsigned int>> cell_atom_point_;
   std::vector<cuda_container<unsigned int>> cell_atom_count_;
   std::vector<cuda_container<unsigned int>> max_atoms_cell_;
-  std::vector<cuda_container<double2>> sf_;
-  std::vector<cuda_container<double2>> rmt_sum_;
+  std::vector<cuda_container<CT>> sf_re_;
+  std::vector<cuda_container<CT>> sf_im_;
+  std::vector<cuda_container<CT>> rmt_sum_re_;
+  std::vector<cuda_container<CT>> rmt_sum_im_;
 
   std::vector<void *> cub_work_buffer_;
   std::vector<std::size_t> cub_work_buffer_size_;
@@ -107,6 +113,15 @@ private:
   int cuda_count_;
   std::vector<int> cell_dev_idx_;
   std::vector<cuda_container<unsigned int>> dev_cell_idx_;
+  std::vector<cudaStream_t> comp_streams_;
+  std::vector<cudaStream_t> comm_streams_;
+  std::vector<cudaEvent_t> comp_events_;
+  std::vector<cudaEvent_t> comm_events_;
+  std::vector<int> nccl_devs_;
+  std::vector<ncclComm_t> nccl_comms_;
 };
+
+template class glst_force<float>;
+template class glst_force<double>;
 
 #endif

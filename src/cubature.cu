@@ -17,10 +17,16 @@
 #include <fstream>
 #include <limits>
 #include <stdexcept>
+#include <type_traits>
 
-cubature::cubature(void)
-    : num_cubatures_(0), tot_num_nodes_(0), points_(), num_nodes_(), xyzw_(),
-      cuda_count_(-1) {
+template <typename CT>
+cubature<CT>::cubature(void)
+    : num_cubatures_(0), tot_num_nodes_(0), points_(), num_nodes_(), x_(), y_(),
+      z_(), w_(), cuda_count_(-1) {
+  // Ensure that CT is of a correct type
+  static_assert(std::is_floating_point_v<CT>,
+                "CT must be a floating-point type (float or double)");
+
   cudaCheck(cudaGetDeviceCount(&this->cuda_count_));
   if (this->cuda_count_ < 1) {
     throw std::runtime_error(
@@ -28,42 +34,66 @@ cubature::cubature(void)
   }
   this->points_.resize(this->cuda_count_);
   this->num_nodes_.resize(this->cuda_count_);
-  this->xyzw_.resize(this->cuda_count_);
+  this->x_.resize(this->cuda_count_);
+  this->y_.resize(this->cuda_count_);
+  this->z_.resize(this->cuda_count_);
+  this->w_.resize(this->cuda_count_);
 }
 
-cubature::cubature(const double tol, const unsigned int nalpha,
-                   const std::vector<double> &rmax,
-                   const std::vector<double> &alpha,
-                   const std::vector<double> &zcut)
+template <typename CT>
+cubature<CT>::cubature(const double tol, const unsigned int nalpha,
+                       const std::vector<double> &rmax,
+                       const std::vector<double> &alpha,
+                       const std::vector<double> &zcut)
     : cubature() {
   this->initialize(tol, nalpha, rmax, alpha, zcut);
 }
 
-unsigned int cubature::num_cubatures(void) const {
+template <typename CT> unsigned int cubature<CT>::num_cubatures(void) const {
   return this->num_cubatures_;
 }
 
-unsigned int cubature::tot_num_nodes(void) const {
+template <typename CT> unsigned int cubature<CT>::tot_num_nodes(void) const {
   return this->tot_num_nodes_;
 }
 
-const std::vector<cuda_container<unsigned int>> &cubature::points(void) const {
+template <typename CT>
+const std::vector<cuda_container<unsigned int>> &
+cubature<CT>::points(void) const {
   return this->points_;
 }
 
+template <typename CT>
 const std::vector<cuda_container<unsigned int>> &
-cubature::num_nodes(void) const {
+cubature<CT>::num_nodes(void) const {
   return this->num_nodes_;
 }
 
-const std::vector<cuda_container<double4>> &cubature::xyzw(void) const {
-  return this->xyzw_;
+template <typename CT>
+const std::vector<cuda_container<CT>> &cubature<CT>::x(void) const {
+  return this->x_;
 }
 
-void cubature::initialize(const double tol, const unsigned int nalpha,
-                          const std::vector<double> &rmax,
-                          const std::vector<double> &alpha,
-                          const std::vector<double> &zcut) {
+template <typename CT>
+const std::vector<cuda_container<CT>> &cubature<CT>::y(void) const {
+  return this->y_;
+}
+
+template <typename CT>
+const std::vector<cuda_container<CT>> &cubature<CT>::z(void) const {
+  return this->z_;
+}
+
+template <typename CT>
+const std::vector<cuda_container<CT>> &cubature<CT>::w(void) const {
+  return this->w_;
+}
+
+template <typename CT>
+void cubature<CT>::initialize(const double tol, const unsigned int nalpha,
+                              const std::vector<double> &rmax,
+                              const std::vector<double> &alpha,
+                              const std::vector<double> &zcut) {
   this->num_cubatures_ = nalpha;
   this->tot_num_nodes_ = 0;
 
@@ -78,7 +108,7 @@ void cubature::initialize(const double tol, const unsigned int nalpha,
 
   std::vector<unsigned int> points(nalpha, 0);
   std::vector<unsigned int> num_nodes(nalpha, 0);
-  std::vector<double4> xyzw;
+  std::vector<CT> xc, yc, zc, wc;
   for (unsigned int grp = 0; grp < nalpha; grp++) {
     num_nodes[grp] =
         static_cast<unsigned int>(xgl[grp].size() * sm[grp].size());
@@ -97,7 +127,10 @@ void cubature::initialize(const double tol, const unsigned int nalpha,
         const double w = 4.0 * alpha[grp] * zcut[grp] * wgl[grp][i] *
                          std::exp(-zcut2 * xgl[grp][i] * xgl[grp][i]) /
                          (M_PI * static_cast<double>(sm[grp].size()));
-        xyzw.push_back(make_double4(x, y, z, w));
+        xc.push_back(static_cast<CT>(x));
+        yc.push_back(static_cast<CT>(y));
+        zc.push_back(static_cast<CT>(z));
+        wc.push_back(static_cast<CT>(w));
       }
     }
   }
@@ -106,14 +139,18 @@ void cubature::initialize(const double tol, const unsigned int nalpha,
     cudaCheck(cudaSetDevice(dev));
     this->points_[dev] = points;
     this->num_nodes_[dev] = num_nodes;
-    this->xyzw_[dev] = xyzw;
+    this->x_[dev] = xc;
+    this->y_[dev] = yc;
+    this->z_[dev] = zc;
+    this->w_[dev] = wc;
   }
 
   return;
 }
 
-void cubature::eval_legendre_poly(double &p, double &dpdx, const double x,
-                                  const unsigned int n) {
+template <typename CT>
+void cubature<CT>::eval_legendre_poly(double &p, double &dpdx, const double x,
+                                      const unsigned int n) {
   // Evaluate Legendre polynomial Pl_n(x) and its derivative at x
   if (n == 0) {
     p = 1.0;
@@ -145,8 +182,10 @@ void cubature::eval_legendre_poly(double &p, double &dpdx, const double x,
   return;
 }
 
-void cubature::get_wgl(std::vector<double> &wgl, const std::vector<double> &xgl,
-                       const unsigned int n) {
+template <typename CT>
+void cubature<CT>::get_wgl(std::vector<double> &wgl,
+                           const std::vector<double> &xgl,
+                           const unsigned int n) {
   // Get Gauss-Legendre quadrature weights (Golub 1969, w_j)
   //
   // w_j = 2 / (1 - x_j^2)[Pl_N'(x_j)^2] (x_j: j-th root of Pl.)
@@ -164,7 +203,8 @@ void cubature::get_wgl(std::vector<double> &wgl, const std::vector<double> &xgl,
   return;
 }
 
-double cubature::eval_legendre_root(const double x0, const unsigned int n) {
+template <typename CT>
+double cubature<CT>::eval_legendre_root(const double x0, const unsigned int n) {
   // Newton's method for finding first root of Pl_n(x) arouund x0
   double p = 1.0, dpdx = 0.0;
   double dx1 = 0.0, dx2 = -1.0;
@@ -187,7 +227,8 @@ double cubature::eval_legendre_root(const double x0, const unsigned int n) {
   return x;
 }
 
-void cubature::get_xgl(std::vector<double> &xgl, const unsigned int n) {
+template <typename CT>
+void cubature<CT>::get_xgl(std::vector<double> &xgl, const unsigned int n) {
   // Find positive roots of Pl_n(x). Strategy:
   //
   // For odd n, put x = 0 as the first root. There are m = (n + 1) / 2 positive
@@ -299,11 +340,12 @@ void cubature::get_xgl(std::vector<double> &xgl, const unsigned int n) {
   return;
 }
 
-void cubature::get_gauss_legendre(unsigned int &ngl, unsigned int &ngl0,
-                                  std::vector<double> &xgl,
-                                  std::vector<double> &wgl, const double tol,
-                                  const double dist, const double alpha,
-                                  const double zcut) {
+template <typename CT>
+void cubature<CT>::get_gauss_legendre(unsigned int &ngl, unsigned int &ngl0,
+                                      std::vector<double> &xgl,
+                                      std::vector<double> &wgl,
+                                      const double tol, const double dist,
+                                      const double alpha, const double zcut) {
   constexpr unsigned int MIN_DEGREE = 2;
   constexpr unsigned int MAX_DEGREE = 324;
 
@@ -349,7 +391,8 @@ void cubature::get_gauss_legendre(unsigned int &ngl, unsigned int &ngl0,
   return;
 }
 
-void cubature::assign_gauss_legendre_quadratures(
+template <typename CT>
+void cubature<CT>::assign_gauss_legendre_quadratures(
     std::vector<unsigned int> &ngl0, std::vector<std::vector<double>> &xgl,
     std::vector<std::vector<double>> &wgl, const double tol,
     const unsigned int nalpha, const std::vector<double> &rmax,
@@ -366,8 +409,9 @@ void cubature::assign_gauss_legendre_quadratures(
   return;
 }
 
-void cubature::read_tdesign(std::vector<std::array<double, 3>> &sm,
-                            const std::string &tfname) {
+template <typename CT>
+void cubature<CT>::read_tdesign(std::vector<std::array<double, 3>> &sm,
+                                const std::string &tfname) {
   std::ifstream fs(tfname);
 
   if (!fs.is_open())
@@ -384,9 +428,10 @@ void cubature::read_tdesign(std::vector<std::array<double, 3>> &sm,
   return;
 }
 
-void cubature::get_tdesign_props(std::string &tfname, unsigned int &m,
-                                 const unsigned int tdeg,
-                                 const std::string &dir) {
+template <typename CT>
+void cubature<CT>::get_tdesign_props(std::string &tfname, unsigned int &m,
+                                     const unsigned int tdeg,
+                                     const std::string &dir) {
   for (const auto &file : std::filesystem::directory_iterator(dir)) {
     std::string path = file.path();
     std::size_t pos0 = path.length() - 9;
@@ -403,12 +448,14 @@ void cubature::get_tdesign_props(std::string &tfname, unsigned int &m,
   return;
 }
 
-void cubature::get_spherical_tdesign(std::vector<std::array<double, 3>> &sm,
-                                     const unsigned int ngl0,
-                                     const std::vector<double> &xgl,
-                                     const std::vector<double> &wgl,
-                                     const double tol, const double dist,
-                                     const double alpha, const double zcut) {
+template <typename CT>
+void cubature<CT>::get_spherical_tdesign(std::vector<std::array<double, 3>> &sm,
+                                         const unsigned int ngl0,
+                                         const std::vector<double> &xgl,
+                                         const std::vector<double> &wgl,
+                                         const double tol, const double dist,
+                                         const double alpha,
+                                         const double zcut) {
   // Given Gauss-Legendre quadrature Xgl (roots) and Wgl (weights), determine
   // the tdeg of t-design and save the corresponding unit vectors \hat t_m to
   // Sm. For this, increment t-design tdeg, read {\hat t_m}, and calculate
@@ -465,7 +512,8 @@ void cubature::get_spherical_tdesign(std::vector<std::array<double, 3>> &sm,
   return;
 }
 
-void cubature::assign_spherical_tdesigns(
+template <typename CT>
+void cubature<CT>::assign_spherical_tdesigns(
     std::vector<std::vector<std::array<double, 3>>> &sm,
     const std::vector<unsigned int> &ngl0,
     const std::vector<std::vector<double>> &xgl,

@@ -71,17 +71,20 @@ int main(int argc, char **argv) {
   cuda_container<double> fx_glst(natom), fy_glst(natom), fz_glst(natom),
       en_glst(natom);
 
-  std::unique_ptr<glst_force> glst = nullptr;
+  // typedef float real_type;
+  typedef double real_type;
+
+  std::unique_ptr<glst_force<real_type>> glst = nullptr;
   if (argc == 5)
-    glst = std::make_unique<glst_force>(natom, tol, box_dim_x, box_dim_y,
-                                        box_dim_z, rcut);
+    glst = std::make_unique<glst_force<real_type>>(natom, tol, box_dim_x,
+                                                   box_dim_y, box_dim_z, rcut);
   else if (argc == 7)
-    glst = std::make_unique<glst_force>(natom, tol, box_dim_x, box_dim_y,
-                                        box_dim_z, ncell_x, ncell_y, ncell_z);
+    glst = std::make_unique<glst_force<real_type>>(
+        natom, tol, box_dim_x, box_dim_y, box_dim_z, ncell_x, ncell_y, ncell_z);
 
   std::cout << std::endl;
 
-  constexpr std::size_t MAX_ITER = 50;
+  constexpr std::size_t MAX_ITER = 100;
   std::vector<std::vector<double>> times(7, std::vector<double>(MAX_ITER));
   for (std::size_t ITER = 0; ITER < MAX_ITER; ITER++) {
     std::cout << "\rIteration " << ITER << std::flush;
@@ -152,22 +155,22 @@ int main(int argc, char **argv) {
   std::cout << "\rFinished " << MAX_ITER << " calculations" << std::endl;
   std::cout << std::endl;
   std::cout << "                   Assign atoms to cells: " << avg(times[0])
-            << " ms (" << stdev(times[0]) << ") " << std::endl;
+            << " ms (+/- " << stdev(times[0]) << " ms)" << std::endl;
   std::cout << "             Calculate structure factors: " << avg(times[1])
-            << " ms (" << stdev(times[1]) << ")" << std::endl;
+            << " ms (+/- " << stdev(times[1]) << " ms)" << std::endl;
   std::cout << "            Sum remote structure factors: " << avg(times[2])
-            << " ms (" << stdev(times[2]) << ")" << std::endl;
+            << " ms (+/- " << stdev(times[2]) << " ms)" << std::endl;
   std::cout << "  Calculate long-range energy and forces: " << avg(times[3])
-            << " ms (" << stdev(times[3]) << ")" << std::endl;
+            << " ms (+/- " << stdev(times[3]) << " ms)" << std::endl;
   std::cout << " Calculate short-range energy and forces: " << avg(times[4])
-            << " ms (" << stdev(times[4]) << ")" << std::endl;
+            << " ms (+/- " << stdev(times[4]) << " ms)" << std::endl;
   std::cout << "---------------------------------------------------------------"
                "-----------"
             << std::endl;
   std::cout << "                 Long-Range GLST Runtime: " << avg(times[5])
-            << " ms (" << stdev(times[5]) << ")" << std::endl;
+            << " ms (+/- " << stdev(times[5]) << " ms)" << std::endl;
   std::cout << "                      Total GLST Runtime: " << avg(times[6])
-            << " ms (" << stdev(times[6]) << ")" << std::endl;
+            << " ms (+/- " << stdev(times[6]) << " ms)" << std::endl;
 
   // Transfer GLST results to host
   glst->get_ef(fx_glst, fy_glst, fz_glst, en_glst);

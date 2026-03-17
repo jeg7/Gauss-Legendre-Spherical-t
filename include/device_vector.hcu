@@ -72,6 +72,7 @@ template class device_vector<double>;
 template class device_vector<double2>;
 template class device_vector<double3>;
 template class device_vector<double4>;
-template class device_vector<atom_packet>;
+template class device_vector<atom_packet<float>>;
+template class device_vector<atom_packet<double>>;
 
 #endif
