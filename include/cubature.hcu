@@ -37,6 +37,7 @@ public:
   const std::vector<cuda_container<CT>> &y(void) const;
   const std::vector<cuda_container<CT>> &z(void) const;
   const std::vector<cuda_container<CT>> &w(void) const;
+  const std::vector<cuda_container<unsigned int>> &group(void) const;
 
 public:
   void initialize(const double tol, const unsigned int nalpha,
@@ -89,6 +90,7 @@ private:
   std::vector<cuda_container<CT>> y_;
   std::vector<cuda_container<CT>> z_;
   std::vector<cuda_container<CT>> w_;
+  std::vector<cuda_container<unsigned int>> group_;
 
   int cuda_count_;
 };

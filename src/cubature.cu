@@ -22,7 +22,7 @@
 template <typename CT>
 cubature<CT>::cubature(void)
     : num_cubatures_(0), tot_num_nodes_(0), points_(), num_nodes_(), x_(), y_(),
-      z_(), w_(), cuda_count_(-1) {
+      z_(), w_(), group_(), cuda_count_(-1) {
   // Ensure that CT is of a correct type
   static_assert(std::is_floating_point_v<CT>,
                 "CT must be a floating-point type (float or double)");
@@ -38,6 +38,7 @@ cubature<CT>::cubature(void)
   this->y_.resize(this->cuda_count_);
   this->z_.resize(this->cuda_count_);
   this->w_.resize(this->cuda_count_);
+  this->group_.resize(this->cuda_count_);
 }
 
 template <typename CT>
@@ -90,6 +91,12 @@ const std::vector<cuda_container<CT>> &cubature<CT>::w(void) const {
 }
 
 template <typename CT>
+const std::vector<cuda_container<unsigned int>> &
+cubature<CT>::group(void) const {
+  return this->group_;
+}
+
+template <typename CT>
 void cubature<CT>::initialize(const double tol, const unsigned int nalpha,
                               const std::vector<double> &rmax,
                               const std::vector<double> &alpha,
@@ -109,6 +116,7 @@ void cubature<CT>::initialize(const double tol, const unsigned int nalpha,
   std::vector<unsigned int> points(nalpha, 0);
   std::vector<unsigned int> num_nodes(nalpha, 0);
   std::vector<CT> xc, yc, zc, wc;
+  std::vector<unsigned int> g;
   for (unsigned int grp = 0; grp < nalpha; grp++) {
     num_nodes[grp] =
         static_cast<unsigned int>(xgl[grp].size() * sm[grp].size());
@@ -131,6 +139,7 @@ void cubature<CT>::initialize(const double tol, const unsigned int nalpha,
         yc.push_back(static_cast<CT>(y));
         zc.push_back(static_cast<CT>(z));
         wc.push_back(static_cast<CT>(w));
+        g.push_back(grp);
       }
     }
   }
@@ -143,6 +152,7 @@ void cubature<CT>::initialize(const double tol, const unsigned int nalpha,
     this->y_[dev] = yc;
     this->z_[dev] = zc;
     this->w_[dev] = wc;
+    this->group_[dev] = g;
   }
 
   return;

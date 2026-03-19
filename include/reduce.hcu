@@ -23,7 +23,7 @@ template <typename T> __device__ __inline__ T block_reduce_sum(T value) {
   const unsigned int lane = threadIdx.x % warpSize;
   const unsigned int warp = threadIdx.x / warpSize;
 
-  value = warp_reduce_sum<t>(value);
+  value = warp_reduce_sum<T>(value);
 
   // Write reduced value to shared memory
   if (lane == 0)

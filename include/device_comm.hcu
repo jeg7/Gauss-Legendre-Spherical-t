@@ -37,4 +37,40 @@ void nccl_all_reduce_sum_pair_ip(std::vector<cuda_container<double>> &buffs0,
                                  std::vector<cudaStream_t> &streams,
                                  const int cuda_count);
 
+void nccl_all_reduce_sum_ef_ip(std::vector<cuda_container<float>> &fx,
+                               std::vector<cuda_container<float>> &fy,
+                               std::vector<cuda_container<float>> &fz,
+                               std::vector<cuda_container<float>> &en,
+                               std::size_t count,
+                               std::vector<ncclComm_t> &comms,
+                               std::vector<cudaStream_t> &streams,
+                               const int cuda_count);
+
+void nccl_all_reduce_sum_ef_ip(std::vector<cuda_container<double>> &fx,
+                               std::vector<cuda_container<double>> &fy,
+                               std::vector<cuda_container<double>> &fz,
+                               std::vector<cuda_container<double>> &en,
+                               std::size_t count,
+                               std::vector<ncclComm_t> &comms,
+                               std::vector<cudaStream_t> &streams,
+                               const int cuda_count);
+
+void nccl_root_reduce_sum_ef_ip(std::vector<cuda_container<float>> &fx,
+                                std::vector<cuda_container<float>> &fy,
+                                std::vector<cuda_container<float>> &fz,
+                                std::vector<cuda_container<float>> &en,
+                                std::size_t count,
+                                std::vector<ncclComm_t> &comms,
+                                std::vector<cudaStream_t> &streams,
+                                const int cuda_count);
+
+void nccl_root_reduce_sum_ef_ip(std::vector<cuda_container<double>> &fx,
+                                std::vector<cuda_container<double>> &fy,
+                                std::vector<cuda_container<double>> &fz,
+                                std::vector<cuda_container<double>> &en,
+                                std::size_t count,
+                                std::vector<ncclComm_t> &comms,
+                                std::vector<cudaStream_t> &streams,
+                                const int cuda_count);
+
 #endif

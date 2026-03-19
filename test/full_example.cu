@@ -73,7 +73,6 @@ int main(int argc, char **argv) {
 
   // typedef float real_type;
   typedef double real_type;
-
   std::unique_ptr<glst_force<real_type>> glst = nullptr;
   if (argc == 5)
     glst = std::make_unique<glst_force<real_type>>(natom, tol, box_dim_x,
@@ -85,7 +84,7 @@ int main(int argc, char **argv) {
   std::cout << std::endl;
 
   constexpr std::size_t MAX_ITER = 100;
-  std::vector<std::vector<double>> times(7, std::vector<double>(MAX_ITER));
+  std::vector<std::vector<double>> times(8, std::vector<double>(MAX_ITER));
   for (std::size_t ITER = 0; ITER < MAX_ITER; ITER++) {
     std::cout << "\rIteration " << ITER << std::flush;
     auto start_glst = std::chrono::high_resolution_clock::now();
@@ -126,12 +125,20 @@ int main(int argc, char **argv) {
       cudaDeviceSynchronize();
     }
     auto end_sr = std::chrono::high_resolution_clock::now();
+    auto start_comm = std::chrono::high_resolution_clock::now();
+    glst->comm_ef();
+    for (int dev = 0; dev < cuda_count; dev++) {
+      cudaSetDevice(dev);
+      cudaDeviceSynchronize();
+    }
+    auto end_comm = std::chrono::high_resolution_clock::now();
     auto end_glst = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> time_assign = end_assign - start_assign;
     std::chrono::duration<double> time_sf = end_sf - start_sf;
     std::chrono::duration<double> time_sum = end_sum - start_sum;
     std::chrono::duration<double> time_lr = end_lr - start_lr;
     std::chrono::duration<double> time_sr = end_sr - start_sr;
+    std::chrono::duration<double> time_comm = end_comm - start_comm;
     std::chrono::duration<double> time_glst_lr = end_glst_lr - start_glst;
     std::chrono::duration<double> time_glst = end_glst - start_glst;
     times[0][ITER] = 1000.0 * time_assign.count();
@@ -139,8 +146,9 @@ int main(int argc, char **argv) {
     times[2][ITER] = 1000.0 * time_sum.count();
     times[3][ITER] = 1000.0 * time_lr.count();
     times[4][ITER] = 1000.0 * time_sr.count();
-    times[5][ITER] = 1000.0 * time_glst_lr.count();
-    times[6][ITER] = 1000.0 * time_glst.count();
+    times[5][ITER] = 1000.0 * time_comm.count();
+    times[6][ITER] = 1000.0 * time_glst_lr.count();
+    times[7][ITER] = 1000.0 * time_glst.count();
     if (ITER < MAX_ITER - 1) {
       for (int dev = 0; dev < cuda_count; dev++) {
         cudaSetDevice(dev);
@@ -164,18 +172,21 @@ int main(int argc, char **argv) {
             << " ms (+/- " << stdev(times[3]) << " ms)" << std::endl;
   std::cout << " Calculate short-range energy and forces: " << avg(times[4])
             << " ms (+/- " << stdev(times[4]) << " ms)" << std::endl;
+  std::cout << "         Communicate energies and forces: " << avg(times[5])
+            << " ms (+/- " << stdev(times[5]) << " ms)" << std::endl;
   std::cout << "---------------------------------------------------------------"
                "-----------"
             << std::endl;
-  std::cout << "                 Long-Range GLST Runtime: " << avg(times[5])
-            << " ms (+/- " << stdev(times[5]) << " ms)" << std::endl;
-  std::cout << "                      Total GLST Runtime: " << avg(times[6])
+  std::cout << "                 Long-Range GLST Runtime: " << avg(times[6])
             << " ms (+/- " << stdev(times[6]) << " ms)" << std::endl;
+  std::cout << "                      Total GLST Runtime: " << avg(times[7])
+            << " ms (+/- " << stdev(times[7]) << " ms)" << std::endl;
 
   // Transfer GLST results to host
   glst->get_ef(fx_glst, fy_glst, fz_glst, en_glst);
 
   // Compute Coulomb energy and forces
+  cudaSetDevice(0);
   cuda_container<double> fx_coul(natom), fy_coul(natom), fz_coul(natom),
       en_coul(natom);
 
@@ -191,6 +202,7 @@ int main(int argc, char **argv) {
             << std::endl;
 
   // Transfer Coulomb results to host
+  cudaSetDevice(0);
   fx_coul.transfer_to_host();
   fy_coul.transfer_to_host();
   fz_coul.transfer_to_host();

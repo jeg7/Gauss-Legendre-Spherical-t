@@ -13,6 +13,7 @@
 #include "cell_decomp.hpp"
 #include "cuda_utils.hcu"
 #include "device_comm.hcu"
+#include "reduce.hcu"
 #include <cub/cub.cuh>
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -27,11 +28,12 @@ glst_force<CT>::glst_force(void)
       atom_cell_sorted_idx_(), ncell_x_(0), ncell_y_(0), ncell_z_(0), ncell_(0),
       cell_dim_x_(static_cast<CT>(0.0)), cell_dim_y_(static_cast<CT>(0.0)),
       cell_dim_z_(static_cast<CT>(0.0)), ngroup_(0), grp_r_in_(), grp_r_out_(),
-      cubature_(nullptr), cell_atom_point_(), cell_atom_count_(),
-      max_atoms_cell_(), sf_re_(), sf_im_(), rmt_sum_re_(), rmt_sum_im_(),
-      cub_work_buffer_(), cub_work_buffer_size_(), cuda_count_(-1),
-      cell_dev_idx_(), dev_cell_idx_(), comp_streams_(), comm_streams_(),
-      comp_events_(), comm_events_(), nccl_devs_(), nccl_comms_() {
+      cubature_(nullptr), dev_cub_counts_(), dev_cub_points_(),
+      cell_atom_point_(), cell_atom_count_(), max_atoms_cell_(), sf_re_(),
+      sf_im_(), rmt_sum_re_(), rmt_sum_im_(), cub_work_buffer_(),
+      cub_work_buffer_size_(), cuda_count_(-1), cell_dev_idx_(),
+      dev_cell_idx_(), comp_streams_(), comm_streams_(), comp_events_(),
+      comm_events_(), nccl_devs_(), nccl_comms_() {
   // Ensure that CT is of a correct type
   static_assert(std::is_floating_point_v<CT>,
                 "CT must be a floating-point type (float or double)");
@@ -148,65 +150,27 @@ void glst_force<CT>::get_ef(cuda_container<double> &fx,
   fz.resize(this->natom_);
   en.resize(this->natom_);
 
-  fx.set(0);
-  fy.set(0);
-  fz.set(0);
-  en.set(0);
+  cub::DeviceRadixSort::SortPairs(
+      this->cub_work_buffer_[0], this->cub_work_buffer_size_[0],
+      this->sorted_idx_[0].d_array().data(), this->idx_[0].d_array().data(),
+      this->fx_[0].d_array().data(), fx.d_array().data(), this->natom_);
+  cub::DeviceRadixSort::SortPairs(
+      this->cub_work_buffer_[0], this->cub_work_buffer_size_[0],
+      this->sorted_idx_[0].d_array().data(), this->idx_[0].d_array().data(),
+      this->fy_[0].d_array().data(), fy.d_array().data(), this->natom_);
+  cub::DeviceRadixSort::SortPairs(
+      this->cub_work_buffer_[0], this->cub_work_buffer_size_[0],
+      this->sorted_idx_[0].d_array().data(), this->idx_[0].d_array().data(),
+      this->fz_[0].d_array().data(), fz.d_array().data(), this->natom_);
+  cub::DeviceRadixSort::SortPairs(
+      this->cub_work_buffer_[0], this->cub_work_buffer_size_[0],
+      this->sorted_idx_[0].d_array().data(), this->idx_[0].d_array().data(),
+      this->en_[0].d_array().data(), en.d_array().data(), this->natom_);
 
-  std::vector<cuda_container<double>> tmp(this->cuda_count_);
-  for (int dev = 0; dev < this->cuda_count_; dev++) {
-    cudaCheck(cudaSetDevice(dev));
-    tmp[dev].resize(this->natom_);
-  }
-
-  for (int dev = 0; dev < this->cuda_count_; dev++) {
-    cudaCheck(cudaSetDevice(dev));
-    tmp[dev].set(0);
-    cub::DeviceRadixSort::SortPairs(
-        this->cub_work_buffer_[dev], this->cub_work_buffer_size_[dev],
-        this->sorted_idx_[dev].d_array().data(),
-        this->idx_[dev].d_array().data(), this->fx_[dev].d_array().data(),
-        tmp[dev].d_array().data(), this->natom_);
-    tmp[dev].transfer_to_host();
-    for (unsigned int i = 0; i < this->natom_; i++)
-      fx[i] += tmp[dev][i];
-
-    tmp[dev].set(0);
-    cub::DeviceRadixSort::SortPairs(
-        this->cub_work_buffer_[dev], this->cub_work_buffer_size_[dev],
-        this->sorted_idx_[dev].d_array().data(),
-        this->idx_[dev].d_array().data(), this->fy_[dev].d_array().data(),
-        tmp[dev].d_array().data(), this->natom_);
-    tmp[dev].transfer_to_host();
-    for (unsigned int i = 0; i < this->natom_; i++)
-      fy[i] += tmp[dev][i];
-
-    tmp[dev].set(0);
-    cub::DeviceRadixSort::SortPairs(
-        this->cub_work_buffer_[dev], this->cub_work_buffer_size_[dev],
-        this->sorted_idx_[dev].d_array().data(),
-        this->idx_[dev].d_array().data(), this->fz_[dev].d_array().data(),
-        tmp[dev].d_array().data(), this->natom_);
-    tmp[dev].transfer_to_host();
-    for (unsigned int i = 0; i < this->natom_; i++)
-      fz[i] += tmp[dev][i];
-
-    tmp[dev].set(0);
-    cub::DeviceRadixSort::SortPairs(
-        this->cub_work_buffer_[dev], this->cub_work_buffer_size_[dev],
-        this->sorted_idx_[dev].d_array().data(),
-        this->idx_[dev].d_array().data(), this->en_[dev].d_array().data(),
-        tmp[dev].d_array().data(), this->natom_);
-    tmp[dev].transfer_to_host();
-    for (unsigned int i = 0; i < this->natom_; i++)
-      en[i] += tmp[dev][i];
-  }
-
-  cudaCheck(cudaSetDevice(0));
-  fx.transfer_to_device();
-  fy.transfer_to_device();
-  fz.transfer_to_device();
-  en.transfer_to_device();
+  fx.transfer_to_host();
+  fy.transfer_to_host();
+  fz.transfer_to_host();
+  en.transfer_to_host();
 
   return;
 }
@@ -309,6 +273,25 @@ void glst_force<CT>::init(const unsigned int natom, const double tol,
               << this->cubature_->num_nodes()[0][grp] << std::endl;
   }
 
+  { // Distribute cubature nodes across devices
+    const unsigned int size = this->cubature_->tot_num_nodes() /
+                              static_cast<unsigned int>(this->cuda_count_);
+    const int rmdr =
+        static_cast<int>(this->cubature_->tot_num_nodes()) % this->cuda_count_;
+    this->dev_cub_counts_.resize(this->cuda_count_);
+    this->dev_cub_points_.resize(this->cuda_count_);
+    this->dev_cub_points_[0] = 0;
+    for (int dev = 0; dev < this->cuda_count_; dev++) {
+      this->dev_cub_counts_[dev] = (dev < rmdr) ? size + 1 : size;
+      if (dev > 0) {
+        this->dev_cub_points_[dev] =
+            this->dev_cub_points_[dev - 1] + this->dev_cub_counts_[dev - 1];
+      }
+    }
+    std::cout << "  Number of cubature nodes per device: ~"
+              << this->dev_cub_counts_[0] << std::endl;
+  }
+
   // Allocate cell memory
   this->cell_atom_point_.resize(this->cuda_count_);
   this->cell_atom_count_.resize(this->cuda_count_);
@@ -322,20 +305,17 @@ void glst_force<CT>::init(const unsigned int natom, const double tol,
     this->cell_atom_point_[dev].resize(this->ncell_);
     this->cell_atom_count_[dev].resize(this->ncell_);
     this->max_atoms_cell_[dev].resize(1);
-    this->sf_re_[dev].resize(this->ncell_ * this->cubature_->tot_num_nodes());
-    this->sf_im_[dev].resize(this->ncell_ * this->cubature_->tot_num_nodes());
-    this->rmt_sum_re_[dev].resize(this->ncell_ *
-                                  this->cubature_->tot_num_nodes());
-    this->rmt_sum_im_[dev].resize(this->ncell_ *
-                                  this->cubature_->tot_num_nodes());
+    this->sf_re_[dev].resize(this->ncell_ * this->dev_cub_counts_[dev]);
+    this->sf_im_[dev].resize(this->ncell_ * this->dev_cub_counts_[dev]);
+    this->rmt_sum_re_[dev].resize(this->ncell_ * this->dev_cub_counts_[dev]);
+    this->rmt_sum_im_[dev].resize(this->ncell_ * this->dev_cub_counts_[dev]);
   }
 
   this->allocate();
 
   // Call NCCL collective once to avoid initialization penalty
-  nccl_all_reduce_sum_ip(
-      this->sf_re_, this->ncell_ * this->cubature_->tot_num_nodes(),
-      this->nccl_comms_, this->comm_streams_, this->cuda_count_);
+  nccl_all_reduce_sum_ip(this->fx_, this->natom_, this->nccl_comms_,
+                         this->comm_streams_, this->cuda_count_);
 
   // Synchronize on CUDA stream to wait for completion of NCCL operation
   for (int dev = 0; dev < this->cuda_count_; dev++) {
@@ -555,8 +535,7 @@ calc_sf_kernel(float *__restrict__ sf_re, float *__restrict__ sf_im,
                const float *__restrict__ rz, const float *__restrict__ qc,
                const unsigned int *__restrict__ cell_atom_points,
                const unsigned int *__restrict__ cell_atom_counts,
-               const unsigned int *__restrict__ cells,
-               const unsigned int cell_count) {
+               const unsigned int ncell) {
   __shared__ float s_cache[ATOM_TILE * 4];
 
   const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -569,8 +548,7 @@ calc_sf_kernel(float *__restrict__ sf_re, float *__restrict__ sf_im,
     zc = cz[idx];
   }
 
-  for (unsigned int c = blockIdx.y; c < cell_count; c += gridDim.y) {
-    const unsigned int cell = cells[c];
+  for (unsigned int cell = blockIdx.y; cell < ncell; cell += gridDim.y) {
     const unsigned int apnt = cell_atom_points[cell];
     const unsigned int acnt = cell_atom_counts[cell];
 
@@ -622,8 +600,7 @@ calc_sf_kernel(double *__restrict__ sf_re, double *__restrict__ sf_im,
                const double *__restrict__ rz, const double *__restrict__ qc,
                const unsigned int *__restrict__ cell_atom_points,
                const unsigned int *__restrict__ cell_atom_counts,
-               const unsigned int *__restrict__ cells,
-               const unsigned int cell_count) {
+               const unsigned int ncell) {
   __shared__ double s_cache[ATOM_TILE * 4];
 
   const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -636,8 +613,7 @@ calc_sf_kernel(double *__restrict__ sf_re, double *__restrict__ sf_im,
     zc = cz[idx];
   }
 
-  for (unsigned int c = blockIdx.y; c < cell_count; c += gridDim.y) {
-    const unsigned int cell = cells[c];
+  for (unsigned int cell = blockIdx.y; cell < ncell; cell += gridDim.y) {
     const unsigned int apnt = cell_atom_points[cell];
     const unsigned int acnt = cell_atom_counts[cell];
 
@@ -683,10 +659,10 @@ template <typename CT> void glst_force<CT>::calc_sf(void) {
   if ((this->ncell_x_ < 3) && (this->ncell_y_ < 3) && (this->ncell_z_ < 3))
     return;
 
-  const unsigned int nc = this->cubature_->tot_num_nodes();
-
   for (int dev = 0; dev < this->cuda_count_; dev++) {
     cudaCheck(cudaSetDevice(dev));
+    const unsigned int nc = this->dev_cub_counts_[dev];
+    const unsigned int off = this->dev_cub_points_[dev];
     cudaCheck(cudaMemsetAsync(
         static_cast<void *>(this->sf_re_[dev].d_array().data()), 0,
         this->ncell_ * nc * sizeof(CT), this->comp_streams_[dev]));
@@ -694,27 +670,19 @@ template <typename CT> void glst_force<CT>::calc_sf(void) {
         static_cast<void *>(this->sf_im_[dev].d_array().data()), 0,
         this->ncell_ * nc * sizeof(CT), this->comp_streams_[dev]));
     constexpr dim3 num_threads(128, 1, 1);
-    const dim3 num_blocks(
-        (nc + num_threads.x - 1) / num_threads.x,
-        std::min(65535u,
-                 static_cast<unsigned int>(this->dev_cell_idx_[dev].size())),
-        1);
+    const dim3 num_blocks((nc + num_threads.x - 1) / num_threads.x,
+                          std::min(65535u, this->ncell_), 1);
     calc_sf_kernel<96>
         <<<num_blocks, num_threads, 0, this->comp_streams_[dev]>>>(
             this->sf_re_[dev].d_array().data(),
             this->sf_im_[dev].d_array().data(),
-            this->cubature_->x()[dev].d_array().data(),
-            this->cubature_->y()[dev].d_array().data(),
-            this->cubature_->z()[dev].d_array().data(), nc,
+            this->cubature_->x()[dev].d_array().data() + off,
+            this->cubature_->y()[dev].d_array().data() + off,
+            this->cubature_->z()[dev].d_array().data() + off, nc,
             this->rx_[dev].d_array().data(), this->ry_[dev].d_array().data(),
             this->rz_[dev].d_array().data(), this->qc_[dev].d_array().data(),
             this->cell_atom_point_[dev].d_array().data(),
-            this->cell_atom_count_[dev].d_array().data(),
-            this->dev_cell_idx_[dev].d_array().data(),
-            static_cast<unsigned int>(this->dev_cell_idx_[dev].size()));
-
-    cudaCheck(
-        cudaEventRecord(this->comp_events_[dev], this->comp_streams_[dev]));
+            this->cell_atom_count_[dev].d_array().data(), this->ncell_);
   }
 
   return;
@@ -792,15 +760,14 @@ calc_prefix_sum_x_kernel(CT *__restrict__ sf_re, CT *__restrict__ sf_im,
   return;
 }
 
-// JEG260122: Try benchmarking with this marked as __inline__
 template <typename CT>
-__device__ void
-box_sum(CT &box_re, CT &box_im, const CT *__restrict__ P_re,
-        const CT *__restrict__ P_im, const unsigned int x0,
-        const unsigned int y0, const unsigned int z0, const unsigned int x1,
-        const unsigned int y1, const unsigned int z1, const unsigned int nx,
-        const unsigned int ny, const unsigned int nz, const unsigned int idx,
-        const unsigned int off, const unsigned int nc) {
+__device__ void box_sum(CT &box_re, CT &box_im, const CT *__restrict__ P_re,
+                        const CT *__restrict__ P_im, const unsigned int x0,
+                        const unsigned int y0, const unsigned int z0,
+                        const unsigned int x1, const unsigned int y1,
+                        const unsigned int z1, const unsigned int nx,
+                        const unsigned int ny, const unsigned int nz,
+                        const unsigned int idx, const unsigned int nc) {
   // Need to check if x0-1, y0-1, z0-1 < 0
   const bool xb = (x0 == 0);
   const bool yb = (y0 == 0);
@@ -817,52 +784,51 @@ box_sum(CT &box_re, CT &box_im, const CT *__restrict__ P_re,
   const unsigned int cell6 = (x1 * ny + ym) * nz + zm; // ( x1,   y0-1, z0-1 )
   const unsigned int cell7 = (xm * ny + ym) * nz + zm; // ( x0-1, y0-1, z0-1 )
 
-  const CT g0_re = P_re[cell0 * nc + off + idx]; // Include
+  const CT g0_re = P_re[cell0 * nc + idx]; // Include
   const CT g1_re =
-      (xb) ? static_cast<CT>(0.0) : P_re[cell1 * nc + off + idx]; // Exclude
+      (xb) ? static_cast<CT>(0.0) : P_re[cell1 * nc + idx]; // Exclude
   const CT g2_re =
-      (yb) ? static_cast<CT>(0.0) : P_re[cell2 * nc + off + idx]; // Exclude
+      (yb) ? static_cast<CT>(0.0) : P_re[cell2 * nc + idx]; // Exclude
   const CT g3_re =
-      (zb) ? static_cast<CT>(0.0) : P_re[cell3 * nc + off + idx]; // Exclude
-  const CT g4_re = (xb || yb) ? static_cast<CT>(0.0)
-                              : P_re[cell4 * nc + off + idx]; // Include
-  const CT g5_re = (xb || zb) ? static_cast<CT>(0.0)
-                              : P_re[cell5 * nc + off + idx]; // Include
-  const CT g6_re = (yb || zb) ? static_cast<CT>(0.0)
-                              : P_re[cell6 * nc + off + idx]; // Include
+      (zb) ? static_cast<CT>(0.0) : P_re[cell3 * nc + idx]; // Exclude
+  const CT g4_re =
+      (xb || yb) ? static_cast<CT>(0.0) : P_re[cell4 * nc + idx]; // Include
+  const CT g5_re =
+      (xb || zb) ? static_cast<CT>(0.0) : P_re[cell5 * nc + idx]; // Include
+  const CT g6_re =
+      (yb || zb) ? static_cast<CT>(0.0) : P_re[cell6 * nc + idx]; // Include
   const CT g7_re = (xb || yb || zb) ? static_cast<CT>(0.0)
-                                    : P_re[cell7 * nc + off + idx]; // Exclude
+                                    : P_re[cell7 * nc + idx]; // Exclude
 
-  const CT g0_im = P_im[cell0 * nc + off + idx]; // Include
+  const CT g0_im = P_im[cell0 * nc + idx]; // Include
   const CT g1_im =
-      (xb) ? static_cast<CT>(0.0) : P_im[cell1 * nc + off + idx]; // Exclude
+      (xb) ? static_cast<CT>(0.0) : P_im[cell1 * nc + idx]; // Exclude
   const CT g2_im =
-      (yb) ? static_cast<CT>(0.0) : P_im[cell2 * nc + off + idx]; // Exclude
+      (yb) ? static_cast<CT>(0.0) : P_im[cell2 * nc + idx]; // Exclude
   const CT g3_im =
-      (zb) ? static_cast<CT>(0.0) : P_im[cell3 * nc + off + idx]; // Exclude
-  const CT g4_im = (xb || yb) ? static_cast<CT>(0.0)
-                              : P_im[cell4 * nc + off + idx]; // Include
-  const CT g5_im = (xb || zb) ? static_cast<CT>(0.0)
-                              : P_im[cell5 * nc + off + idx]; // Include
-  const CT g6_im = (yb || zb) ? static_cast<CT>(0.0)
-                              : P_im[cell6 * nc + off + idx]; // Include
+      (zb) ? static_cast<CT>(0.0) : P_im[cell3 * nc + idx]; // Exclude
+  const CT g4_im =
+      (xb || yb) ? static_cast<CT>(0.0) : P_im[cell4 * nc + idx]; // Include
+  const CT g5_im =
+      (xb || zb) ? static_cast<CT>(0.0) : P_im[cell5 * nc + idx]; // Include
+  const CT g6_im =
+      (yb || zb) ? static_cast<CT>(0.0) : P_im[cell6 * nc + idx]; // Include
   const CT g7_im = (xb || yb || zb) ? static_cast<CT>(0.0)
-                                    : P_im[cell7 * nc + off + idx]; // Exclude
+                                    : P_im[cell7 * nc + idx]; // Exclude
 
   box_re = g0_re - g1_re - g2_re - g3_re + g4_re + g5_re + g6_re - g7_re;
   box_im = g0_im - g1_im - g2_im - g3_im + g4_im + g5_im + g6_im - g7_im;
+
   return;
 }
 
-// JEG260122: Try benchmarking with this marked as __inline__
 template <typename CT>
 __device__ void cube_sum(CT &cube_re, CT &cube_im, const CT *__restrict__ P_re,
                          const CT *__restrict__ P_im, const unsigned int x,
                          const unsigned int y, const unsigned int z,
                          const unsigned int r, const unsigned int nx,
                          const unsigned int ny, const unsigned int nz,
-                         const unsigned int idx, const unsigned int off,
-                         const unsigned int nc) {
+                         const unsigned int idx, const unsigned int nc) {
   // Need to check if x-r, y-r, z-r is < 0
   const unsigned int x0 = (x < r) ? 0 : x - r;
   const unsigned int y0 = (y < r) ? 0 : y - r;
@@ -877,11 +843,10 @@ __device__ void cube_sum(CT &cube_re, CT &cube_im, const CT *__restrict__ P_re,
   z1 = (z1 >= nz) ? nz - 1 : z1;
 
   box_sum<CT>(cube_re, cube_im, P_re, P_im, x0, y0, z0, x1, y1, z1, nx, ny, nz,
-              idx, off, nc);
+              idx, nc);
   return;
 }
 
-// JEG260122: Try benchmarking with this marked as __inline__
 template <typename CT>
 __device__ void
 shell_sum(CT &shell_re, CT &shell_im, const CT *__restrict__ P_re,
@@ -889,13 +854,13 @@ shell_sum(CT &shell_re, CT &shell_im, const CT *__restrict__ P_re,
           const unsigned int y, const unsigned int z, const unsigned int inner,
           const unsigned int outer, const unsigned int nx,
           const unsigned int ny, const unsigned int nz, const unsigned int idx,
-          const unsigned int off, const unsigned int nc) {
+          const unsigned int nc) {
   CT osum_re = static_cast<CT>(0.0), osum_im = static_cast<CT>(0.0);
   cube_sum<CT>(osum_re, osum_im, P_re, P_im, x, y, z, outer, nx, ny, nz, idx,
-               off, nc);
+               nc);
   CT isum_re = static_cast<CT>(0.0), isum_im = static_cast<CT>(0.0);
   cube_sum<CT>(isum_re, isum_im, P_re, P_im, x, y, z, inner, nx, ny, nz, idx,
-               off, nc);
+               nc);
   shell_re = osum_re - isum_re;
   shell_im = osum_im - isum_im;
   return;
@@ -905,31 +870,32 @@ template <typename CT>
 __global__ static void calc_rmt_sum_kernel(
     CT *__restrict__ rmt_sum_re, CT *__restrict__ rmt_sum_im,
     const CT *__restrict__ sf_re, CT *__restrict__ sf_im,
-    const CT *__restrict__ cw, const unsigned int nc,
-    const unsigned int cub_point, const unsigned int cub_count,
-    const unsigned int inner, const unsigned int outer, const unsigned int nx,
-    const unsigned int ny, const unsigned int nz,
-    const unsigned int *__restrict__ cells, const unsigned int cell_count) {
+    const CT *__restrict__ cw, const unsigned int *__restrict__ groups,
+    const unsigned int nc, const unsigned int *__restrict__ grp_r_in,
+    const unsigned int *__restrict__ grp_r_out, const unsigned int nx,
+    const unsigned int ny, const unsigned int nz, const unsigned int ncell) {
   const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
-  if (idx >= cub_count)
+  if (idx >= nc)
     return;
 
-  const CT wc = cw[cub_point + idx];
+  const CT wc = cw[idx];
+  const unsigned int grp = groups[idx];
 
-  for (unsigned int c = blockIdx.y; c < cell_count; c += gridDim.y) {
-    const unsigned int cell = cells[c];
+  for (unsigned int cell = blockIdx.y; cell < ncell; cell += gridDim.y) {
     const unsigned int x = cell / (ny * nz);
     const unsigned int y = (cell / nz) % ny;
     const unsigned int z = cell % nz;
+    const unsigned int inner = grp_r_in[grp];
+    const unsigned int outer = grp_r_out[grp];
 
     CT shell_re = static_cast<CT>(0.0), shell_im = static_cast<CT>(0.0);
     shell_sum<CT>(shell_re, shell_im, sf_re, sf_im, x, y, z, inner, outer, nx,
-                  ny, nz, idx, cub_point, nc);
+                  ny, nz, idx, nc);
     shell_re *= wc;
     shell_im *= wc;
-    rmt_sum_re[cell * nc + cub_point + idx] = shell_re;
-    rmt_sum_im[cell * nc + cub_point + idx] = shell_im;
+    rmt_sum_re[cell * nc + idx] = shell_re;
+    rmt_sum_im[cell * nc + idx] = shell_im;
   }
 
   return;
@@ -939,37 +905,10 @@ template <typename CT> void glst_force<CT>::sum_rmt_sf(void) {
   if ((this->ncell_x_ < 3) && (this->ncell_y_ < 3) && (this->ncell_z_ < 3))
     return;
 
-  const unsigned int nc = this->cubature_->tot_num_nodes();
-
-  // Synchronize to ensure that all devices are done computing their structure
-  // factors
   for (int dev = 0; dev < this->cuda_count_; dev++) {
     cudaCheck(cudaSetDevice(dev));
-    cudaCheck(
-        cudaStreamWaitEvent(this->comm_streams_[dev], this->comp_events_[dev]));
-  }
-
-  nccl_all_reduce_sum_ip(
-      this->sf_re_, this->ncell_ * this->cubature_->tot_num_nodes(),
-      this->nccl_comms_, this->comm_streams_, this->cuda_count_);
-  nccl_all_reduce_sum_ip(
-      this->sf_im_, this->ncell_ * this->cubature_->tot_num_nodes(),
-      this->nccl_comms_, this->comm_streams_, this->cuda_count_);
-
-  for (int dev = 0; dev < this->cuda_count_; dev++) {
-    cudaCheck(
-        cudaEventRecord(this->comm_events_[dev], this->comm_streams_[dev]));
-  }
-
-  // Synchronize on CUDA stream to wait for completion of NCCL operation
-  for (int dev = 0; dev < this->cuda_count_; dev++) {
-    cudaCheck(cudaSetDevice(dev));
-    cudaCheck(
-        cudaStreamWaitEvent(this->comp_streams_[dev], this->comm_events_[dev]));
-  }
-
-  for (int dev = 0; dev < this->cuda_count_; dev++) {
-    cudaCheck(cudaSetDevice(dev));
+    const unsigned int nc = this->dev_cub_counts_[dev];
+    const unsigned int off = this->dev_cub_points_[dev];
     {
       constexpr dim3 num_threads(512, 1, 1);
       const dim3 num_blocks((nc + num_threads.x - 1) / num_threads.x,
@@ -1003,24 +942,21 @@ template <typename CT> void glst_force<CT>::sum_rmt_sf(void) {
               this->ncell_y_, this->ncell_z_);
     }
 
-    for (unsigned int group = 0; group < this->ngroup_; group++) {
-      const unsigned int cub_point = this->cubature_->points()[dev][group];
-      const unsigned int cub_count = this->cubature_->num_nodes()[dev][group];
+    {
       constexpr dim3 num_threads(512, 1, 1);
-      const dim3 num_blocks(
-          (cub_count + num_threads.x - 1) / num_threads.x,
-          static_cast<unsigned int>(this->dev_cell_idx_[dev].size()), 1);
+      const dim3 num_blocks((nc + num_threads.x - 1) / num_threads.x,
+                            std::min(65535u, this->ncell_), 1);
       calc_rmt_sum_kernel<CT>
           <<<num_blocks, num_threads, 0, this->comp_streams_[dev]>>>(
               this->rmt_sum_re_[dev].d_array().data(),
               this->rmt_sum_im_[dev].d_array().data(),
               this->sf_re_[dev].d_array().data(),
               this->sf_im_[dev].d_array().data(),
-              this->cubature_->w()[dev].d_array().data(), nc, cub_point,
-              cub_count, this->grp_r_in_[dev][group],
-              this->grp_r_out_[dev][group], this->ncell_x_, this->ncell_y_,
-              this->ncell_z_, this->dev_cell_idx_[dev].d_array().data(),
-              static_cast<unsigned int>(this->dev_cell_idx_[dev].size()));
+              this->cubature_->w()[dev].d_array().data() + off,
+              this->cubature_->group()[dev].d_array().data() + off, nc,
+              this->grp_r_in_[dev].d_array().data(),
+              this->grp_r_out_[dev].d_array().data(), this->ncell_x_,
+              this->ncell_y_, this->ncell_z_, this->ncell_);
     }
   }
 
@@ -1029,23 +965,23 @@ template <typename CT> void glst_force<CT>::sum_rmt_sf(void) {
 
 // SINGLE-PRECISION
 template <unsigned int BLOCK>
-__global__ static void calc_lr_ef_kernel(
-    double *__restrict__ fx, double *__restrict__ fy, double *__restrict__ fz,
-    double *__restrict__ en, const float *__restrict__ rx,
-    const float *__restrict__ ry, const float *__restrict__ rz,
-    const float *__restrict__ qc,
-    const unsigned int *__restrict__ cell_atom_points,
-    const unsigned int *__restrict__ cell_atom_counts,
-    const float *__restrict__ cx, const float *__restrict__ cy,
-    const float *__restrict__ cz, const float *__restrict__ rmt_sum_re,
-    const float *__restrict__ rmt_sum_im, const unsigned int nc,
-    const unsigned int *__restrict__ cells, const unsigned int cell_count) {
+__global__ static void
+calc_lr_ef_kernel(double *__restrict__ fx, double *__restrict__ fy,
+                  double *__restrict__ fz, double *__restrict__ en,
+                  const float *__restrict__ rx, const float *__restrict__ ry,
+                  const float *__restrict__ rz, const float *__restrict__ qc,
+                  const unsigned int *__restrict__ cell_atom_points,
+                  const unsigned int *__restrict__ cell_atom_counts,
+                  const float *__restrict__ cx, const float *__restrict__ cy,
+                  const float *__restrict__ cz,
+                  const float *__restrict__ rmt_sum_re,
+                  const float *__restrict__ rmt_sum_im, const unsigned int nc,
+                  const unsigned int ncell) {
   __shared__ float s_cache[BLOCK * 5];
 
   const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
-  for (unsigned int c = blockIdx.y; c < cell_count; c += gridDim.y) {
-    const unsigned int cell = cells[c];
+  for (unsigned int cell = blockIdx.y; cell < ncell; cell += gridDim.y) {
     const unsigned int apnt = cell_atom_points[cell];
     const unsigned int acnt = cell_atom_counts[cell];
     const bool active = (idx < acnt);
@@ -1106,23 +1042,23 @@ __global__ static void calc_lr_ef_kernel(
 
 // DOUBLE-PRECISION
 template <unsigned int BLOCK>
-__global__ static void calc_lr_ef_kernel(
-    double *__restrict__ fx, double *__restrict__ fy, double *__restrict__ fz,
-    double *__restrict__ en, const double *__restrict__ rx,
-    const double *__restrict__ ry, const double *__restrict__ rz,
-    const double *__restrict__ qc,
-    const unsigned int *__restrict__ cell_atom_points,
-    const unsigned int *__restrict__ cell_atom_counts,
-    const double *__restrict__ cx, const double *__restrict__ cy,
-    const double *__restrict__ cz, const double *__restrict__ rmt_sum_re,
-    const double *__restrict__ rmt_sum_im, const unsigned int nc,
-    const unsigned int *__restrict__ cells, const unsigned int cell_count) {
+__global__ static void
+calc_lr_ef_kernel(double *__restrict__ fx, double *__restrict__ fy,
+                  double *__restrict__ fz, double *__restrict__ en,
+                  const double *__restrict__ rx, const double *__restrict__ ry,
+                  const double *__restrict__ rz, const double *__restrict__ qc,
+                  const unsigned int *__restrict__ cell_atom_points,
+                  const unsigned int *__restrict__ cell_atom_counts,
+                  const double *__restrict__ cx, const double *__restrict__ cy,
+                  const double *__restrict__ cz,
+                  const double *__restrict__ rmt_sum_re,
+                  const double *__restrict__ rmt_sum_im, const unsigned int nc,
+                  const unsigned int ncell) {
   __shared__ double s_cache[BLOCK * 5];
 
   const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
-  for (unsigned int c = blockIdx.y; c < cell_count; c += gridDim.y) {
-    const unsigned int cell = cells[c];
+  for (unsigned int cell = blockIdx.y; cell < ncell; cell += gridDim.y) {
     const unsigned int apnt = cell_atom_points[cell];
     const unsigned int acnt = cell_atom_counts[cell];
     const bool active = (idx < acnt);
@@ -1187,12 +1123,12 @@ template <typename CT> void glst_force<CT>::calc_lr_ef(void) {
 
   for (int dev = 0; dev < this->cuda_count_; dev++) {
     cudaCheck(cudaSetDevice(dev));
+    const unsigned int nc = this->dev_cub_counts_[dev];
+    const unsigned int off = this->dev_cub_points_[dev];
     constexpr dim3 num_threads(64, 1, 1);
-    const dim3 num_blocks(
-        (this->max_atoms_cell_[dev][0] + num_threads.x - 1) / num_threads.x,
-        std::min(65535u,
-                 static_cast<unsigned int>(this->dev_cell_idx_[dev].size())),
-        1);
+    const dim3 num_blocks((this->max_atoms_cell_[dev][0] + num_threads.x - 1) /
+                              num_threads.x,
+                          std::min(65535u, this->ncell_), 1);
     calc_lr_ef_kernel<num_threads.x>
         <<<num_blocks, num_threads, 0, this->comp_streams_[dev]>>>(
             this->fx_[dev].d_array().data(), this->fy_[dev].d_array().data(),
@@ -1201,14 +1137,11 @@ template <typename CT> void glst_force<CT>::calc_lr_ef(void) {
             this->rz_[dev].d_array().data(), this->qc_[dev].d_array().data(),
             this->cell_atom_point_[dev].d_array().data(),
             this->cell_atom_count_[dev].d_array().data(),
-            this->cubature_->x()[dev].d_array().data(),
-            this->cubature_->y()[dev].d_array().data(),
-            this->cubature_->z()[dev].d_array().data(),
+            this->cubature_->x()[dev].d_array().data() + off,
+            this->cubature_->y()[dev].d_array().data() + off,
+            this->cubature_->z()[dev].d_array().data() + off,
             this->rmt_sum_re_[dev].d_array().data(),
-            this->rmt_sum_im_[dev].d_array().data(),
-            this->cubature_->tot_num_nodes(),
-            this->dev_cell_idx_[dev].d_array().data(),
-            static_cast<unsigned int>(this->dev_cell_idx_[dev].size()));
+            this->rmt_sum_im_[dev].d_array().data(), nc, this->ncell_);
   }
 
   return;
@@ -1625,6 +1558,26 @@ template <typename CT> void glst_force<CT>::calc_sr_ef(void) {
   return;
 }
 
+template <typename CT> void glst_force<CT>::comm_ef(void) {
+  // Synchronize to ensure that all devices are done computing
+  for (int dev = 0; dev < this->cuda_count_; dev++) {
+    cudaCheck(cudaSetDevice(dev));
+    cudaCheck(cudaStreamSynchronize(this->comp_streams_[dev]));
+  }
+
+  nccl_root_reduce_sum_ef_ip(this->fx_, this->fy_, this->fz_, this->en_,
+                             this->natom_, this->nccl_comms_,
+                             this->comm_streams_, this->cuda_count_);
+
+  // Synchronize to ensure that all devices are done communicating
+  for (int dev = 0; dev < this->cuda_count_; dev++) {
+    cudaCheck(cudaSetDevice(dev));
+    cudaCheck(cudaStreamSynchronize(this->comm_streams_[dev]));
+  }
+
+  return;
+}
+
 template <typename CT>
 void glst_force<CT>::calc_ener_force(const double *d_rx, const double *d_ry,
                                      const double *d_rz, const double *d_qc) {
@@ -1633,6 +1586,7 @@ void glst_force<CT>::calc_ener_force(const double *d_rx, const double *d_ry,
   this->sum_rmt_sf();
   this->calc_lr_ef();
   this->calc_sr_ef();
+  this->comm_ef();
   return;
 }
 

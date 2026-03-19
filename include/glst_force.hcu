@@ -55,6 +55,7 @@ public: // Energy and force calculation
   void sum_rmt_sf(void);
   void calc_lr_ef(void);
   void calc_sr_ef(void);
+  void comm_ef(void);
   void calc_ener_force(const double *d_rx, const double *d_ry,
                        const double *d_rz, const double *d_qc);
 
@@ -98,6 +99,8 @@ private:
   std::vector<cuda_container<unsigned int>> grp_r_out_;
 
   std::unique_ptr<cubature<CT>> cubature_;
+  std::vector<unsigned int> dev_cub_counts_;
+  std::vector<unsigned int> dev_cub_points_;
 
   std::vector<cuda_container<unsigned int>> cell_atom_point_;
   std::vector<cuda_container<unsigned int>> cell_atom_count_;
