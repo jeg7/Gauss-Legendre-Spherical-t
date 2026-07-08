@@ -155,6 +155,7 @@ void nccl_root_reduce_sum_ef_ip(std::vector<cuda_container<float>> &fx,
                                 const int cuda_count) {
   ncclCheck(ncclGroupStart());
   for (int dev = 0; dev < cuda_count; dev++) {
+    cudaCheck(cudaSetDevice(dev));
     ncclCheck(ncclReduce(static_cast<const void *>(fx[dev].d_array().data()),
                          static_cast<void *>(fx[0].d_array().data()), count,
                          ncclFloat, ncclSum, 0, comms[dev], streams[dev]));
@@ -182,6 +183,7 @@ void nccl_root_reduce_sum_ef_ip(std::vector<cuda_container<double>> &fx,
                                 const int cuda_count) {
   ncclCheck(ncclGroupStart());
   for (int dev = 0; dev < cuda_count; dev++) {
+    cudaCheck(cudaSetDevice(dev));
     ncclCheck(ncclReduce(static_cast<const void *>(fx[dev].d_array().data()),
                          static_cast<void *>(fx[0].d_array().data()), count,
                          ncclDouble, ncclSum, 0, comms[dev], streams[dev]));

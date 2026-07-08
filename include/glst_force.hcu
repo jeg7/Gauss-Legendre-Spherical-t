@@ -44,7 +44,7 @@ public:
   void get_ef(cuda_container<double> &fx, cuda_container<double> &fy,
               cuda_container<double> &fz, cuda_container<double> &en);
 
-public: // Initiialization
+public: // Initialization
   void init(const unsigned int natom, const double tol, const double box_dim_x,
             const double box_dim_y, const double box_dim_z, const double rcut);
 

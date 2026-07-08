@@ -215,7 +215,7 @@ void cubature<CT>::get_wgl(std::vector<double> &wgl,
 
 template <typename CT>
 double cubature<CT>::eval_legendre_root(const double x0, const unsigned int n) {
-  // Newton's method for finding first root of Pl_n(x) arouund x0
+  // Newton's method for finding first root of Pl_n(x) around x0
   double p = 1.0, dpdx = 0.0;
   double dx1 = 0.0, dx2 = -1.0;
   double x = x0;

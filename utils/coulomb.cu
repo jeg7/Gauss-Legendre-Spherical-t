@@ -174,8 +174,8 @@ void compute_coulomb_cuda(double *fx, double *fy, double *fz, double *en,
 template <unsigned int BLOCK>
 __global__ static void compute_coulomb_kernel(double4 *__restrict__ fxyzen,
                                               const double4 *__restrict__ xyzq,
-                                              const std::size_t count,
                                               const std::size_t point,
+                                              const std::size_t count,
                                               const std::size_t natom) {
   __shared__ double4 s_cache[BLOCK];
 

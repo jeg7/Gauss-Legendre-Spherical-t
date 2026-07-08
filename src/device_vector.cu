@@ -105,7 +105,7 @@ __global__ static void set_back_kernel(T *data, const std::size_t size,
 
 template <typename T> void device_vector<T>::push_back(const T &value) {
   if (this->size_ >= this->capacity_) // Increase size of memory block by 50%
-    this->reallocate(this->capacity_ + this->capacity_ / 2);
+    this->reallocate(this->capacity_ + (this->capacity_ / 2) + 1);
 
   this->size_++;
 

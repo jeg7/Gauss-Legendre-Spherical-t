@@ -437,7 +437,8 @@ void glst_force<CT>::assign_atoms(const double *d_rx, const double *d_ry,
       constexpr unsigned int num_threads = 512;
       const unsigned int num_blocks =
           (this->ncell_ + num_threads - 1) / num_threads;
-      init_cell_atom_count_kernel<<<num_blocks, num_threads>>>(
+      init_cell_atom_count_kernel<<<num_blocks, num_threads, 0,
+                                    this->comp_streams_[dev]>>>(
           this->cell_atom_count_[dev].d_array().data(), this->ncell_);
     }
 
@@ -445,10 +446,11 @@ void glst_force<CT>::assign_atoms(const double *d_rx, const double *d_ry,
       constexpr unsigned int num_threads = 512;
       const unsigned int num_blocks =
           (this->natom_ + num_threads - 1) / num_threads;
-      copy_coords_kernel<CT><<<num_blocks, num_threads>>>(
-          this->rx_[dev].d_array().data(), this->ry_[dev].d_array().data(),
-          this->rz_[dev].d_array().data(), this->qc_[dev].d_array().data(),
-          d_rx, d_ry, d_rz, d_qc, this->natom_);
+      copy_coords_kernel<CT>
+          <<<num_blocks, num_threads, 0, this->comp_streams_[dev]>>>(
+              this->rx_[dev].d_array().data(), this->ry_[dev].d_array().data(),
+              this->rz_[dev].d_array().data(), this->qc_[dev].d_array().data(),
+              d_rx, d_ry, d_rz, d_qc, this->natom_);
     }
 
     { // Determine which cell each atom is in and count how many atoms are in
@@ -656,7 +658,9 @@ calc_sf_kernel(double *__restrict__ sf_re, double *__restrict__ sf_im,
 }
 
 template <typename CT> void glst_force<CT>::calc_sf(void) {
-  if ((this->ncell_x_ < 3) && (this->ncell_y_ < 3) && (this->ncell_z_ < 3))
+  const bool has_long_range_cells =
+      ((this->ncell_x_ > 2) && (this->ncell_y_ > 2) && (this->ncell_z_ > 2));
+  if (!has_long_range_cells)
     return;
 
   for (int dev = 0; dev < this->cuda_count_; dev++) {
@@ -902,7 +906,9 @@ __global__ static void calc_rmt_sum_kernel(
 }
 
 template <typename CT> void glst_force<CT>::sum_rmt_sf(void) {
-  if ((this->ncell_x_ < 3) && (this->ncell_y_ < 3) && (this->ncell_z_ < 3))
+  const bool has_long_range_cells =
+      ((this->ncell_x_ > 2) && (this->ncell_y_ > 2) && (this->ncell_z_ > 2));
+  if (!has_long_range_cells)
     return;
 
   for (int dev = 0; dev < this->cuda_count_; dev++) {
@@ -1118,7 +1124,9 @@ calc_lr_ef_kernel(double *__restrict__ fx, double *__restrict__ fy,
 }
 
 template <typename CT> void glst_force<CT>::calc_lr_ef(void) {
-  if ((this->ncell_x_ < 3) && (this->ncell_y_ < 3) && (this->ncell_z_ < 3))
+  const bool has_long_range_cells =
+      ((this->ncell_x_ > 2) && (this->ncell_y_ > 2) && (this->ncell_z_ > 2));
+  if (!has_long_range_cells)
     return;
 
   for (int dev = 0; dev < this->cuda_count_; dev++) {
@@ -1604,7 +1612,7 @@ static double erfc_inv(const double y, const double tol) {
 
     // Calculate the derivative of erfc
     double deriv = -std::exp(-x * x) * rdum;
-    x -= err / deriv; // Newton-Raphson forumla: x = x - f(x) / f'(x)
+    x -= err / deriv; // Newton-Raphson formula: x = x - f(x) / f'(x)
   }
 
   if (std::abs(err) >= tol) {
