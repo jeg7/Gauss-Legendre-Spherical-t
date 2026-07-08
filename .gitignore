@@ -38,3 +38,4 @@ clean.sh
 compile.sh
 run.sh
 build/
+*.swp
