@@ -1864,3 +1864,6 @@ template <typename CT> void glst_force<CT>::cells2dev(void) {
 
   return;
 }
+
+template class glst_force<float>;
+template class glst_force<double>;

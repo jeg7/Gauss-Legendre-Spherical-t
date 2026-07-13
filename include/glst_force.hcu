@@ -14,8 +14,10 @@
 #include "atom_packet.hcu"
 #include "cubature.hcu"
 #include "cuda_container.hcu"
-#include <memory>
+
 #include <nccl.h>
+
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -123,8 +125,5 @@ private:
   std::vector<int> nccl_devs_;
   std::vector<ncclComm_t> nccl_comms_;
 };
-
-template class glst_force<float>;
-template class glst_force<double>;
 
 #endif

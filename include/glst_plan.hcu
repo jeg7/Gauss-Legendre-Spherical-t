@@ -1,0 +1,22 @@
+// BEGINLICENSE
+//
+// This file is part of Gauss-Legendre-Spherical-t, which is distributed under
+// the BSD 3-clause license, as described in the LICENSE file in the top level
+// directory of this project.
+//
+// Author: James E. Gonzales II
+//
+// ENDLICENS
+
+#ifndef __GLST_GLST_PLAN__
+#define __GLST_GLST_PLAN__
+
+// CT = Calculation Type
+
+template <typename CT> class glst_plan {
+public:
+  glst_plan(void);
+  ~glst_plan(void);
+};
+
+#endif

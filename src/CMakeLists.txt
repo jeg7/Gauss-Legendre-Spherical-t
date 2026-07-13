@@ -8,6 +8,8 @@ add_library(GLST
   ${GLST_SOURCE_DIR}/src/device_comm.cu
   ${GLST_SOURCE_DIR}/src/device_vector.cu
   ${GLST_SOURCE_DIR}/src/glst_force.cu
+  ${GLST_SOURCE_DIR}/src/glst_plan.cu
+  ${GLST_SOURCE_DIR}/src/glst_workspace.cu
   ${GLST_SOURCE_DIR}/src/string_utils.cpp
 )
 
