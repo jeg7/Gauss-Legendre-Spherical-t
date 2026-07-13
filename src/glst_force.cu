@@ -440,6 +440,7 @@ void glst_force<CT>::assign_atoms(const double *d_rx, const double *d_ry,
       init_cell_atom_count_kernel<<<num_blocks, num_threads, 0,
                                     this->comp_streams_[dev]>>>(
           this->cell_atom_count_[dev].d_array().data(), this->ncell_);
+      cudaCheck(cudaGetLastError());
     }
 
     { // Store input double precision coordinates as private CT coordinates
@@ -451,6 +452,7 @@ void glst_force<CT>::assign_atoms(const double *d_rx, const double *d_ry,
               this->rx_[dev].d_array().data(), this->ry_[dev].d_array().data(),
               this->rz_[dev].d_array().data(), this->qc_[dev].d_array().data(),
               d_rx, d_ry, d_rz, d_qc, this->natom_);
+      cudaCheck(cudaGetLastError());
     }
 
     { // Determine which cell each atom is in and count how many atoms are in
@@ -466,6 +468,7 @@ void glst_force<CT>::assign_atoms(const double *d_rx, const double *d_ry,
               this->rz_[dev].d_array().data(), this->natom_, this->cell_dim_x_,
               this->cell_dim_y_, this->cell_dim_z_, this->ncell_x_,
               this->ncell_y_, this->ncell_z_);
+      cudaCheck(cudaGetLastError());
     }
 
     // JEG260127: Find optimial place to do this
@@ -486,6 +489,7 @@ void glst_force<CT>::assign_atoms(const double *d_rx, const double *d_ry,
                                     this->comp_streams_[dev]>>>(
           this->cell_atom_point_[dev].d_array().data(),
           this->cell_atom_count_[dev].d_array().data(), this->ncell_);
+      cudaCheck(cudaGetLastError());
     }
 
     { // Pack atom data
@@ -497,6 +501,7 @@ void glst_force<CT>::assign_atoms(const double *d_rx, const double *d_ry,
           this->ry_[dev].d_array().data(), this->rz_[dev].d_array().data(),
           this->qc_[dev].d_array().data(), this->idx_[dev].d_array().data(),
           this->natom_);
+      cudaCheck(cudaGetLastError());
     }
 
     // JEG260211: Fix this later
@@ -521,6 +526,7 @@ void glst_force<CT>::assign_atoms(const double *d_rx, const double *d_ry,
               this->rz_[dev].d_array().data(), this->qc_[dev].d_array().data(),
               this->sorted_idx_[dev].d_array().data(),
               this->sorted_packets_[dev].d_array().data(), this->natom_);
+      cudaCheck(cudaGetLastError());
     }
   }
 
@@ -687,6 +693,7 @@ template <typename CT> void glst_force<CT>::calc_sf(void) {
             this->rz_[dev].d_array().data(), this->qc_[dev].d_array().data(),
             this->cell_atom_point_[dev].d_array().data(),
             this->cell_atom_count_[dev].d_array().data(), this->ncell_);
+    cudaCheck(cudaGetLastError());
   }
 
   return;
@@ -924,6 +931,7 @@ template <typename CT> void glst_force<CT>::sum_rmt_sf(void) {
               this->sf_re_[dev].d_array().data(),
               this->sf_im_[dev].d_array().data(), nc, this->ncell_x_,
               this->ncell_y_, this->ncell_z_);
+      cudaCheck(cudaGetLastError());
     }
 
     {
@@ -935,6 +943,7 @@ template <typename CT> void glst_force<CT>::sum_rmt_sf(void) {
               this->sf_re_[dev].d_array().data(),
               this->sf_im_[dev].d_array().data(), nc, this->ncell_x_,
               this->ncell_y_, this->ncell_z_);
+      cudaCheck(cudaGetLastError());
     }
 
     {
@@ -946,6 +955,7 @@ template <typename CT> void glst_force<CT>::sum_rmt_sf(void) {
               this->sf_re_[dev].d_array().data(),
               this->sf_im_[dev].d_array().data(), nc, this->ncell_x_,
               this->ncell_y_, this->ncell_z_);
+      cudaCheck(cudaGetLastError());
     }
 
     {
@@ -963,6 +973,7 @@ template <typename CT> void glst_force<CT>::sum_rmt_sf(void) {
               this->grp_r_in_[dev].d_array().data(),
               this->grp_r_out_[dev].d_array().data(), this->ncell_x_,
               this->ncell_y_, this->ncell_z_, this->ncell_);
+      cudaCheck(cudaGetLastError());
     }
   }
 
@@ -1150,6 +1161,7 @@ template <typename CT> void glst_force<CT>::calc_lr_ef(void) {
             this->cubature_->z()[dev].d_array().data() + off,
             this->rmt_sum_re_[dev].d_array().data(),
             this->rmt_sum_im_[dev].d_array().data(), nc, this->ncell_);
+    cudaCheck(cudaGetLastError());
   }
 
   return;
@@ -1550,6 +1562,8 @@ template <typename CT> void glst_force<CT>::calc_sr_ef(void) {
             this->cell_atom_count_[dev].d_array().data(),
             this->dev_cell_idx_[dev].d_array().data(),
             static_cast<unsigned int>(this->dev_cell_idx_[dev].size()));
+    cudaCheck(cudaGetLastError());
+
     calc_sr_ef_inter_kernel<num_threads.x>
         <<<num_blocks, num_threads, 0, this->comp_streams_[dev]>>>(
             this->fx_[dev].d_array().data(), this->fy_[dev].d_array().data(),
@@ -1561,6 +1575,7 @@ template <typename CT> void glst_force<CT>::calc_sr_ef(void) {
             this->dev_cell_idx_[dev].d_array().data(),
             static_cast<unsigned int>(this->dev_cell_idx_[dev].size()),
             this->ncell_x_, this->ncell_y_, this->ncell_z_);
+    cudaCheck(cudaGetLastError());
   }
 
   return;

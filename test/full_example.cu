@@ -12,15 +12,33 @@
 #include <cuda_container.hcu>
 #include <cuda_utils.hcu>
 #include <glst_force.hcu>
+#include <io.hpp>
 #include <utils.hpp>
 
 #include <chrono>
 #include <cstdlib>
-#include <io.hpp>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <memory>
 #include <string>
+
+bool env_true(const char *name) {
+  const char *value = std::getenv(name);
+  if (value == nullptr)
+    return false;
+
+  std::string s(value);
+  return !(s.empty() || s == "0" || s == "false" || s == "FALSE" ||
+           s == "off" || s == "OFF" || s == "no" || s == "NO");
+}
+
+std::string env_or(const char *name, const std::string &fallback) {
+  const char *value = std::getenv(name);
+  if (value == nullptr)
+    return fallback;
+  return std::string(value);
+}
 
 int main(int argc, char **argv) {
   // Input check and error catch
@@ -31,6 +49,25 @@ int main(int argc, char **argv) {
     std::cout << "       " << argv[0]
               << " [sys] [tol] [box_dim] [ncell.x] [ncell.y] [ncell.z]"
               << std::endl;
+    return EXIT_FAILURE;
+  }
+
+  // Optional benchmark output file. If GLST_BENCH_OUT is not set, full_example
+  // writes the output to stdout. If GLST_BENCH_TERMINAL=1, ignore
+  // GLST_BENCH_OUT and leave stdout alone.
+  const bool terminal_only = env_true("GLST_BENCH_TERMINAL");
+  std::ofstream bench_out;
+  std::streambuf *old_cout_buf = nullptr;
+  if (!terminal_only) {
+    if (const char *out_name = std::getenv("GLST_BENCH_OUT")) {
+      bench_out.open(out_name);
+      if (!bench_out) {
+        std::cerr << "Could not open GLST_BENCH_OUT file: \"" << out_name
+                  << "\"" << std::endl;
+        return EXIT_FAILURE;
+      }
+      old_cout_buf = std::cout.rdbuf(bench_out.rdbuf());
+    }
   }
 
   int cuda_count = 0;
@@ -43,9 +80,9 @@ int main(int argc, char **argv) {
   double box_dim_y = std::stod(argv[3]);
   double box_dim_z = std::stod(argv[3]);
   double rcut = 0.0;
-  int ncell_x = 0.0;
-  int ncell_y = 0.0;
-  int ncell_z = 0.0;
+  int ncell_x = 0;
+  int ncell_y = 0;
+  int ncell_z = 0;
   if (argc == 5)
     rcut = std::stod(argv[4]);
   else if (argc == 7) {
@@ -53,6 +90,15 @@ int main(int argc, char **argv) {
     ncell_y = std::stoi(argv[5]);
     ncell_z = std::stoi(argv[6]);
   }
+
+  std::cout << "BENCH_INPUT";
+  std::cout << " sweep=" << env_or("GLST_BENCH_SWEEP", "manual");
+  std::cout << " sys=" << env_or("GLST_BENCH_SYS", file_name);
+  std::cout << " tol=" << tol;
+  std::cout << " box_dim=" << box_dim_x << "," << box_dim_y << "," << box_dim_z;
+  std::cout << " cut=" << rcut;
+  std::cout << " requested_gpus=" << env_or("GLST_BENCH_GPUS", "");
+  std::cout << std::endl;
 
   // Allocate host memory and perform IO
   std::size_t natom = get_natom_psf(file_name + ".psf");
@@ -87,7 +133,9 @@ int main(int argc, char **argv) {
   constexpr std::size_t MAX_ITER = 100;
   std::vector<std::vector<double>> times(8, std::vector<double>(MAX_ITER));
   for (std::size_t ITER = 0; ITER < MAX_ITER; ITER++) {
-    std::cout << "\rIteration " << ITER << std::flush;
+    // Progress goes to stderr so it stays visible in the terminal even when
+    // stdout is redirected to GLST_BENCH_OUT
+    std::cerr << "\rIteration " << ITER << std::flush;
     auto start_glst = std::chrono::high_resolution_clock::now();
     auto start_assign = std::chrono::high_resolution_clock::now();
     glst->assign_atoms(rx.d_array().data(), ry.d_array().data(),
@@ -161,7 +209,8 @@ int main(int argc, char **argv) {
     }
   }
 
-  std::cout << "\rFinished " << MAX_ITER << " calculations" << std::endl;
+  std::cerr << "\rFinished " << MAX_ITER << " calculations" << std::endl;
+  std::cout << "Finished " << MAX_ITER << " calculations" << std::endl;
   std::cout << std::endl;
   std::cout << "                   Assign atoms to cells: " << avg(times[0])
             << " ms (+/- " << stdev(times[0]) << " ms)" << std::endl;
@@ -213,6 +262,9 @@ int main(int argc, char **argv) {
   print_error_report(fx_glst.h_array(), fy_glst.h_array(), fz_glst.h_array(),
                      en_glst.h_array(), fx_coul.h_array(), fy_coul.h_array(),
                      fz_coul.h_array(), en_coul.h_array(), natom, tol);
+
+  if (old_cout_buf != nullptr)
+    std::cout.rdbuf(old_cout_buf);
 
   return 0;
 }

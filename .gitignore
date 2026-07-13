@@ -42,4 +42,4 @@ lib/
 build/
 *.swp
 
-benchmark_outputs/
+benchmark*
