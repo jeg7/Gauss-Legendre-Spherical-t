@@ -45,7 +45,7 @@ glst_plan::glst_plan(void)
     : natom_(0), box_dim_x_(0.0), box_dim_y_(0.0), box_dim_z_(0.0), ncell_x_(0),
       ncell_y_(0), ncell_z_(0), ncell_(0), cell_dim_x_(0.0), cell_dim_y_(0.0),
       cell_dim_z_(0.0), ngroup_(0), grp_r_in_(), grp_r_out_(),
-      ncell_alpha_group_(), rmax_(), alpha_(), zcut_() {}
+      ncell_alpha_group_(), rmax_(), alpha_(), zcut_(), cubature_(nullptr) {}
 
 glst_plan::~glst_plan(void) {}
 
@@ -90,6 +90,51 @@ const std::vector<double> &glst_plan::rmax(void) const { return this->rmax_; }
 const std::vector<double> &glst_plan::alpha(void) const { return this->alpha_; }
 
 const std::vector<double> &glst_plan::zcut(void) const { return this->zcut_; }
+
+unsigned int glst_plan::num_cubatures(void) const {
+  return this->cubature_data().num_cubatures();
+}
+
+unsigned int glst_plan::tot_num_nodes(void) const {
+  return this->cubature_data().tot_num_nodes();
+}
+
+const std::vector<cuda_container<unsigned int>> &glst_plan::points(void) const {
+  return this->cubature_data().points();
+}
+
+const std::vector<cuda_container<unsigned int>> &
+glst_plan::num_nodes(void) const {
+  return this->cubature_data().num_nodes();
+}
+
+const std::vector<cuda_container<double>> &glst_plan::x(void) const {
+  return this->cubature_data().x();
+}
+
+const std::vector<cuda_container<double>> &glst_plan::y(void) const {
+  return this->cubature_data().y();
+}
+
+const std::vector<cuda_container<double>> &glst_plan::z(void) const {
+  return this->cubature_data().z();
+}
+
+const std::vector<cuda_container<double>> &glst_plan::w(void) const {
+  return this->cubature_data().w();
+}
+
+const std::vector<cuda_container<unsigned int>> &glst_plan::group(void) const {
+  return this->cubature_data().group();
+}
+
+const cubature<double> &glst_plan::cubature_data(void) const {
+  if (this->cubature_ == nullptr) {
+    throw std::runtime_error("FATAL ERROR: glst_plan::cubature_data: Cubature "
+                             "has not been initialized");
+  }
+  return *(this->cubature_);
+}
 
 void glst_plan::init_cells(const unsigned int natom, const double box_dim_x,
                            const double box_dim_y, const double box_dim_z,
@@ -194,6 +239,18 @@ void glst_plan::init_alpha_groups(const double tol) {
     this->grp_r_out_[group] =
         this->grp_r_in_[group] + this->ncell_alpha_group_[group];
   }
+
+  return;
+}
+
+void glst_plan::init_cubature(const double tol) {
+  if (this->ngroup_ == 0) {
+    throw std::runtime_error("FATAL ERROR: glst_plan::init_cubature: Alpha "
+                             "groups have not been initialized");
+  }
+
+  this->cubature_ = std::make_unique<cubature<double>>(
+      tol, this->ngroup_, this->rmax_, this->alpha_, this->zcut_);
 
   return;
 }

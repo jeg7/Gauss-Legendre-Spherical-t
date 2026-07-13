@@ -11,6 +11,10 @@
 #ifndef __GLST_GLST_PLAN__
 #define __GLST_GLST_PLAN__
 
+#include "cubature.hcu"
+#include "cuda_container.hcu"
+
+#include <memory>
 #include <vector>
 
 class glst_plan {
@@ -43,12 +47,27 @@ public:
   const std::vector<double> &alpha(void) const;
   const std::vector<double> &zcut(void) const;
 
+  unsigned int num_cubatures(void) const;
+  unsigned int tot_num_nodes(void) const;
+
+  const std::vector<cuda_container<unsigned int>> &points(void) const;
+  const std::vector<cuda_container<unsigned int>> &num_nodes(void) const;
+  const std::vector<cuda_container<double>> &x(void) const;
+  const std::vector<cuda_container<double>> &y(void) const;
+  const std::vector<cuda_container<double>> &z(void) const;
+  const std::vector<cuda_container<double>> &w(void) const;
+  const std::vector<cuda_container<unsigned int>> &group(void) const;
+
+  const cubature<double> &cubature_data(void) const;
+
 public:
   void init_cells(const unsigned int natom, const double box_dim_x,
                   const double box_dim_y, const double box_dim_z,
                   const double rcut);
 
   void init_alpha_groups(const double tol);
+
+  void init_cubature(const double tol);
 
 private:
   unsigned int natom_;
@@ -73,6 +92,8 @@ private:
   std::vector<double> rmax_;
   std::vector<double> alpha_;
   std::vector<double> zcut_;
+
+  std::unique_ptr<cubature<double>> cubature_;
 };
 
 #endif

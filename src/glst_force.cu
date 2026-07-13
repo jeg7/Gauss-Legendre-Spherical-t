@@ -28,12 +28,12 @@ glst_force<CT>::glst_force(void)
       atom_cell_sorted_idx_(), ncell_x_(0), ncell_y_(0), ncell_z_(0), ncell_(0),
       cell_dim_x_(static_cast<CT>(0.0)), cell_dim_y_(static_cast<CT>(0.0)),
       cell_dim_z_(static_cast<CT>(0.0)), ngroup_(0), grp_r_in_(), grp_r_out_(),
-      plan_(nullptr), cubature_(nullptr), dev_cub_counts_(), dev_cub_points_(),
-      cell_atom_point_(), cell_atom_count_(), max_atoms_cell_(), sf_re_(),
-      sf_im_(), rmt_sum_re_(), rmt_sum_im_(), cub_work_buffer_(),
-      cub_work_buffer_size_(), cuda_count_(-1), cell_dev_idx_(),
-      dev_cell_idx_(), comp_streams_(), comm_streams_(), comp_events_(),
-      comm_events_(), nccl_devs_(), nccl_comms_() {
+      plan_(nullptr), dev_cub_counts_(), dev_cub_points_(), cell_atom_point_(),
+      cell_atom_count_(), max_atoms_cell_(), sf_re_(), sf_im_(), rmt_sum_re_(),
+      rmt_sum_im_(), cub_work_buffer_(), cub_work_buffer_size_(),
+      cuda_count_(-1), cell_dev_idx_(), dev_cell_idx_(), comp_streams_(),
+      comm_streams_(), comp_events_(), comm_events_(), nccl_devs_(),
+      nccl_comms_() {
   // Ensure that CT is of a correct type
   static_assert(std::is_floating_point_v<CT>,
                 "CT must be a floating-point type (float or double)");
@@ -221,6 +221,8 @@ void glst_force<CT>::init(const unsigned int natom, const double tol,
 
   this->plan_ = std::make_unique<glst_plan>();
   this->plan_->init_cells(natom, box_dim_x, box_dim_y, box_dim_z, rcut);
+  this->plan_->init_alpha_groups(tol);
+  this->plan_->init_cubature(tol);
 
   this->natom_ = this->plan_->natom();
 
@@ -249,7 +251,6 @@ void glst_force<CT>::init(const unsigned int natom, const double tol,
             << static_cast<CT>(this->ncell_z_) * this->cell_dim_z_ << std::endl;
   std::cout << "           Number of GPUs: " << this->cuda_count_ << std::endl;
 
-  this->plan_->init_alpha_groups(tol);
   this->ngroup_ = this->plan_->ngroup();
 
   this->grp_r_in_.resize(this->cuda_count_);
@@ -262,22 +263,18 @@ void glst_force<CT>::init(const unsigned int natom, const double tol,
   std::cout << std::endl;
   std::cout << "  Number of alpha groups: " << this->ngroup_ << std::endl;
 
-  this->cubature_ =
-      std::make_unique<cubature<CT>>(tol, this->ngroup_, this->plan_->rmax(),
-                                     this->plan_->alpha(), this->plan_->zcut());
-
   std::cout << "       Total number of cubature nodes: "
-            << this->cubature_->tot_num_nodes() << std::endl;
+            << this->plan_->tot_num_nodes() << std::endl;
   for (unsigned int grp = 0; grp < this->ngroup_; grp++) {
     std::cout << "  Number of cubature nodes in group " << grp << ": "
-              << this->cubature_->num_nodes()[0][grp] << std::endl;
+              << this->plan_->num_nodes()[0][grp] << std::endl;
   }
 
   { // Distribute cubature nodes across devices
-    const unsigned int size = this->cubature_->tot_num_nodes() /
+    const unsigned int size = this->plan_->tot_num_nodes() /
                               static_cast<unsigned int>(this->cuda_count_);
     const int rmdr =
-        static_cast<int>(this->cubature_->tot_num_nodes()) % this->cuda_count_;
+        static_cast<int>(this->plan_->tot_num_nodes()) % this->cuda_count_;
     this->dev_cub_counts_.resize(this->cuda_count_);
     this->dev_cub_points_.resize(this->cuda_count_);
     this->dev_cub_points_[0] = 0;
@@ -537,8 +534,8 @@ void glst_force<CT>::assign_atoms(const double *d_rx, const double *d_ry,
 template <unsigned int ATOM_TILE>
 __global__ static void
 calc_sf_kernel(float *__restrict__ sf_re, float *__restrict__ sf_im,
-               const float *__restrict__ cx, const float *__restrict__ cy,
-               const float *__restrict__ cz, const unsigned int nc,
+               const double *__restrict__ cx, const double *__restrict__ cy,
+               const double *__restrict__ cz, const unsigned int nc,
                const float *__restrict__ rx, const float *__restrict__ ry,
                const float *__restrict__ rz, const float *__restrict__ qc,
                const unsigned int *__restrict__ cell_atom_points,
@@ -686,9 +683,9 @@ template <typename CT> void glst_force<CT>::calc_sf(void) {
         <<<num_blocks, num_threads, 0, this->comp_streams_[dev]>>>(
             this->sf_re_[dev].d_array().data(),
             this->sf_im_[dev].d_array().data(),
-            this->cubature_->x()[dev].d_array().data() + off,
-            this->cubature_->y()[dev].d_array().data() + off,
-            this->cubature_->z()[dev].d_array().data() + off, nc,
+            this->plan_->x()[dev].d_array().data() + off,
+            this->plan_->y()[dev].d_array().data() + off,
+            this->plan_->z()[dev].d_array().data() + off, nc,
             this->rx_[dev].d_array().data(), this->ry_[dev].d_array().data(),
             this->rz_[dev].d_array().data(), this->qc_[dev].d_array().data(),
             this->cell_atom_point_[dev].d_array().data(),
@@ -881,7 +878,7 @@ template <typename CT>
 __global__ static void calc_rmt_sum_kernel(
     CT *__restrict__ rmt_sum_re, CT *__restrict__ rmt_sum_im,
     const CT *__restrict__ sf_re, CT *__restrict__ sf_im,
-    const CT *__restrict__ cw, const unsigned int *__restrict__ groups,
+    const double *__restrict__ cw, const unsigned int *__restrict__ groups,
     const unsigned int nc, const unsigned int *__restrict__ grp_r_in,
     const unsigned int *__restrict__ grp_r_out, const unsigned int nx,
     const unsigned int ny, const unsigned int nz, const unsigned int ncell) {
@@ -968,8 +965,8 @@ template <typename CT> void glst_force<CT>::sum_rmt_sf(void) {
               this->rmt_sum_im_[dev].d_array().data(),
               this->sf_re_[dev].d_array().data(),
               this->sf_im_[dev].d_array().data(),
-              this->cubature_->w()[dev].d_array().data() + off,
-              this->cubature_->group()[dev].d_array().data() + off, nc,
+              this->plan_->w()[dev].d_array().data() + off,
+              this->plan_->group()[dev].d_array().data() + off, nc,
               this->grp_r_in_[dev].d_array().data(),
               this->grp_r_out_[dev].d_array().data(), this->ncell_x_,
               this->ncell_y_, this->ncell_z_, this->ncell_);
@@ -989,8 +986,8 @@ calc_lr_ef_kernel(double *__restrict__ fx, double *__restrict__ fy,
                   const float *__restrict__ rz, const float *__restrict__ qc,
                   const unsigned int *__restrict__ cell_atom_points,
                   const unsigned int *__restrict__ cell_atom_counts,
-                  const float *__restrict__ cx, const float *__restrict__ cy,
-                  const float *__restrict__ cz,
+                  const double *__restrict__ cx, const double *__restrict__ cy,
+                  const double *__restrict__ cz,
                   const float *__restrict__ rmt_sum_re,
                   const float *__restrict__ rmt_sum_im, const unsigned int nc,
                   const unsigned int ncell) {
@@ -1156,9 +1153,9 @@ template <typename CT> void glst_force<CT>::calc_lr_ef(void) {
             this->rz_[dev].d_array().data(), this->qc_[dev].d_array().data(),
             this->cell_atom_point_[dev].d_array().data(),
             this->cell_atom_count_[dev].d_array().data(),
-            this->cubature_->x()[dev].d_array().data() + off,
-            this->cubature_->y()[dev].d_array().data() + off,
-            this->cubature_->z()[dev].d_array().data() + off,
+            this->plan_->x()[dev].d_array().data() + off,
+            this->plan_->y()[dev].d_array().data() + off,
+            this->plan_->z()[dev].d_array().data() + off,
             this->rmt_sum_re_[dev].d_array().data(),
             this->rmt_sum_im_[dev].d_array().data(), nc, this->ncell_);
     cudaCheck(cudaGetLastError());
