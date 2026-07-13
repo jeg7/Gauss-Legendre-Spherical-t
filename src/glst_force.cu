@@ -223,6 +223,7 @@ void glst_force<CT>::init(const unsigned int natom, const double tol,
   this->plan_->init_cells(natom, box_dim_x, box_dim_y, box_dim_z, rcut);
   this->plan_->init_alpha_groups(tol);
   this->plan_->init_cubature(tol);
+  this->plan_->init_tile_schedule();
 
   this->natom_ = this->plan_->natom();
 
@@ -250,6 +251,8 @@ void glst_force<CT>::init(const unsigned int natom, const double tol,
             << static_cast<CT>(this->ncell_y_) * this->cell_dim_y_ << " x "
             << static_cast<CT>(this->ncell_z_) * this->cell_dim_z_ << std::endl;
   std::cout << "           Number of GPUs: " << this->cuda_count_ << std::endl;
+
+  this->plan_->print_tile_diagnostics(std::cout);
 
   this->ngroup_ = this->plan_->ngroup();
 

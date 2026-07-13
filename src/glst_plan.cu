@@ -10,8 +10,11 @@
 
 #include "glst_plan.hcu"
 
+#include <algorithm>
 #include <cmath>
+#include <iostream>
 #include <limits>
+#include <numeric>
 #include <stdexcept>
 #include <string>
 
@@ -45,7 +48,9 @@ glst_plan::glst_plan(void)
     : natom_(0), box_dim_x_(0.0), box_dim_y_(0.0), box_dim_z_(0.0), ncell_x_(0),
       ncell_y_(0), ncell_z_(0), ncell_(0), cell_dim_x_(0.0), cell_dim_y_(0.0),
       cell_dim_z_(0.0), ngroup_(0), grp_r_in_(), grp_r_out_(),
-      ncell_alpha_group_(), rmax_(), alpha_(), zcut_(), cubature_(nullptr) {}
+      ncell_alpha_group_(), rmax_(), alpha_(), zcut_(), cubature_(nullptr),
+      max_tile_nodes_(2048), tile_count_(0), tile_group_(), tile_node_point_(),
+      tile_node_count_() {}
 
 glst_plan::~glst_plan(void) {}
 
@@ -134,6 +139,53 @@ const cubature<double> &glst_plan::cubature_data(void) const {
                              "has not been initialized");
   }
   return *(this->cubature_);
+}
+
+unsigned int glst_plan::max_tile_nodes(void) const {
+  return this->max_tile_nodes_;
+}
+
+unsigned int glst_plan::tile_count(void) const { return this->tile_count_; }
+
+const std::vector<unsigned int> &glst_plan::tile_group(void) const {
+  return this->tile_group_;
+}
+
+const std::vector<unsigned int> &glst_plan::tile_node_point(void) const {
+  return this->tile_node_point_;
+}
+
+const std::vector<unsigned int> &glst_plan::tile_node_count(void) const {
+  return this->tile_node_count_;
+}
+
+unsigned int glst_plan::tile_group(const unsigned int tile) const {
+  if (tile >= this->tile_count_) {
+    throw std::runtime_error(
+        "FATAL ERROR: glst_plan::tile_group: Tile index out of range");
+  }
+  return this->tile_group_[tile];
+}
+
+unsigned int glst_plan::tile_node_point(const unsigned int tile) const {
+  if (tile >= this->tile_count_) {
+    throw std::runtime_error(
+        "FATAL ERROR: glst_plan::tile_node_point: Tile index out of range");
+  }
+  return this->tile_node_point_[tile];
+}
+
+unsigned int glst_plan::tile_node_count(const unsigned int tile) const {
+  if (tile >= this->tile_count_) {
+    throw std::runtime_error(
+        "FATAL ERROR: glst_plan::tile_node_count: Tile index out of range");
+  }
+  return this->tile_node_count_[tile];
+}
+
+unsigned int glst_plan::tiles_in_group(const unsigned int group) const {
+  return static_cast<unsigned int>(
+      std::count(this->tile_group_.begin(), this->tile_group_.end(), group));
 }
 
 void glst_plan::init_cells(const unsigned int natom, const double box_dim_x,
@@ -252,5 +304,132 @@ void glst_plan::init_cubature(const double tol) {
   this->cubature_ = std::make_unique<cubature<double>>(
       tol, this->ngroup_, this->rmax_, this->alpha_, this->zcut_);
 
+  return;
+}
+
+void glst_plan::init_tile_schedule(const unsigned int max_tile_nodes) {
+  if (max_tile_nodes == 0) {
+    throw std::runtime_error("FATAL ERROR: glst_plan::init_tile_schedule: "
+                             "max_tile_nodes must be > 0");
+  }
+
+  if (this->cubature_ == nullptr) {
+    throw std::runtime_error("FATAL ERROR: glst_plan::init_tile_schedule: "
+                             "Cubature has not been initialized");
+  }
+
+  this->max_tile_nodes_ = max_tile_nodes;
+  this->tile_count_ = 0;
+
+  this->tile_group_.clear();
+  this->tile_node_point_.clear();
+  this->tile_node_count_.clear();
+
+  const unsigned int total_nodes =
+      static_cast<unsigned int>(this->cubature_->tot_num_nodes());
+
+  unsigned int scheduled_nodes = 0;
+
+  for (unsigned int group = 0; group < this->ngroup_; group++) {
+    const unsigned int group_point =
+        static_cast<unsigned int>(this->cubature_->points()[0][group]);
+
+    const unsigned int group_node_count =
+        static_cast<unsigned int>(this->cubature_->num_nodes()[0][group]);
+
+    if ((group_point > total_nodes) ||
+        (group_node_count > total_nodes - group_point)) {
+      throw std::runtime_error("FATAL ERROR: glst_plan::init_tile_schedule: "
+                               "Cubature group node range is out of bounds");
+    }
+
+    unsigned int group_offset = 0;
+
+    while (group_offset < group_node_count) {
+      const unsigned int remaining = group_node_count - group_offset;
+      const unsigned int this_tile_count =
+          std::min(this->max_tile_nodes_, remaining);
+
+      this->tile_group_.push_back(group);
+      this->tile_node_point_.push_back(group_point + group_offset);
+      this->tile_node_count_.push_back(this_tile_count);
+
+      group_offset += this_tile_count;
+      scheduled_nodes += this_tile_count;
+    }
+  }
+
+  this->tile_count_ = static_cast<unsigned int>(this->tile_node_count_.size());
+
+  if (scheduled_nodes != total_nodes) {
+    throw std::runtime_error(
+        "FATAL ERROR: glst_plan::init_tile_schedule: Scheduled tile nodes do "
+        "not match total cubature nodes");
+  }
+
+  for (unsigned int tile = 0; tile < this->tile_count_; tile++) {
+    if (this->tile_node_count_[tile] == 0) {
+      throw std::runtime_error("FATAL ERROR: glst_plan::init_tile_schedule: "
+                               "Zero-sized tile encountered");
+    }
+
+    if (this->tile_node_count_[tile] > this->max_tile_nodes_) {
+      throw std::runtime_error("FATAL ERROR: glst_plan::init_tile_schedule: "
+                               "Tile exceeds max_tile_nodes");
+    }
+
+    const unsigned int group = this->tile_group_[tile];
+
+    if (group >= this->ngroup_) {
+      throw std::runtime_error("FATAL ERROR: glst_plan::init_tile_schedule: "
+                               "Tile has invalid cubature group");
+    }
+
+    const unsigned int group_point =
+        static_cast<unsigned int>(this->cubature_->points()[0][group]);
+
+    const unsigned int group_node_count =
+        static_cast<unsigned int>(this->cubature_->num_nodes()[0][group]);
+
+    const unsigned int tile_begin = this->tile_node_point_[tile];
+    const unsigned int tile_end = tile_begin + this->tile_node_count_[tile];
+    const unsigned int group_end = group_point + group_node_count;
+
+    if ((tile_begin < group_point) || (tile_end > group_end)) {
+      throw std::runtime_error("FATAL ERROR: glst_plan::init_tile_schedule: "
+                               "Tile crosses a cubature group boundary");
+    }
+
+    if (tile > 0) {
+      const unsigned int previous_group = this->tile_group_[tile - 1];
+
+      if (group < previous_group) {
+        throw std::runtime_error("FATAL ERROR: glst_plan::init_tile_schedule: "
+                                 "Tile groups are not monotonically ordered");
+      }
+
+      if (group == previous_group) {
+        const unsigned int previous_end =
+            this->tile_node_point_[tile - 1] + this->tile_node_count_[tile - 1];
+
+        if (tile_begin != previous_end) {
+          throw std::runtime_error(
+              "FATAL ERROR: glst_plan::init_tile_schedule: Non-contiguous tile "
+              "inside cubature group");
+        }
+      }
+    }
+  }
+
+  return;
+}
+
+void glst_plan::print_tile_diagnostics(std::ostream &os) const {
+  os << "              Number of GLST tiles: " << tile_count_ << '\n';
+  os << "   Maximum cubature nodes per tile: " << max_tile_nodes_ << '\n';
+  for (unsigned int group = 0; group < this->ngroup_; group++) {
+    os << "      Number of tiles in group " << group << ": "
+       << tiles_in_group(group) << '\n';
+  }
   return;
 }
