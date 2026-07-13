@@ -194,7 +194,6 @@ void glst_force<CT>::init(const unsigned int natom, const double tol,
   this->atom_cell_idx_.resize(this->cuda_count_);
   this->atom_cell_sorted_idx_.resize(this->cuda_count_);
 
-  this->natom_ = natom;
   for (int dev = 0; dev < this->cuda_count_; dev++) {
     cudaCheck(cudaSetDevice(dev));
     this->idx_[dev].resize(natom);
@@ -250,15 +249,22 @@ void glst_force<CT>::init(const unsigned int natom, const double tol,
             << static_cast<CT>(this->ncell_z_) * this->cell_dim_z_ << std::endl;
   std::cout << "           Number of GPUs: " << this->cuda_count_ << std::endl;
 
-  std::vector<unsigned int> ncell_alpha_group;
-  std::vector<double> rmax, alpha, zcut;
-  this->init_alpha_groups(ncell_alpha_group, rmax, alpha, zcut, tol);
+  this->plan_->init_alpha_groups(tol);
+  this->ngroup_ = this->plan_->ngroup();
+
+  this->grp_r_in_.resize(this->cuda_count_);
+  this->grp_r_out_.resize(this->cuda_count_);
+  for (int dev = 0; dev < this->cuda_count_; dev++) {
+    this->grp_r_in_[dev] = this->plan_->grp_r_in();
+    this->grp_r_out_[dev] = this->plan_->grp_r_out();
+  }
 
   std::cout << std::endl;
   std::cout << "  Number of alpha groups: " << this->ngroup_ << std::endl;
 
   this->cubature_ =
-      std::make_unique<cubature<CT>>(tol, this->ngroup_, rmax, alpha, zcut);
+      std::make_unique<cubature<CT>>(tol, this->ngroup_, this->plan_->rmax(),
+                                     this->plan_->alpha(), this->plan_->zcut());
 
   std::cout << "       Total number of cubature nodes: "
             << this->cubature_->tot_num_nodes() << std::endl;
@@ -1604,116 +1610,6 @@ void glst_force<CT>::calc_ener_force(const double *d_rx, const double *d_ry,
   this->calc_lr_ef();
   this->calc_sr_ef();
   this->comm_ef();
-  return;
-}
-
-static double erfc_inv(const double y, const double tol) {
-  constexpr unsigned long long int MAX_IT = 100000000;
-  const double rdum = 2.0 / std::sqrt(M_PI);
-
-  double x = 0.0; // Initial guess for x
-  double err = std::numeric_limits<double>::max();
-
-  for (unsigned long long int i = 0; i < MAX_IT; i++) {
-    err = 1.0 - std::erf(x) - y;
-    if (std::abs(err) < tol)
-      break;
-
-    // Calculate the derivative of erfc
-    double deriv = -std::exp(-x * x) * rdum;
-    x -= err / deriv; // Newton-Raphson formula: x = x - f(x) / f'(x)
-  }
-
-  if (std::abs(err) >= tol) {
-    throw std::runtime_error("FATAL ERROR: erfc_inv(const double, const "
-                             "double): Inverse of erfc not found after " +
-                             std::to_string(MAX_IT) + " iterations");
-  }
-
-  return x;
-}
-
-template <typename CT>
-void glst_force<CT>::init_alpha_groups(
-    std::vector<unsigned int> &ncell_alpha_group, std::vector<double> &rmax,
-    std::vector<double> &alpha, std::vector<double> &zcut, const double tol) {
-  ncell_alpha_group.clear();
-  rmax.clear();
-  alpha.clear();
-  zcut.clear();
-
-  int width = 1;
-  int tot_width = 0;
-  int ncell_remain = this->ncell_x_;
-  ncell_remain = (static_cast<int>(this->ncell_y_) > ncell_remain)
-                     ? static_cast<int>(this->ncell_y_)
-                     : ncell_remain;
-  ncell_remain = (static_cast<int>(this->ncell_z_) > ncell_remain)
-                     ? static_cast<int>(this->ncell_z_)
-                     : ncell_remain;
-  ncell_remain -= 2;
-
-  this->ngroup_ = 0;
-
-  while (ncell_remain >= 0) {
-    ncell_alpha_group.push_back(static_cast<unsigned int>(width));
-
-    double lmin = this->cell_dim_x_;
-    lmin = (this->cell_dim_y_ < lmin) ? this->cell_dim_y_ : lmin;
-    lmin = (this->cell_dim_z_ < lmin) ? this->cell_dim_z_ : lmin;
-
-    double lmax = this->cell_dim_x_;
-    lmax = (this->cell_dim_y_ > lmax) ? this->cell_dim_y_ : lmax;
-    lmax = (this->cell_dim_z_ > lmax) ? this->cell_dim_z_ : lmax;
-
-    const double rmin0 = lmin * static_cast<double>(tot_width + 1);
-    const double rmax0 =
-        std::sqrt(3.0) * (rmin0 + lmax * static_cast<double>(width + 1));
-    rmax.push_back(rmax0);
-
-    const double alpha0 =
-        erfc_inv(tol * rmin0, std::numeric_limits<double>::epsilon()) / rmin0;
-    alpha.push_back(alpha0);
-
-    const double zcut0 = erfc_inv(0.5 * std::sqrt(M_PI) / alpha0 * tol,
-                                  std::numeric_limits<double>::epsilon());
-    zcut.push_back(zcut0);
-
-    ncell_remain -= width;
-    tot_width += width;
-    if (ncell_remain < 1)
-      break;
-
-    // Determine the next alpha group width
-    int width1 = 2 * width; // Width of next complete alpha group
-    int width2 =
-        6 * width; // Sum of the next two alpha group width (2 + 4) * width
-    if (ncell_remain <= width1)
-      width = ncell_remain; // The last group
-    else if ((width1 < ncell_remain) && (ncell_remain < width2))
-      width = ncell_remain / 2; // Two groups left
-    else
-      width = width1; // Keep going
-  }
-
-  this->ngroup_ = static_cast<unsigned int>(ncell_alpha_group.size());
-
-  std::vector<unsigned int> r_in((this->ngroup_ > 0) ? this->ngroup_ : 1);
-  std::vector<unsigned int> r_out((this->ngroup_ > 0) ? this->ngroup_ : 1);
-  r_in[0] = 1;
-  for (unsigned int group = 0; group < this->ngroup_; group++) {
-    if (group > 0)
-      r_in[group] = r_out[group - 1];
-    r_out[group] = r_in[group] + ncell_alpha_group[group];
-  }
-
-  this->grp_r_in_.resize(this->cuda_count_);
-  this->grp_r_out_.resize(this->cuda_count_);
-  for (int dev = 0; dev < this->cuda_count_; dev++) {
-    this->grp_r_in_[dev] = r_in;
-    this->grp_r_out_[dev] = r_out;
-  }
-
   return;
 }
 

@@ -63,11 +63,6 @@ public: // Energy and force calculation
                        const double *d_rz, const double *d_qc);
 
 private:
-  void init_alpha_groups(std::vector<unsigned int> &ncell_alpha_group,
-                         std::vector<double> &rmax, std::vector<double> &alpha,
-                         std::vector<double> &zcut, const double tol);
-
-private:
   void allocate(void);
   void deallocate(void);
   void cells2dev(void);

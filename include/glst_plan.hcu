@@ -11,6 +11,8 @@
 #ifndef __GLST_GLST_PLAN__
 #define __GLST_GLST_PLAN__
 
+#include <vector>
+
 class glst_plan {
 public:
   glst_plan(void);
@@ -32,10 +34,21 @@ public:
   double cell_dim_y(void) const;
   double cell_dim_z(void) const;
 
+  unsigned int ngroup(void) const;
+
+  const std::vector<unsigned int> &grp_r_in(void) const;
+  const std::vector<unsigned int> &grp_r_out(void) const;
+  const std::vector<unsigned int> &ncell_alpha_group(void) const;
+  const std::vector<double> &rmax(void) const;
+  const std::vector<double> &alpha(void) const;
+  const std::vector<double> &zcut(void) const;
+
 public:
   void init_cells(const unsigned int natom, const double box_dim_x,
                   const double box_dim_y, const double box_dim_z,
                   const double rcut);
+
+  void init_alpha_groups(const double tol);
 
 private:
   unsigned int natom_;
@@ -52,6 +65,14 @@ private:
   double cell_dim_x_;
   double cell_dim_y_;
   double cell_dim_z_;
+
+  unsigned int ngroup_;
+  std::vector<unsigned int> grp_r_in_;
+  std::vector<unsigned int> grp_r_out_;
+  std::vector<unsigned int> ncell_alpha_group_;
+  std::vector<double> rmax_;
+  std::vector<double> alpha_;
+  std::vector<double> zcut_;
 };
 
 #endif
