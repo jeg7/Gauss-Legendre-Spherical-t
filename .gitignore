@@ -37,5 +37,9 @@ SS31-Mar-2016
 clean.sh
 compile.sh
 run.sh
+bin/
+lib/
 build/
 *.swp
+
+benchmark_outputs/

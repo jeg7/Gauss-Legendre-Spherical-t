@@ -8,18 +8,19 @@
 //
 // ENDLICENSE
 
-#include <chrono>
 #include <coulomb.hcu>
-#include <cstdlib>
 #include <cuda_container.hcu>
 #include <cuda_utils.hcu>
 #include <glst_force.hcu>
+#include <utils.hpp>
+
+#include <chrono>
+#include <cstdlib>
 #include <io.hpp>
 #include <iostream>
 #include <limits>
 #include <memory>
 #include <string>
-#include <utils.hpp>
 
 int main(int argc, char **argv) {
   // Input check and error catch

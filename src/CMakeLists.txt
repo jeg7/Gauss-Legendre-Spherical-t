@@ -10,21 +10,15 @@ add_library(GLST
   ${GLST_SOURCE_DIR}/src/glst_force.cu
   ${GLST_SOURCE_DIR}/src/string_utils.cpp
 )
+
 set_target_properties(GLST PROPERTIES
-  CUDA_ARCHITECTURES "80"
+  POSITION_INDEPENDENT_CODE ON
+  CUDA_ARCHITECTURES "${GLST_CUDA_ARCHITECTURES}"
+  # CUDA_SEPARABLE_COMPILATION ON
+  # COMPILE_FLAGS "-rdc=true"
+  # LINK_FLAGS "-lcudadevrt"
 )
-# set_target_properties(GLST PROPERTIES
-#   CUDA_ARCHITECTURES "70;80;90"
-# )
-# set_target_properties(GLST PROPERTIES
-#   CUDA_SEPARABLE_COMPILATION ON
-# )
-# set_target_properties(GLST PROPERTIES
-#   COMPILE_FLAGS "-rdc=true"
-# )
-# set_target_properties(GLST PROPERTIES
-#   LINK_FLAGS "-lcudadevrt"
-# )
+
 target_include_directories(GLST PUBLIC ${GLST_SOURCE_DIR}/include)
 
 target_link_libraries(GLST
