@@ -28,7 +28,7 @@ glst_force<CT>::glst_force(void)
       atom_cell_sorted_idx_(), ncell_x_(0), ncell_y_(0), ncell_z_(0), ncell_(0),
       cell_dim_x_(static_cast<CT>(0.0)), cell_dim_y_(static_cast<CT>(0.0)),
       cell_dim_z_(static_cast<CT>(0.0)), ngroup_(0), grp_r_in_(), grp_r_out_(),
-      cubature_(nullptr), dev_cub_counts_(), dev_cub_points_(),
+      plan_(nullptr), cubature_(nullptr), dev_cub_counts_(), dev_cub_points_(),
       cell_atom_point_(), cell_atom_count_(), max_atoms_cell_(), sf_re_(),
       sf_im_(), rmt_sum_re_(), rmt_sum_im_(), cub_work_buffer_(),
       cub_work_buffer_size_(), cuda_count_(-1), cell_dev_idx_(),
@@ -220,25 +220,19 @@ void glst_force<CT>::init(const unsigned int natom, const double tol,
     this->idx_[dev].transfer_to_device();
   }
 
-  this->cell_dim_x_ = static_cast<CT>(rcut);
-  this->cell_dim_y_ = static_cast<CT>(rcut);
-  this->cell_dim_z_ = static_cast<CT>(rcut);
-  this->ncell_x_ =
-      static_cast<unsigned int>(static_cast<CT>(box_dim_x) / this->cell_dim_x_);
-  this->ncell_y_ =
-      static_cast<unsigned int>(static_cast<CT>(box_dim_y) / this->cell_dim_y_);
-  this->ncell_z_ =
-      static_cast<unsigned int>(static_cast<CT>(box_dim_z) / this->cell_dim_z_);
-  if (static_cast<CT>(this->ncell_x_) * this->cell_dim_x_ <
-      static_cast<CT>(box_dim_x))
-    this->ncell_x_++;
-  if (static_cast<CT>(this->ncell_y_) * this->cell_dim_y_ <
-      static_cast<CT>(box_dim_y))
-    this->ncell_y_++;
-  if (static_cast<CT>(this->ncell_z_) * this->cell_dim_z_ <
-      static_cast<CT>(box_dim_z))
-    this->ncell_z_++;
-  this->ncell_ = this->ncell_x_ * this->ncell_y_ * this->ncell_z_;
+  this->plan_ = std::make_unique<glst_plan>();
+  this->plan_->init_cells(natom, box_dim_x, box_dim_y, box_dim_z, rcut);
+
+  this->natom_ = this->plan_->natom();
+
+  this->cell_dim_x_ = this->plan_->cell_dim_x();
+  this->cell_dim_y_ = this->plan_->cell_dim_y();
+  this->cell_dim_z_ = this->plan_->cell_dim_z();
+
+  this->ncell_x_ = this->plan_->ncell_x();
+  this->ncell_y_ = this->plan_->ncell_y();
+  this->ncell_z_ = this->plan_->ncell_z();
+  this->ncell_ = this->plan_->ncell();
 
   this->cells2dev();
 

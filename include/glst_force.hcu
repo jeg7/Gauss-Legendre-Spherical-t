@@ -14,6 +14,7 @@
 #include "atom_packet.hcu"
 #include "cubature.hcu"
 #include "cuda_container.hcu"
+#include "glst_plan.hcu"
 
 #include <nccl.h>
 
@@ -100,6 +101,7 @@ private:
   std::vector<cuda_container<unsigned int>> grp_r_in_;
   std::vector<cuda_container<unsigned int>> grp_r_out_;
 
+  std::unique_ptr<glst_plan> plan_;
   std::unique_ptr<cubature<CT>> cubature_;
   std::vector<unsigned int> dev_cub_counts_;
   std::vector<unsigned int> dev_cub_points_;

@@ -11,12 +11,47 @@
 #ifndef __GLST_GLST_PLAN__
 #define __GLST_GLST_PLAN__
 
-// CT = Calculation Type
-
-template <typename CT> class glst_plan {
+class glst_plan {
 public:
   glst_plan(void);
   ~glst_plan(void);
+
+public:
+  unsigned int natom(void) const;
+
+  double box_dim_x(void) const;
+  double box_dim_y(void) const;
+  double box_dim_z(void) const;
+
+  unsigned int ncell_x(void) const;
+  unsigned int ncell_y(void) const;
+  unsigned int ncell_z(void) const;
+  unsigned int ncell(void) const;
+
+  double cell_dim_x(void) const;
+  double cell_dim_y(void) const;
+  double cell_dim_z(void) const;
+
+public:
+  void init_cells(const unsigned int natom, const double box_dim_x,
+                  const double box_dim_y, const double box_dim_z,
+                  const double rcut);
+
+private:
+  unsigned int natom_;
+
+  double box_dim_x_;
+  double box_dim_y_;
+  double box_dim_z_;
+
+  unsigned int ncell_x_;
+  unsigned int ncell_y_;
+  unsigned int ncell_z_;
+  unsigned int ncell_;
+
+  double cell_dim_x_;
+  double cell_dim_y_;
+  double cell_dim_z_;
 };
 
 #endif
