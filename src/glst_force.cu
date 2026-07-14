@@ -274,9 +274,6 @@ void glst_force<CT>::init(const unsigned int natom, const double tol,
     std::cout << "  Number of cubature nodes in group " << grp << ": "
               << this->plan_->num_nodes()[0][grp] << std::endl;
   }
-  std::cout << std::endl;
-
-  this->plan_->print_tile_diagnostics(std::cout);
 
   { // Distribute cubature nodes across devices
     const unsigned int size = this->plan_->tot_num_nodes() /
@@ -296,6 +293,9 @@ void glst_force<CT>::init(const unsigned int natom, const double tol,
     std::cout << "  Number of cubature nodes per device: ~"
               << this->dev_cub_counts_[0] << std::endl;
   }
+  std::cout << std::endl;
+
+  this->plan_->print_tile_diagnostics(std::cout);
 
   // Allocate cell memory
   this->cell_atom_point_.resize(this->cuda_count_);

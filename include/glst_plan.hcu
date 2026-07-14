@@ -85,6 +85,8 @@ public:
 
   void init_tile_schedule(const unsigned int max_tile_nodes = 2048);
 
+  void validate(void) const;
+
 public:
   void print_tile_diagnostics(std::ostream &os) const;
 

@@ -362,63 +362,192 @@ void glst_plan::init_tile_schedule(const unsigned int max_tile_nodes) {
 
   this->tile_count_ = static_cast<unsigned int>(this->tile_node_count_.size());
 
-  if (scheduled_nodes != total_nodes) {
-    throw std::runtime_error(
-        "FATAL ERROR: glst_plan::init_tile_schedule: Scheduled tile nodes do "
-        "not match total cubature nodes");
+  this->validate();
+
+  return;
+}
+
+void glst_plan::validate(void) const {
+  const std::size_t expected_ncell = static_cast<std::size_t>(this->ncell_x_) *
+                                     static_cast<std::size_t>(this->ncell_y_) *
+                                     static_cast<std::size_t>(this->ncell_z_);
+
+  if (expected_ncell >
+      static_cast<std::size_t>(std::numeric_limits<unsigned int>::max())) {
+    throw std::runtime_error("FATAL ERROR: glst_plan::validate: ncell product "
+                             "exceeds unsigned int range");
   }
 
+  if (static_cast<std::size_t>(this->ncell_) != expected_ncell) {
+    throw std::runtime_error("FATAL ERROR: glst_plan::validate: ncell does not "
+                             "match ncell_x * ncell_y * ncell_z");
+  }
+
+  if (this->cubature_ == nullptr) {
+    throw std::runtime_error(
+        "FATAL ERROR: glst_plan::validate: Cubature has not been initialized");
+  }
+
+  if (this->ngroup_ != this->cubature_->num_cubatures()) {
+    throw std::runtime_error("FATAL ERROR: glst_plan::validate: ngroup does "
+                             "not match cubature num_cubatures");
+  }
+
+  if ((this->grp_r_in_.size() != static_cast<std::size_t>(this->ngroup_)) ||
+      (this->grp_r_out_.size() != static_cast<std::size_t>(this->ngroup_)) ||
+      (this->ncell_alpha_group_.size() !=
+       static_cast<std::size_t>(this->ngroup_)) ||
+      (this->rmax_.size() != static_cast<std::size_t>(this->ngroup_)) ||
+      (this->alpha_.size() != static_cast<std::size_t>(this->ngroup_)) ||
+      (this->zcut_.size() != static_cast<std::size_t>(this->ngroup_))) {
+    throw std::runtime_error("FATAL ERROR: glst_plan::validate: Alpha-group "
+                             "metadata sizes do not match ngroup");
+  }
+
+  const auto &points = this->cubature_->points();
+  const auto &num_nodes = this->cubature_->num_nodes();
+  const auto &x = this->cubature_->x();
+  const auto &y = this->cubature_->y();
+  const auto &z = this->cubature_->z();
+  const auto &w = this->cubature_->w();
+  const auto &group_array = this->cubature_->group();
+
+  if (points.empty() || num_nodes.empty() || x.empty() || y.empty() ||
+      z.empty() || w.empty() || group_array.empty()) {
+    throw std::runtime_error(
+        "FATAL ERROR: glst_plan::validate: Cubature storage is empty");
+  }
+
+  if ((points[0].size() < static_cast<std::size_t>(this->ngroup_)) ||
+      (num_nodes[0].size() < static_cast<std::size_t>(this->ngroup_))) {
+    throw std::runtime_error("FATAL ERROR: glst_plan::validate: Cubature group "
+                             "metadata is smaller than ngroup");
+  }
+
+  const std::size_t total_nodes =
+      static_cast<std::size_t>(this->cubature_->tot_num_nodes());
+
+  if (total_nodes == 0) {
+    throw std::runtime_error(
+        "FATAL ERROR: glst_plan::validate: Cubature has zero nodes");
+  }
+
+  if ((x[0].size() != total_nodes) || (y[0].size() != total_nodes) ||
+      (z[0].size() != total_nodes) || (w[0].size() != total_nodes) ||
+      (group_array[0].size() != total_nodes)) {
+    throw std::runtime_error("FATAL ERROR: glst_plan::validate: Cubature node "
+                             "arrays do not match total node count");
+  }
+
+  std::size_t group_node_sum = 0;
+  std::vector<std::size_t> group_begin(this->ngroup_);
+  std::vector<std::size_t> group_end(this->ngroup_);
+
+  for (unsigned int group = 0; group < this->ngroup_; group++) {
+    const std::size_t group_point = static_cast<std::size_t>(points[0][group]);
+    const std::size_t group_count =
+        static_cast<std::size_t>(num_nodes[0][group]);
+
+    if ((group_point > total_nodes) ||
+        (group_count > total_nodes - group_point)) {
+      throw std::runtime_error("FATAL ERROR: glst_plan::validate: Cubature "
+                               "group node range is out of bounds");
+    }
+
+    group_begin[group] = group_point;
+    group_end[group] = group_point + group_count;
+    group_node_sum += group_count;
+  }
+
+  if (group_node_sum != total_nodes) {
+    throw std::runtime_error(
+        "FATAL ERROR: glst_plan::validate: Sum of cubature group node counts "
+        "does not match total cubature node count");
+  }
+
+  if (this->max_tile_nodes_ == 0) {
+    throw std::runtime_error(
+        "FATAL ERROR: glst_plan::validate: max_tile_nodes is 0");
+  }
+
+  if ((static_cast<std::size_t>(this->tile_count_) !=
+       this->tile_group_.size()) ||
+      (static_cast<std::size_t>(this->tile_count_) !=
+       this->tile_node_point_.size()) ||
+      (static_cast<std::size_t>(this->tile_count_) !=
+       this->tile_node_count_.size())) {
+    throw std::runtime_error("FATAL ERROR: glst_plan::validate: Tile metadata "
+                             "sizes do not match tile_count");
+  }
+
+  std::size_t tile_node_sum = 0;
+  std::vector<std::size_t> next_node_point(this->ngroup_);
+  for (unsigned int group = 0; group < this->ngroup_; group++)
+    next_node_point[group] = group_begin[group];
+
   for (unsigned int tile = 0; tile < this->tile_count_; tile++) {
+    const unsigned int tile_group = this->tile_group_[tile];
+
     if (this->tile_node_count_[tile] == 0) {
-      throw std::runtime_error("FATAL ERROR: glst_plan::init_tile_schedule: "
-                               "Zero-sized tile encountered");
+      throw std::runtime_error(
+          "FATAL ERROR: glst_plan::validate: Zero-sized tile encountered");
     }
 
     if (this->tile_node_count_[tile] > this->max_tile_nodes_) {
-      throw std::runtime_error("FATAL ERROR: glst_plan::init_tile_schedule: "
-                               "Tile exceeds max_tile_nodes");
+      throw std::runtime_error(
+          "FATAL ERROR: glst_plan::validate: Tile exceeds max_tile_nodes");
     }
 
-    const unsigned int group = this->tile_group_[tile];
-
-    if (group >= this->ngroup_) {
-      throw std::runtime_error("FATAL ERROR: glst_plan::init_tile_schedule: "
-                               "Tile has invalid cubature group");
+    if (tile_group >= this->ngroup_) {
+      throw std::runtime_error(
+          "FATAL ERROR: glst_plan::validate: Tile has invalid cubature group");
     }
 
-    const unsigned int group_point =
-        static_cast<unsigned int>(this->cubature_->points()[0][group]);
-
-    const unsigned int group_node_count =
-        static_cast<unsigned int>(this->cubature_->num_nodes()[0][group]);
-
-    const unsigned int tile_begin = this->tile_node_point_[tile];
-    const unsigned int tile_end = tile_begin + this->tile_node_count_[tile];
-    const unsigned int group_end = group_point + group_node_count;
-
-    if ((tile_begin < group_point) || (tile_end > group_end)) {
-      throw std::runtime_error("FATAL ERROR: glst_plan::init_tile_schedule: "
-                               "Tile crosses a cubature group boundary");
+    if ((tile > 0) && (tile_group < this->tile_group_[tile - 1])) {
+      throw std::runtime_error("FATAL ERROR: glst_plan::validate: Tile groups "
+                               "are not monotonically ordered");
     }
 
-    if (tile > 0) {
-      const unsigned int previous_group = this->tile_group_[tile - 1];
+    const std::size_t tile_begin =
+        static_cast<std::size_t>(this->tile_node_point_[tile]);
+    const std::size_t tile_count =
+        static_cast<std::size_t>(this->tile_node_count_[tile]);
 
-      if (group < previous_group) {
-        throw std::runtime_error("FATAL ERROR: glst_plan::init_tile_schedule: "
-                                 "Tile groups are not monotonically ordered");
-      }
+    if ((tile_begin > total_nodes) || (tile_count > total_nodes - tile_begin)) {
+      throw std::runtime_error(
+          "FATAL ERROR: glst_plan::validate: Tile node range is out of bounds");
+    }
 
-      if (group == previous_group) {
-        const unsigned int previous_end =
-            this->tile_node_point_[tile - 1] + this->tile_node_count_[tile - 1];
+    const std::size_t tile_end = tile_begin + tile_count;
 
-        if (tile_begin != previous_end) {
-          throw std::runtime_error(
-              "FATAL ERROR: glst_plan::init_tile_schedule: Non-contiguous tile "
-              "inside cubature group");
-        }
-      }
+    if ((tile_begin < group_begin[tile_group]) ||
+        (tile_end > group_end[tile_group])) {
+      throw std::runtime_error("FATAL ERROR: glst_plan::validate: Tile crosses "
+                               "a cubature group boundary");
+    }
+
+    if (tile_begin != next_node_point[tile_group]) {
+      throw std::runtime_error(
+          "FATAL ERROR: glst_plan::validate: Non-contiguous tile coverage "
+          "inside cubature group");
+    }
+
+    next_node_point[tile_group] = tile_end;
+    tile_node_sum += tile_count;
+  }
+
+  if (tile_node_sum != total_nodes) {
+    throw std::runtime_error(
+        "FATAL ERROR: glst_plan::validate: Sum of tile node counts does not "
+        "match total cubature node count");
+  }
+
+  for (unsigned int group = 0; group < this->ngroup_; group++) {
+    if (next_node_point[group] != group_end[group]) {
+      throw std::runtime_error(
+          "FATAL ERROR: glst_plan::validate: Tile schedule does not cover "
+          "every cubature node in group " +
+          std::to_string(group));
     }
   }
 
@@ -443,8 +572,9 @@ void glst_plan::print_tile_diagnostics(std::ostream &os) const {
   os << "       Tile-buffer memory estimate: " << tile_buffer_mib << " MiB ("
      << tile_buffer_bytes << " bytes)" << '\n';
   for (unsigned int group = 0; group < this->ngroup_; group++) {
-    os << "      Number of tiles in group " << group << ": "
+    os << "        Number of tiles in group " << group << ": "
        << tiles_in_group(group) << '\n';
   }
+
   return;
 }
