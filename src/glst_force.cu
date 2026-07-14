@@ -31,18 +31,37 @@ glst_force<CT>::glst_force(void)
       plan_(nullptr), workspace_(nullptr), dev_cub_counts_(), dev_cub_points_(),
       cell_atom_point_(), cell_atom_count_(), max_atoms_cell_(), sf_re_(),
       sf_im_(), rmt_sum_re_(), rmt_sum_im_(), cub_work_buffer_(),
-      cub_work_buffer_size_(), cuda_count_(-1), cell_dev_idx_(),
-      dev_cell_idx_(), comp_streams_(), comm_streams_(), comp_events_(),
-      comm_events_(), nccl_devs_(), nccl_comms_() {
+      cub_work_buffer_size_(), tiled_single_gpu_(true), cuda_count_(-1),
+      cell_dev_idx_(), dev_cell_idx_(), comp_streams_(), comm_streams_(),
+      comp_events_(), comm_events_(), nccl_devs_(), nccl_comms_() {
   // Ensure that CT is of a correct type
   static_assert(std::is_floating_point_v<CT>,
                 "CT must be a floating-point type (float or double)");
 
-  cudaCheck(cudaGetDeviceCount(&this->cuda_count_));
-  if (this->cuda_count_ < 1) {
+  int device_count = 0;
+  cudaCheck(cudaGetDeviceCount(&device_count));
+  if (device_count < 1) {
     throw std::runtime_error(
         "glst_force<CT>::init: Could not find any CUDA capable devices");
   }
+
+  if (this->tiled_single_gpu_) {
+    this->cuda_count_ = 1;
+
+    this->comp_streams_.resize(1);
+    this->comm_streams_.clear();
+    this->comp_events_.clear();
+    this->comm_events_.clear();
+    this->nccl_devs_.clear();
+    this->nccl_comms_.clear();
+
+    cudaCheck(cudaSetDevice(0));
+    cudaCheck(cudaStreamCreate(&this->comp_streams_[0]));
+
+    return;
+  }
+
+  this->cuda_count_ = device_count;
   enable_p2p(this->cuda_count_);
 
   // Initialize streams and events
@@ -96,7 +115,8 @@ glst_force<CT>::glst_force(const unsigned int natom, const double tol,
 
 template <typename CT> glst_force<CT>::~glst_force(void) {
   this->deallocate();
-  disable_p2p(this->cuda_count_);
+  if (!this->tiled_single_gpu_)
+    disable_p2p(this->cuda_count_);
 }
 
 template <typename CT>
@@ -318,14 +338,16 @@ void glst_force<CT>::init(const unsigned int natom, const double tol,
 
   this->allocate();
 
-  // Call NCCL collective once to avoid initialization penalty
-  nccl_all_reduce_sum_ip(this->fx_, this->natom_, this->nccl_comms_,
-                         this->comm_streams_, this->cuda_count_);
+  if (!this->tiled_single_gpu_) {
+    // Call NCCL collective once to avoid initialization penalty
+    nccl_all_reduce_sum_ip(this->fx_, this->natom_, this->nccl_comms_,
+                           this->comm_streams_, this->cuda_count_);
 
-  // Synchronize on CUDA stream to wait for completion of NCCL operation
-  for (int dev = 0; dev < this->cuda_count_; dev++) {
-    cudaCheck(cudaSetDevice(dev));
-    cudaCheck(cudaStreamSynchronize(this->comm_streams_[dev]));
+    // Synchronize on CUDA stream to wait for completion of NCCL operation
+    for (int dev = 0; dev < this->cuda_count_; dev++) {
+      cudaCheck(cudaSetDevice(dev));
+      cudaCheck(cudaStreamSynchronize(this->comm_streams_[dev]));
+    }
   }
 
   return;
@@ -964,11 +986,7 @@ template <typename CT> void glst_force<CT>::sum_rmt_sf(void) {
     }
 
     {
-#ifdef __GLST_DEBUG__
       constexpr dim3 num_threads(512, 1, 1);
-#else
-      constexpr dim3 num_threads(128, 1, 1);
-#endif
       const dim3 num_blocks((nc + num_threads.x - 1) / num_threads.x,
                             std::min(65535u, this->ncell_), 1);
       calc_rmt_sum_kernel<CT>
@@ -1591,6 +1609,12 @@ template <typename CT> void glst_force<CT>::calc_sr_ef(void) {
 }
 
 template <typename CT> void glst_force<CT>::comm_ef(void) {
+  if (this->tiled_single_gpu_) {
+    cudaCheck(cudaSetDevice(0));
+    cudaCheck(cudaStreamSynchronize(this->comp_streams_[0]));
+    return;
+  }
+
   // Synchronize to ensure that all devices are done computing
   for (int dev = 0; dev < this->cuda_count_; dev++) {
     cudaCheck(cudaSetDevice(dev));
@@ -1676,25 +1700,44 @@ template <typename CT> void glst_force<CT>::deallocate(void) {
     }
   }
 
-  // Finalize NCCL
-  for (int dev = 0; dev < this->cuda_count_; dev++) {
-    cudaCheck(cudaSetDevice(dev));
-    ncclCheck(ncclCommDestroy(this->nccl_comms_[dev]));
+  if (!this->tiled_single_gpu_) {
+    // Finalize NCCL
+    for (int dev = 0; dev < this->cuda_count_; dev++) {
+      cudaCheck(cudaSetDevice(dev));
+      ncclCheck(ncclCommDestroy(this->nccl_comms_[dev]));
+    }
   }
 
   // Destroy CUDA streams and events
   for (int dev = 0; dev < this->cuda_count_; dev++) {
     cudaCheck(cudaSetDevice(dev));
     cudaCheck(cudaStreamDestroy(this->comp_streams_[dev]));
-    cudaCheck(cudaStreamDestroy(this->comm_streams_[dev]));
-    cudaCheck(cudaEventDestroy(this->comp_events_[dev]));
-    cudaCheck(cudaEventDestroy(this->comm_events_[dev]));
+    if (!this->tiled_single_gpu_) {
+      cudaCheck(cudaStreamDestroy(this->comm_streams_[dev]));
+      cudaCheck(cudaEventDestroy(this->comp_events_[dev]));
+      cudaCheck(cudaEventDestroy(this->comm_events_[dev]));
+    }
   }
 
   return;
 }
 
 template <typename CT> void glst_force<CT>::cells2dev(void) {
+  if (this->tiled_single_gpu_) {
+    this->cell_dev_idx_.assign(this->ncell_, 0);
+
+    this->dev_cell_idx_.resize(1);
+    cudaCheck(cudaSetDevice(0));
+
+    std::vector<unsigned int> cells(this->ncell_);
+    for (unsigned int cell = 0; cell < this->ncell_; cell++)
+      cells[cell] = cell;
+
+    this->dev_cell_idx_[0] = cells;
+
+    return;
+  }
+
   /* */
   { // Assign each cell to a CUDA device
     this->cell_dev_idx_.resize(this->ncell_);

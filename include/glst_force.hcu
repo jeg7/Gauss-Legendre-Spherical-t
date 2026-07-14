@@ -112,6 +112,8 @@ private:
   std::vector<void *> cub_work_buffer_;
   std::vector<std::size_t> cub_work_buffer_size_;
 
+  bool tiled_single_gpu_;
+
   int cuda_count_;
   std::vector<int> cell_dev_idx_;
   std::vector<cuda_container<unsigned int>> dev_cell_idx_;

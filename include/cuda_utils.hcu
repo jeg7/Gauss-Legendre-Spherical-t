@@ -11,11 +11,11 @@
 #ifndef __GLST_CUDA_UTILS__
 #define __GLST_CUDA_UTILS__
 
-#ifdef __GLST_DEBUG__
-
 #include <nccl.h>
 #include <stdexcept>
 #include <string>
+
+// #ifdef __GLST_DEBUG__
 
 #define cudaCheck(result)                                                      \
   do {                                                                         \
@@ -41,13 +41,13 @@
     }                                                                          \
   } while (0)
 
-#else
+// #else
 
-#define cudaCheck(result) result
+// #define cudaCheck(result) result
 
-#define ncclCheck(result) result
+// #define ncclCheck(result) result
 
-#endif
+// #endif
 
 void enable_p2p(const int cuda_count);
 void disable_p2p(const int cuda_count);
