@@ -964,7 +964,11 @@ template <typename CT> void glst_force<CT>::sum_rmt_sf(void) {
     }
 
     {
+#ifdef __GLST_DEBUG__
       constexpr dim3 num_threads(512, 1, 1);
+#else
+      constexpr dim3 num_threads(128, 1, 1);
+#endif
       const dim3 num_blocks((nc + num_threads.x - 1) / num_threads.x,
                             std::min(65535u, this->ncell_), 1);
       calc_rmt_sum_kernel<CT>

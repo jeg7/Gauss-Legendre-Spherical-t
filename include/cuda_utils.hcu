@@ -11,29 +11,35 @@
 #ifndef __GLST_CUDA_UTILS__
 #define __GLST_CUDA_UTILS__
 
+#ifdef __GLST_DEBUG__
+
 #include <nccl.h>
 #include <stdexcept>
 #include <string>
 
-#ifdef __GLST_DEBUG__
-
 #define cudaCheck(result)                                                      \
-  if (result != cudaSuccess) {                                                 \
-    std::string msg = "CUDA Runtime Error: ";                                  \
-    msg += std::string(cudaGetErrorString(result)) + "\n";                     \
-    msg += "  file(): " + std::string(__FILE__) + "\n";                        \
-    msg += "  line(): " + std::to_string(__LINE__) + "\n";                     \
-    throw std::runtime_error(msg);                                             \
-  }
+  do {                                                                         \
+    const cudaError_t cuda_error = (result);                                   \
+    if (cuda_error != cudaSuccess) {                                           \
+      std::string msg = "CUDA Runtime Error: ";                                \
+      msg += std::string(cudaGetErrorString(cuda_error)) + "\n";               \
+      msg += "  file(): " + std::string(__FILE__) + "\n";                      \
+      msg += "  line(): " + std::to_string(__LINE__) + "\n";                   \
+      throw std::runtime_error(msg);                                           \
+    }                                                                          \
+  } while (0)
 
 #define ncclCheck(result)                                                      \
-  if (result != ncclSuccess) {                                                 \
-    std::string msg = "NCCL Runtime Error: ";                                  \
-    msg += std::string(ncclGetErrorString(result));                            \
-    msg += "  file(): " + std::string(__FILE__) + "\n";                        \
-    msg += "  line(): " + std::to_string(__LINE__) + "\n";                     \
-    throw std::runtime_error(msg);                                             \
-  }
+  do {                                                                         \
+    const ncclResult_t nccl_error = (result);                                  \
+    if (nccl_error != ncclSuccess) {                                           \
+      std::string msg = "NCCL Runtime Error: ";                                \
+      msg += std::string(ncclGetErrorString(nccl_error));                      \
+      msg += "  file(): " + std::string(__FILE__) + "\n";                      \
+      msg += "  line(): " + std::to_string(__LINE__) + "\n";                   \
+      throw std::runtime_error(msg);                                           \
+    }                                                                          \
+  } while (0)
 
 #else
 

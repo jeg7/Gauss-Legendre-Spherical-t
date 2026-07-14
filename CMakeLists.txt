@@ -73,4 +73,6 @@ set_target_properties(nccl PROPERTIES
 
 add_subdirectory(${GLST_SOURCE_DIR}/src)
 add_subdirectory(${GLST_SOURCE_DIR}/utils)
+
+enable_testing()
 add_subdirectory(${GLST_SOURCE_DIR}/test)

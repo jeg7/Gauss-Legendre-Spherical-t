@@ -6,7 +6,7 @@
 //
 // Author: James E. Gonzales II
 //
-// ENDLICENS
+// ENDLICENSE
 
 #include "glst_plan.hcu"
 
@@ -329,8 +329,6 @@ void glst_plan::init_tile_schedule(const unsigned int max_tile_nodes) {
   const unsigned int total_nodes =
       static_cast<unsigned int>(this->cubature_->tot_num_nodes());
 
-  unsigned int scheduled_nodes = 0;
-
   for (unsigned int group = 0; group < this->ngroup_; group++) {
     const unsigned int group_point =
         static_cast<unsigned int>(this->cubature_->points()[0][group]);
@@ -356,7 +354,6 @@ void glst_plan::init_tile_schedule(const unsigned int max_tile_nodes) {
       this->tile_node_count_.push_back(this_tile_count);
 
       group_offset += this_tile_count;
-      scheduled_nodes += this_tile_count;
     }
   }
 
