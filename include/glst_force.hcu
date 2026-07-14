@@ -66,16 +66,12 @@ private:
   void zero_ef(void);
 
 private:
-  void allocate(void);
   void deallocate(void);
   void cells2dev(void);
 
 private:
   std::unique_ptr<glst_plan> plan_;
   std::unique_ptr<glst_workspace> workspace_;
-
-  std::vector<void *> cub_work_buffer_;
-  std::vector<std::size_t> cub_work_buffer_size_;
 
   bool tiled_single_gpu_;
 

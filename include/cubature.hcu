@@ -12,16 +12,12 @@
 #define __GLST_CUBATURE__
 
 #include "cuda_container.hcu"
+
 #include <array>
 #include <string>
 #include <vector>
 
-// CT = Cubature Type
-// Type of the cubature nodes and weights. Computing the cubature nodes and
-// weights is done in double precision, but can be stored as single (float) or
-// double precision.
-
-template <typename CT> class cubature {
+class cubature {
 public:
   cubature(void);
   cubature(const double tol, const unsigned int nalpha,
@@ -33,10 +29,10 @@ public:
   unsigned int tot_num_nodes(void) const;
   const std::vector<cuda_container<unsigned int>> &points(void) const;
   const std::vector<cuda_container<unsigned int>> &num_nodes(void) const;
-  const std::vector<cuda_container<CT>> &x(void) const;
-  const std::vector<cuda_container<CT>> &y(void) const;
-  const std::vector<cuda_container<CT>> &z(void) const;
-  const std::vector<cuda_container<CT>> &w(void) const;
+  const std::vector<cuda_container<double>> &x(void) const;
+  const std::vector<cuda_container<double>> &y(void) const;
+  const std::vector<cuda_container<double>> &z(void) const;
+  const std::vector<cuda_container<double>> &w(void) const;
   const std::vector<cuda_container<unsigned int>> &group(void) const;
 
 public:
@@ -86,16 +82,13 @@ private:
   unsigned int tot_num_nodes_;
   std::vector<cuda_container<unsigned int>> points_;
   std::vector<cuda_container<unsigned int>> num_nodes_;
-  std::vector<cuda_container<CT>> x_;
-  std::vector<cuda_container<CT>> y_;
-  std::vector<cuda_container<CT>> z_;
-  std::vector<cuda_container<CT>> w_;
+  std::vector<cuda_container<double>> x_;
+  std::vector<cuda_container<double>> y_;
+  std::vector<cuda_container<double>> z_;
+  std::vector<cuda_container<double>> w_;
   std::vector<cuda_container<unsigned int>> group_;
 
   int cuda_count_;
 };
-
-template class cubature<float>;
-template class cubature<double>;
 
 #endif

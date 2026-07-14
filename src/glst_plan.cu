@@ -136,7 +136,7 @@ const std::vector<cuda_container<unsigned int>> &glst_plan::group(void) const {
   return this->cubature_data().group();
 }
 
-const cubature<double> &glst_plan::cubature_data(void) const {
+const cubature &glst_plan::cubature_data(void) const {
   if (this->cubature_ == nullptr) {
     throw std::runtime_error("FATAL ERROR: glst_plan::cubature_data: Cubature "
                              "has not been initialized");
@@ -310,8 +310,8 @@ void glst_plan::init_cubature(const double tol) {
                              "groups have not been initialized");
   }
 
-  this->cubature_ = std::make_unique<cubature<double>>(
-      tol, this->ngroup_, this->rmax_, this->alpha_, this->zcut_);
+  this->cubature_ = std::make_unique<cubature>(tol, this->ngroup_, this->rmax_,
+                                               this->alpha_, this->zcut_);
 
   return;
 }

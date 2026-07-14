@@ -59,7 +59,7 @@ public:
   const std::vector<cuda_container<double>> &w(void) const;
   const std::vector<cuda_container<unsigned int>> &group(void) const;
 
-  const cubature<double> &cubature_data(void) const;
+  const cubature &cubature_data(void) const;
 
   unsigned int max_tile_nodes(void) const;
   unsigned int tile_count(void) const;
@@ -114,7 +114,7 @@ private:
   std::vector<double> alpha_;
   std::vector<double> zcut_;
 
-  std::unique_ptr<cubature<double>> cubature_;
+  std::unique_ptr<cubature> cubature_;
 
   unsigned int max_tile_nodes_;
   unsigned int tile_count_;

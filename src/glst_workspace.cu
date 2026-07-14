@@ -10,6 +10,9 @@
 
 #include "glst_workspace.hcu"
 
+#include "cuda_utils.hcu"
+
+#include <cub/cub.cuh>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -37,7 +40,7 @@ glst_workspace::glst_workspace(const glst_plan &plan) : glst_workspace() {
   this->init(plan);
 }
 
-glst_workspace::~glst_workspace(void) {}
+glst_workspace::~glst_workspace(void) { this->deallocate_cub(); }
 
 std::size_t glst_workspace::atom_capacity(void) const {
   return this->atom_capacity_;
@@ -127,8 +130,7 @@ glst_workspace::cell_atom_count(void) const {
   return this->cell_atom_count_;
 }
 
-const std::vector<cuda_container<unsigned int>> &
-glst_workspace::max_atoms_cell(void) const {
+const std::vector<unsigned int> &glst_workspace::max_atoms_cell(void) const {
   return this->max_atoms_cell_;
 }
 
@@ -148,6 +150,15 @@ glst_workspace::rmt_sum_re(void) const {
 const std::vector<cuda_container<double>> &
 glst_workspace::rmt_sum_im(void) const {
   return this->rmt_sum_im_;
+}
+
+const std::vector<void *> &glst_workspace::cub_work_buffer(void) const {
+  return this->cub_work_buffer_;
+}
+
+const std::vector<std::size_t> &
+glst_workspace::cub_work_buffer_size(void) const {
+  return this->cub_work_buffer_size_;
 }
 
 std::vector<cuda_container<unsigned int>> &glst_workspace::idx(void) {
@@ -217,8 +228,7 @@ glst_workspace::cell_atom_count(void) {
   return this->cell_atom_count_;
 }
 
-std::vector<cuda_container<unsigned int>> &
-glst_workspace::max_atoms_cell(void) {
+std::vector<unsigned int> &glst_workspace::max_atoms_cell(void) {
   return this->max_atoms_cell_;
 }
 
@@ -236,6 +246,14 @@ std::vector<cuda_container<double>> &glst_workspace::rmt_sum_re(void) {
 
 std::vector<cuda_container<double>> &glst_workspace::rmt_sum_im(void) {
   return this->rmt_sum_im_;
+}
+
+std::vector<void *> &glst_workspace::cub_work_buffer(void) {
+  return this->cub_work_buffer_;
+}
+
+std::vector<std::size_t> &glst_workspace::cub_work_buffer_size(void) {
+  return this->cub_work_buffer_size_;
 }
 
 void glst_workspace::init(const glst_plan &plan) {
@@ -309,12 +327,13 @@ void glst_workspace::init(const glst_plan &plan) {
 
   this->cell_atom_point_[0].resize(this->cell_capacity_);
   this->cell_atom_count_[0].resize(this->cell_capacity_);
-  this->max_atoms_cell_[0].resize(1);
 
   this->sf_re_[0].resize(this->tile_buffer_capacity_);
   this->sf_im_[0].resize(this->tile_buffer_capacity_);
   this->rmt_sum_re_[0].resize(this->tile_buffer_capacity_);
   this->rmt_sum_im_[0].resize(this->tile_buffer_capacity_);
+
+  this->allocate_cub(natom);
 
   return;
 }
@@ -349,6 +368,57 @@ void glst_workspace::clear(void) {
   this->sf_im_.clear();
   this->rmt_sum_re_.clear();
   this->rmt_sum_im_.clear();
+
+  return;
+}
+
+void glst_workspace::allocate_cub(const std::size_t natom) {
+  this->cub_work_buffer_.resize(1);
+  this->cub_work_buffer_size_.resize(1);
+
+  this->cub_work_buffer_[0] = nullptr;
+  this->cub_work_buffer_size_[0] = 0;
+
+  // Determine storage requirements for CUB functions
+  std::size_t size0 = 0, size1 = 0, size2 = 0;
+  cub::DeviceRadixSort::SortPairs(
+      this->cub_work_buffer_[0], size0,
+      this->atom_cell_idx_[0].d_array().data(),
+      this->atom_cell_sorted_idx_[0].d_array().data(),
+      this->idx_[0].d_array().data(), this->sorted_idx_[0].d_array().data(),
+      natom);
+  cub::DeviceRadixSort::SortPairs(
+      this->cub_work_buffer_[0], size1,
+      this->atom_cell_idx_[0].d_array().data(),
+      this->atom_cell_sorted_idx_[0].d_array().data(),
+      this->fx_[0].d_array().data(), this->fx_[0].d_array().data(), natom);
+  cub::DeviceRadixSort::SortPairs(
+      this->cub_work_buffer_[0], size2,
+      this->atom_cell_idx_[0].d_array().data(),
+      this->atom_cell_sorted_idx_[0].d_array().data(),
+      this->packets_[0].d_array().data(),
+      this->sorted_packets_[0].d_array().data(), natom);
+
+  this->cub_work_buffer_size_[0] = size0;
+  if (size1 > this->cub_work_buffer_size_[0])
+    this->cub_work_buffer_size_[0] = size1;
+  if (size2 > this->cub_work_buffer_size_[0])
+    this->cub_work_buffer_size_[0] = size2;
+
+  cudaCheck(
+      cudaMalloc(&(this->cub_work_buffer_[0]), this->cub_work_buffer_size_[0]));
+
+  return;
+}
+
+void glst_workspace::deallocate_cub(void) {
+  cudaCheck(cudaSetDevice(0));
+
+  if (this->cub_work_buffer_[0] != nullptr) {
+    cudaCheck(cudaFree(this->cub_work_buffer_[0]));
+    this->cub_work_buffer_[0] = nullptr;
+    this->cub_work_buffer_size_[0] = 0;
+  }
 
   return;
 }

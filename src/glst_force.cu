@@ -24,10 +24,10 @@
 #include <stdexcept>
 
 glst_force::glst_force(void)
-    : plan_(nullptr), workspace_(nullptr), cub_work_buffer_(),
-      cub_work_buffer_size_(), tiled_single_gpu_(true), cuda_count_(-1),
-      cell_dev_idx_(), dev_cell_idx_(), comp_streams_(), comm_streams_(),
-      comp_events_(), comm_events_(), nccl_devs_(), nccl_comms_() {
+    : plan_(nullptr), workspace_(nullptr), tiled_single_gpu_(true),
+      cuda_count_(-1), cell_dev_idx_(), dev_cell_idx_(), comp_streams_(),
+      comm_streams_(), comp_events_(), comm_events_(), nccl_devs_(),
+      nccl_comms_() {
   int device_count = 0;
   cudaCheck(cudaGetDeviceCount(&device_count));
   if (device_count < 1) {
@@ -148,29 +148,39 @@ void glst_force::get_ef(cuda_container<double> &fx, cuda_container<double> &fy,
   en.resize(this->plan_->natom());
 
   cub::DeviceRadixSort::SortPairs(
-      this->cub_work_buffer_[0], this->cub_work_buffer_size_[0],
+      this->workspace_->cub_work_buffer()[0],
+      this->workspace_->cub_work_buffer_size()[0],
       this->workspace_->sorted_idx()[0].d_array().data(),
       this->workspace_->idx()[0].d_array().data(),
       this->workspace_->fx()[0].d_array().data(), fx.d_array().data(),
-      this->plan_->natom());
+      this->plan_->natom(), 0, static_cast<int>(8 * sizeof(unsigned int)),
+      this->comp_streams_[0]);
   cub::DeviceRadixSort::SortPairs(
-      this->cub_work_buffer_[0], this->cub_work_buffer_size_[0],
+      this->workspace_->cub_work_buffer()[0],
+      this->workspace_->cub_work_buffer_size()[0],
       this->workspace_->sorted_idx()[0].d_array().data(),
       this->workspace_->idx()[0].d_array().data(),
       this->workspace_->fy()[0].d_array().data(), fy.d_array().data(),
-      this->plan_->natom());
+      this->plan_->natom(), 0, static_cast<int>(8 * sizeof(unsigned int)),
+      this->comp_streams_[0]);
   cub::DeviceRadixSort::SortPairs(
-      this->cub_work_buffer_[0], this->cub_work_buffer_size_[0],
+      this->workspace_->cub_work_buffer()[0],
+      this->workspace_->cub_work_buffer_size()[0],
       this->workspace_->sorted_idx()[0].d_array().data(),
       this->workspace_->idx()[0].d_array().data(),
       this->workspace_->fz()[0].d_array().data(), fz.d_array().data(),
-      this->plan_->natom());
+      this->plan_->natom(), 0, static_cast<int>(8 * sizeof(unsigned int)),
+      this->comp_streams_[0]);
   cub::DeviceRadixSort::SortPairs(
-      this->cub_work_buffer_[0], this->cub_work_buffer_size_[0],
+      this->workspace_->cub_work_buffer()[0],
+      this->workspace_->cub_work_buffer_size()[0],
       this->workspace_->sorted_idx()[0].d_array().data(),
       this->workspace_->idx()[0].d_array().data(),
       this->workspace_->en()[0].d_array().data(), en.d_array().data(),
-      this->plan_->natom());
+      this->plan_->natom(), 0, static_cast<int>(8 * sizeof(unsigned int)),
+      this->comp_streams_[0]);
+
+  cudaCheck(cudaStreamSynchronize(this->comp_streams_[0]));
 
   fx.transfer_to_host();
   fy.transfer_to_host();
@@ -237,8 +247,6 @@ void glst_force::init(const unsigned int natom, const double tol,
   std::cout << std::endl;
 
   this->plan_->print_tile_diagnostics(std::cout);
-
-  this->allocate();
 
   if (!this->tiled_single_gpu_) {
     // Call NCCL collective once to avoid initialization penalty
@@ -425,14 +433,16 @@ void glst_force::assign_atoms(const double *d_rx, const double *d_ry,
     }
 
     // JEG260127: Find optimial place to do this
+    cudaCheck(cudaStreamSynchronize(this->comp_streams_[dev]));
+
     this->workspace_->cell_atom_count()[dev].transfer_to_host();
-    this->workspace_->max_atoms_cell()[dev][0] = 0;
+    this->workspace_->max_atoms_cell()[dev] = 0;
     for (unsigned int cell = 0; cell < this->plan_->ncell(); cell++) {
-      this->workspace_->max_atoms_cell()[dev][0] =
+      this->workspace_->max_atoms_cell()[dev] =
           (this->workspace_->cell_atom_count()[dev][cell] >
-           this->workspace_->max_atoms_cell()[dev][0])
+           this->workspace_->max_atoms_cell()[dev])
               ? this->workspace_->cell_atom_count()[dev][cell]
-              : this->workspace_->max_atoms_cell()[dev][0];
+              : this->workspace_->max_atoms_cell()[dev];
     }
 
     { // Determine where each cell's atom data is stored
@@ -467,7 +477,8 @@ void glst_force::assign_atoms(const double *d_rx, const double *d_ry,
 
     { // Sort atoms based on cell indices
       cub::DeviceRadixSort::SortPairs(
-          this->cub_work_buffer_[dev], this->cub_work_buffer_size_[dev],
+          this->workspace_->cub_work_buffer()[dev],
+          this->workspace_->cub_work_buffer_size()[dev],
           this->workspace_->atom_cell_idx()[dev].d_array().data(),
           this->workspace_->atom_cell_sorted_idx()[dev].d_array().data(),
           this->workspace_->packets()[dev].d_array().data(),
@@ -710,7 +721,7 @@ void glst_force::calc_sr_ef(void) {
 
     constexpr dim3 num_threads(64, 1, 1);
     const dim3 num_blocks(
-        (this->workspace_->max_atoms_cell()[dev][0] + num_threads.x - 1) /
+        (this->workspace_->max_atoms_cell()[dev] + num_threads.x - 1) /
             num_threads.x,
         std::min(65535u,
                  static_cast<unsigned int>(this->dev_cell_idx_[dev].size())),
@@ -1362,7 +1373,7 @@ void glst_force::calc_lr_ef_tile(const unsigned int tile) {
 
     constexpr dim3 num_threads(64, 1, 1);
     const dim3 num_blocks(
-        (this->workspace_->max_atoms_cell()[dev][0] + num_threads.x - 1) /
+        (this->workspace_->max_atoms_cell()[dev] + num_threads.x - 1) /
             num_threads.x,
         std::min(65535u, this->plan_->ncell()), 1);
 
@@ -1415,62 +1426,7 @@ void glst_force::zero_ef(void) {
   return;
 }
 
-void glst_force::allocate(void) {
-  this->cub_work_buffer_.resize(this->cuda_count_);
-  this->cub_work_buffer_size_.resize(this->cuda_count_);
-  for (int dev = 0; dev < this->cuda_count_; dev++) {
-    cudaCheck(cudaSetDevice(dev));
-    this->cub_work_buffer_[dev] = nullptr;
-    this->cub_work_buffer_size_[dev] = 0;
-
-    // Determine storage requirements for CUB functions
-    std::size_t size0 = 0, size1 = 0, size2 = 0;
-    cub::DeviceRadixSort::SortPairs(
-        this->cub_work_buffer_[dev], size0,
-        this->workspace_->atom_cell_idx()[dev].d_array().data(),
-        this->workspace_->atom_cell_sorted_idx()[dev].d_array().data(),
-        this->workspace_->idx()[dev].d_array().data(),
-        this->workspace_->sorted_idx()[dev].d_array().data(),
-        this->plan_->natom());
-    cub::DeviceRadixSort::SortPairs(
-        this->cub_work_buffer_[dev], size1,
-        this->workspace_->atom_cell_idx()[dev].d_array().data(),
-        this->workspace_->atom_cell_sorted_idx()[dev].d_array().data(),
-        this->workspace_->fx()[dev].d_array().data(),
-        this->workspace_->fx()[dev].d_array().data(), this->plan_->natom());
-    cub::DeviceRadixSort::SortPairs(
-        this->cub_work_buffer_[dev], size2,
-        this->workspace_->atom_cell_idx()[dev].d_array().data(),
-        this->workspace_->atom_cell_sorted_idx()[dev].d_array().data(),
-        this->workspace_->packets()[dev].d_array().data(),
-        this->workspace_->sorted_packets()[dev].d_array().data(),
-        this->plan_->natom());
-
-    this->cub_work_buffer_size_[dev] = size0;
-    if (size1 > this->cub_work_buffer_size_[dev])
-      this->cub_work_buffer_size_[dev] = size1;
-    if (size2 > this->cub_work_buffer_size_[dev])
-      this->cub_work_buffer_size_[dev] = size2;
-
-    cudaCheck(cudaMalloc(&(this->cub_work_buffer_[dev]),
-                         this->cub_work_buffer_size_[dev]));
-  }
-
-  return;
-}
-
 void glst_force::deallocate(void) {
-  if (static_cast<int>(this->cub_work_buffer_.size()) == this->cuda_count_) {
-    for (int dev = 0; dev < this->cuda_count_; dev++) {
-      cudaCheck(cudaSetDevice(dev));
-      if (this->cub_work_buffer_[dev] != nullptr) {
-        cudaCheck(cudaFree(this->cub_work_buffer_[dev]));
-        this->cub_work_buffer_[dev] = nullptr;
-        this->cub_work_buffer_size_[dev] = 0;
-      }
-    }
-  }
-
   if (!this->tiled_single_gpu_) {
     // Finalize NCCL
     for (int dev = 0; dev < this->cuda_count_; dev++) {
