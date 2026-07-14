@@ -19,6 +19,7 @@
 #include <cuda_runtime.h>
 #include <cuda_runtime_api.h>
 #include <iostream>
+#include <stdexcept>
 #include <type_traits>
 
 template <typename CT>
@@ -691,38 +692,7 @@ calc_sf_kernel(double *__restrict__ sf_re, double *__restrict__ sf_im,
 }
 
 template <typename CT> void glst_force<CT>::calc_sf(void) {
-  const bool has_long_range_cells =
-      ((this->ncell_x_ > 2) && (this->ncell_y_ > 2) && (this->ncell_z_ > 2));
-  if (!has_long_range_cells)
-    return;
-
-  for (int dev = 0; dev < this->cuda_count_; dev++) {
-    cudaCheck(cudaSetDevice(dev));
-    const unsigned int nc = this->dev_cub_counts_[dev];
-    const unsigned int off = this->dev_cub_points_[dev];
-    cudaCheck(cudaMemsetAsync(
-        static_cast<void *>(this->sf_re_[dev].d_array().data()), 0,
-        this->ncell_ * nc * sizeof(CT), this->comp_streams_[dev]));
-    cudaCheck(cudaMemsetAsync(
-        static_cast<void *>(this->sf_im_[dev].d_array().data()), 0,
-        this->ncell_ * nc * sizeof(CT), this->comp_streams_[dev]));
-    constexpr dim3 num_threads(128, 1, 1);
-    const dim3 num_blocks((nc + num_threads.x - 1) / num_threads.x,
-                          std::min(65535u, this->ncell_), 1);
-    calc_sf_kernel<96>
-        <<<num_blocks, num_threads, 0, this->comp_streams_[dev]>>>(
-            this->sf_re_[dev].d_array().data(),
-            this->sf_im_[dev].d_array().data(),
-            this->plan_->x()[dev].d_array().data() + off,
-            this->plan_->y()[dev].d_array().data() + off,
-            this->plan_->z()[dev].d_array().data() + off, nc,
-            this->rx_[dev].d_array().data(), this->ry_[dev].d_array().data(),
-            this->rz_[dev].d_array().data(), this->qc_[dev].d_array().data(),
-            this->cell_atom_point_[dev].d_array().data(),
-            this->cell_atom_count_[dev].d_array().data(), this->ncell_);
-    cudaCheck(cudaGetLastError());
-  }
-
+  this->calc_sf_tile(0);
   return;
 }
 
@@ -940,70 +910,7 @@ __global__ static void calc_rmt_sum_kernel(
 }
 
 template <typename CT> void glst_force<CT>::sum_rmt_sf(void) {
-  const bool has_long_range_cells =
-      ((this->ncell_x_ > 2) && (this->ncell_y_ > 2) && (this->ncell_z_ > 2));
-  if (!has_long_range_cells)
-    return;
-
-  for (int dev = 0; dev < this->cuda_count_; dev++) {
-    cudaCheck(cudaSetDevice(dev));
-    const unsigned int nc = this->dev_cub_counts_[dev];
-    const unsigned int off = this->dev_cub_points_[dev];
-    {
-      constexpr dim3 num_threads(512, 1, 1);
-      const dim3 num_blocks((nc + num_threads.x - 1) / num_threads.x,
-                            this->ncell_x_ * this->ncell_y_, 1);
-      calc_prefix_sum_z_kernel<CT>
-          <<<num_blocks, num_threads, 0, this->comp_streams_[dev]>>>(
-              this->sf_re_[dev].d_array().data(),
-              this->sf_im_[dev].d_array().data(), nc, this->ncell_x_,
-              this->ncell_y_, this->ncell_z_);
-      cudaCheck(cudaGetLastError());
-    }
-
-    {
-      constexpr dim3 num_threads(512, 1, 1);
-      const dim3 num_blocks((nc + num_threads.x - 1) / num_threads.x,
-                            this->ncell_x_ * this->ncell_z_, 1);
-      calc_prefix_sum_y_kernel<CT>
-          <<<num_blocks, num_threads, 0, this->comp_streams_[dev]>>>(
-              this->sf_re_[dev].d_array().data(),
-              this->sf_im_[dev].d_array().data(), nc, this->ncell_x_,
-              this->ncell_y_, this->ncell_z_);
-      cudaCheck(cudaGetLastError());
-    }
-
-    {
-      constexpr dim3 num_threads(512, 1, 1);
-      const dim3 num_blocks((nc + num_threads.x - 1) / num_threads.x,
-                            this->ncell_y_ * this->ncell_z_, 1);
-      calc_prefix_sum_x_kernel<CT>
-          <<<num_blocks, num_threads, 0, this->comp_streams_[dev]>>>(
-              this->sf_re_[dev].d_array().data(),
-              this->sf_im_[dev].d_array().data(), nc, this->ncell_x_,
-              this->ncell_y_, this->ncell_z_);
-      cudaCheck(cudaGetLastError());
-    }
-
-    {
-      constexpr dim3 num_threads(512, 1, 1);
-      const dim3 num_blocks((nc + num_threads.x - 1) / num_threads.x,
-                            std::min(65535u, this->ncell_), 1);
-      calc_rmt_sum_kernel<CT>
-          <<<num_blocks, num_threads, 0, this->comp_streams_[dev]>>>(
-              this->rmt_sum_re_[dev].d_array().data(),
-              this->rmt_sum_im_[dev].d_array().data(),
-              this->sf_re_[dev].d_array().data(),
-              this->sf_im_[dev].d_array().data(),
-              this->plan_->w()[dev].d_array().data() + off,
-              this->plan_->group()[dev].d_array().data() + off, nc,
-              this->grp_r_in_[dev].d_array().data(),
-              this->grp_r_out_[dev].d_array().data(), this->ncell_x_,
-              this->ncell_y_, this->ncell_z_, this->ncell_);
-      cudaCheck(cudaGetLastError());
-    }
-  }
-
+  this->sum_rmt_sf_tile(0);
   return;
 }
 
@@ -1162,35 +1069,7 @@ calc_lr_ef_kernel(double *__restrict__ fx, double *__restrict__ fy,
 }
 
 template <typename CT> void glst_force<CT>::calc_lr_ef(void) {
-  const bool has_long_range_cells =
-      ((this->ncell_x_ > 2) && (this->ncell_y_ > 2) && (this->ncell_z_ > 2));
-  if (!has_long_range_cells)
-    return;
-
-  for (int dev = 0; dev < this->cuda_count_; dev++) {
-    cudaCheck(cudaSetDevice(dev));
-    const unsigned int nc = this->dev_cub_counts_[dev];
-    const unsigned int off = this->dev_cub_points_[dev];
-    constexpr dim3 num_threads(64, 1, 1);
-    const dim3 num_blocks((this->max_atoms_cell_[dev][0] + num_threads.x - 1) /
-                              num_threads.x,
-                          std::min(65535u, this->ncell_), 1);
-    calc_lr_ef_kernel<num_threads.x>
-        <<<num_blocks, num_threads, 0, this->comp_streams_[dev]>>>(
-            this->fx_[dev].d_array().data(), this->fy_[dev].d_array().data(),
-            this->fz_[dev].d_array().data(), this->en_[dev].d_array().data(),
-            this->rx_[dev].d_array().data(), this->ry_[dev].d_array().data(),
-            this->rz_[dev].d_array().data(), this->qc_[dev].d_array().data(),
-            this->cell_atom_point_[dev].d_array().data(),
-            this->cell_atom_count_[dev].d_array().data(),
-            this->plan_->x()[dev].d_array().data() + off,
-            this->plan_->y()[dev].d_array().data() + off,
-            this->plan_->z()[dev].d_array().data() + off,
-            this->rmt_sum_re_[dev].d_array().data(),
-            this->rmt_sum_im_[dev].d_array().data(), nc, this->ncell_);
-    cudaCheck(cudaGetLastError());
-  }
-
+  this->calc_lr_ef_tile(0);
   return;
 }
 
@@ -1643,6 +1522,200 @@ void glst_force<CT>::calc_ener_force(const double *d_rx, const double *d_ry,
   this->calc_lr_ef();
   this->calc_sr_ef();
   this->comm_ef();
+  return;
+}
+
+template <typename CT>
+void glst_force<CT>::calc_sf_tile(const unsigned int tile) {
+  if (this->plan_ == nullptr) {
+    throw std::runtime_error(
+        "FATAL ERROR: glst_force<CT>::calc_sf_tile: Plan is not initialized");
+  }
+
+  if (tile >= this->plan_->tile_count()) {
+    throw std::runtime_error(
+        "FATAL ERROR: glst_force<CT>::calc_sf_tile: Tile is out of bounds");
+  }
+
+  const unsigned int tile_node_point = this->plan_->tile_node_point(tile);
+  const unsigned int tile_node_count = this->plan_->tile_node_count(tile);
+  static_cast<void>(tile_node_point);
+  static_cast<void>(tile_node_count);
+
+  const bool has_long_range_cells =
+      ((this->ncell_x_ > 2) && (this->ncell_y_ > 2) && (this->ncell_z_ > 2));
+  if (!has_long_range_cells)
+    return;
+
+  for (int dev = 0; dev < this->cuda_count_; dev++) {
+    cudaCheck(cudaSetDevice(dev));
+    const unsigned int nc = this->dev_cub_counts_[dev];
+    const unsigned int off = this->dev_cub_points_[dev];
+
+    cudaCheck(cudaMemsetAsync(
+        static_cast<void *>(this->sf_re_[dev].d_array().data()), 0,
+        this->ncell_ * nc * sizeof(CT), this->comp_streams_[dev]));
+    cudaCheck(cudaMemsetAsync(
+        static_cast<void *>(this->sf_im_[dev].d_array().data()), 0,
+        this->ncell_ * nc * sizeof(CT), this->comp_streams_[dev]));
+
+    constexpr dim3 num_threads(128, 1, 1);
+    const dim3 num_blocks((nc + num_threads.x - 1) / num_threads.x,
+                          std::min(65535u, this->ncell_), 1);
+    calc_sf_kernel<96>
+        <<<num_blocks, num_threads, 0, this->comp_streams_[dev]>>>(
+            this->sf_re_[dev].d_array().data(),
+            this->sf_im_[dev].d_array().data(),
+            this->plan_->x()[dev].d_array().data() + off,
+            this->plan_->y()[dev].d_array().data() + off,
+            this->plan_->z()[dev].d_array().data() + off, nc,
+            this->rx_[dev].d_array().data(), this->ry_[dev].d_array().data(),
+            this->rz_[dev].d_array().data(), this->qc_[dev].d_array().data(),
+            this->cell_atom_point_[dev].d_array().data(),
+            this->cell_atom_count_[dev].d_array().data(), this->ncell_);
+    cudaCheck(cudaGetLastError());
+  }
+
+  return;
+}
+
+template <typename CT>
+void glst_force<CT>::sum_rmt_sf_tile(const unsigned int tile) {
+  if (this->plan_ == nullptr) {
+    throw std::runtime_error("FATAL ERROR: glst_force<CT>::sum_rmt_sf_tile: "
+                             "Plan is not initialized");
+  }
+
+  if (tile >= this->plan_->tile_count()) {
+    throw std::runtime_error(
+        "FATAL ERROR: glst_force<CT>::sum_rmt_sf_tile: Tile is out of bounds");
+  }
+
+  const unsigned int tile_node_point = this->plan_->tile_node_point(tile);
+  const unsigned int tile_node_count = this->plan_->tile_node_count(tile);
+  static_cast<void>(tile_node_point);
+  static_cast<void>(tile_node_count);
+
+  const bool has_long_range_cells =
+      ((this->ncell_x_ > 2) && (this->ncell_y_ > 2) && (this->ncell_z_ > 2));
+  if (!has_long_range_cells)
+    return;
+
+  for (int dev = 0; dev < this->cuda_count_; dev++) {
+    cudaCheck(cudaSetDevice(dev));
+    const unsigned int nc = this->dev_cub_counts_[dev];
+    const unsigned int off = this->dev_cub_points_[dev];
+
+    {
+      constexpr dim3 num_threads(512, 1, 1);
+      const dim3 num_blocks((nc + num_threads.x - 1) / num_threads.x,
+                            this->ncell_x_ * this->ncell_y_, 1);
+      calc_prefix_sum_z_kernel<CT>
+          <<<num_blocks, num_threads, 0, this->comp_streams_[dev]>>>(
+              this->sf_re_[dev].d_array().data(),
+              this->sf_im_[dev].d_array().data(), nc, this->ncell_x_,
+              this->ncell_y_, this->ncell_z_);
+      cudaCheck(cudaGetLastError());
+    }
+
+    {
+      constexpr dim3 num_threads(512, 1, 1);
+      const dim3 num_blocks((nc + num_threads.x - 1) / num_threads.x,
+                            this->ncell_x_ * this->ncell_z_, 1);
+      calc_prefix_sum_y_kernel<CT>
+          <<<num_blocks, num_threads, 0, this->comp_streams_[dev]>>>(
+              this->sf_re_[dev].d_array().data(),
+              this->sf_im_[dev].d_array().data(), nc, this->ncell_x_,
+              this->ncell_y_, this->ncell_z_);
+      cudaCheck(cudaGetLastError());
+    }
+
+    {
+      constexpr dim3 num_threads(512, 1, 1);
+      const dim3 num_blocks((nc + num_threads.x - 1) / num_threads.x,
+                            this->ncell_y_ * this->ncell_z_, 1);
+      calc_prefix_sum_x_kernel<CT>
+          <<<num_blocks, num_threads, 0, this->comp_streams_[dev]>>>(
+              this->sf_re_[dev].d_array().data(),
+              this->sf_im_[dev].d_array().data(), nc, this->ncell_x_,
+              this->ncell_y_, this->ncell_z_);
+      cudaCheck(cudaGetLastError());
+    }
+
+    {
+#ifdef __GLST_DEBUG__
+      constexpr dim3 num_threads(128, 1, 1);
+#else
+      constexpr dim3 num_threads(512, 1, 1);
+#endif
+      const dim3 num_blocks((nc + num_threads.x - 1) / num_threads.x,
+                            std::min(65535u, this->ncell_), 1);
+      calc_rmt_sum_kernel<CT>
+          <<<num_blocks, num_threads, 0, this->comp_streams_[dev]>>>(
+              this->rmt_sum_re_[dev].d_array().data(),
+              this->rmt_sum_im_[dev].d_array().data(),
+              this->sf_re_[dev].d_array().data(),
+              this->sf_im_[dev].d_array().data(),
+              this->plan_->w()[dev].d_array().data() + off,
+              this->plan_->group()[dev].d_array().data() + off, nc,
+              this->grp_r_in_[dev].d_array().data(),
+              this->grp_r_out_[dev].d_array().data(), this->ncell_x_,
+              this->ncell_y_, this->ncell_z_, this->ncell_);
+      cudaCheck(cudaGetLastError());
+    }
+  }
+
+  return;
+}
+
+template <typename CT>
+void glst_force<CT>::calc_lr_ef_tile(const unsigned int tile) {
+  if (this->plan_ == nullptr) {
+    throw std::runtime_error(
+        "FATAL ERROR: glst_force<CT>: Plan is not initialized");
+  }
+
+  if (tile >= this->plan_->tile_count()) {
+    throw std::runtime_error(
+        "FATAL ERROR: glst_force<CT>::calc_lr_ef_tile: Tile is out of bounds");
+  }
+
+  const unsigned int tile_node_point = this->plan_->tile_node_point(tile);
+  const unsigned int tile_node_count = this->plan_->tile_node_count(tile);
+  static_cast<void>(tile_node_point);
+  static_cast<void>(tile_node_count);
+
+  const bool has_long_range_cells =
+      ((this->ncell_x_ > 2) && (this->ncell_y_ > 2) && (this->ncell_z_ > 2));
+  if (!has_long_range_cells)
+    return;
+
+  for (int dev = 0; dev < this->cuda_count_; dev++) {
+    cudaCheck(cudaSetDevice(dev));
+    const unsigned int nc = this->dev_cub_counts_[dev];
+    const unsigned int off = this->dev_cub_points_[dev];
+
+    constexpr dim3 num_threads(64, 1, 1);
+    const dim3 num_blocks((this->max_atoms_cell_[dev][0] + num_threads.x - 1) /
+                              num_threads.x,
+                          std::min(65535u, this->ncell_), 1);
+
+    calc_lr_ef_kernel<num_threads.x>
+        <<<num_blocks, num_threads, 0, this->comp_streams_[dev]>>>(
+            this->fx_[dev].d_array().data(), this->fy_[dev].d_array().data(),
+            this->fz_[dev].d_array().data(), this->en_[dev].d_array().data(),
+            this->rx_[dev].d_array().data(), this->ry_[dev].d_array().data(),
+            this->rz_[dev].d_array().data(), this->qc_[dev].d_array().data(),
+            this->cell_atom_point_[dev].d_array().data(),
+            this->cell_atom_count_[dev].d_array().data(),
+            this->plan_->x()[dev].d_array().data() + off,
+            this->plan_->y()[dev].d_array().data() + off,
+            this->plan_->z()[dev].d_array().data() + off,
+            this->rmt_sum_re_[dev].d_array().data(),
+            this->rmt_sum_im_[dev].d_array().data(), nc, this->ncell_);
+    cudaCheck(cudaGetLastError());
+  }
+
   return;
 }
 

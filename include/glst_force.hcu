@@ -63,6 +63,11 @@ public: // Energy and force calculation
                        const double *d_rz, const double *d_qc);
 
 private:
+  void calc_sf_tile(const unsigned int tile);
+  void sum_rmt_sf_tile(const unsigned int tile);
+  void calc_lr_ef_tile(const unsigned int tile);
+
+private:
   void allocate(void);
   void deallocate(void);
   void cells2dev(void);

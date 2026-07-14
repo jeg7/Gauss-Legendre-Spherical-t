@@ -130,7 +130,7 @@ int main(int argc, char **argv) {
 
   std::cout << std::endl;
 
-  constexpr std::size_t MAX_ITER = 2; // 100;
+  constexpr std::size_t MAX_ITER = 1; // 100;
   std::vector<std::vector<double>> times(8, std::vector<double>(MAX_ITER));
   for (std::size_t ITER = 0; ITER < MAX_ITER; ITER++) {
     // Progress goes to stderr so it stays visible in the terminal even when
