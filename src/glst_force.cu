@@ -14,6 +14,8 @@
 #include "cuda_utils.hcu"
 #include "device_comm.hcu"
 #include "reduce.hcu"
+
+#include <cstddef>
 #include <cub/cub.cuh>
 #include <cuda.h>
 #include <cuda_runtime.h>
@@ -564,515 +566,48 @@ void glst_force<CT>::assign_atoms(const double *d_rx, const double *d_ry,
   return;
 }
 
-// SINGLE-PRECISION
-template <unsigned int ATOM_TILE>
-__global__ static void
-calc_sf_kernel(float *__restrict__ sf_re, float *__restrict__ sf_im,
-               const double *__restrict__ cx, const double *__restrict__ cy,
-               const double *__restrict__ cz, const unsigned int nc,
-               const float *__restrict__ rx, const float *__restrict__ ry,
-               const float *__restrict__ rz, const float *__restrict__ qc,
-               const unsigned int *__restrict__ cell_atom_points,
-               const unsigned int *__restrict__ cell_atom_counts,
-               const unsigned int ncell) {
-  __shared__ float s_cache[ATOM_TILE * 4];
-
-  const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  const bool active = (idx < nc);
-
-  float xc = 0.0f, yc = 0.0f, zc = 0.0f;
-  if (active) {
-    xc = cx[idx];
-    yc = cy[idx];
-    zc = cz[idx];
-  }
-
-  for (unsigned int cell = blockIdx.y; cell < ncell; cell += gridDim.y) {
-    const unsigned int apnt = cell_atom_points[cell];
-    const unsigned int acnt = cell_atom_counts[cell];
-
-    float sf_re0 = 0.0f, sf_im0 = 0.0f;
-    for (unsigned int i = 0; i < acnt; i += ATOM_TILE) {
-      __syncthreads();
-      if ((threadIdx.x < ATOM_TILE) && (i + threadIdx.x < acnt)) {
-        s_cache[threadIdx.x * 4 + 0] = rx[apnt + i + threadIdx.x];
-        s_cache[threadIdx.x * 4 + 1] = ry[apnt + i + threadIdx.x];
-        s_cache[threadIdx.x * 4 + 2] = rz[apnt + i + threadIdx.x];
-        s_cache[threadIdx.x * 4 + 3] = qc[apnt + i + threadIdx.x];
-      }
-      __syncthreads();
-
-      if (active) { // Only "active" threads do expensive sincos work
-        const unsigned int n = min(ATOM_TILE, acnt - i);
-        for (unsigned int j = 0; j < n; j++) {
-          const float xa = s_cache[j * 4 + 0];
-          const float ya = s_cache[j * 4 + 1];
-          const float za = s_cache[j * 4 + 2];
-          const float qa = s_cache[j * 4 + 3];
-
-          const float theta = xc * xa + yc * ya + zc * za;
-          float re = 0.0, im = 0.0;
-          sincosf(theta, &im, &re);
-
-          sf_re0 += qa * re;
-          sf_im0 -= qa * im;
-        }
-      }
-    }
-
-    if (active) {
-      sf_re[cell * nc + idx] = sf_re0;
-      sf_im[cell * nc + idx] = sf_im0;
-    }
-  }
-
-  return;
-}
-
-// DOUBLE-PRECISION
-template <unsigned int ATOM_TILE>
-__global__ static void
-calc_sf_kernel(double *__restrict__ sf_re, double *__restrict__ sf_im,
-               const double *__restrict__ cx, const double *__restrict__ cy,
-               const double *__restrict__ cz, const unsigned int nc,
-               const double *__restrict__ rx, const double *__restrict__ ry,
-               const double *__restrict__ rz, const double *__restrict__ qc,
-               const unsigned int *__restrict__ cell_atom_points,
-               const unsigned int *__restrict__ cell_atom_counts,
-               const unsigned int ncell) {
-  __shared__ double s_cache[ATOM_TILE * 4];
-
-  const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  const bool active = (idx < nc);
-
-  double xc = 0.0, yc = 0.0, zc = 0.0;
-  if (active) {
-    xc = cx[idx];
-    yc = cy[idx];
-    zc = cz[idx];
-  }
-
-  for (unsigned int cell = blockIdx.y; cell < ncell; cell += gridDim.y) {
-    const unsigned int apnt = cell_atom_points[cell];
-    const unsigned int acnt = cell_atom_counts[cell];
-
-    double sf_re0 = 0.0, sf_im0 = 0.0;
-    for (unsigned int i = 0; i < acnt; i += ATOM_TILE) {
-      __syncthreads();
-      if ((threadIdx.x < ATOM_TILE) && (i + threadIdx.x < acnt)) {
-        s_cache[threadIdx.x * 4 + 0] = rx[apnt + i + threadIdx.x];
-        s_cache[threadIdx.x * 4 + 1] = ry[apnt + i + threadIdx.x];
-        s_cache[threadIdx.x * 4 + 2] = rz[apnt + i + threadIdx.x];
-        s_cache[threadIdx.x * 4 + 3] = qc[apnt + i + threadIdx.x];
-      }
-      __syncthreads();
-
-      if (active) { // Only "active" threads do expensive sincos work
-        const unsigned int n = min(ATOM_TILE, acnt - i);
-        for (unsigned int j = 0; j < n; j++) {
-          const double xa = s_cache[j * 4 + 0];
-          const double ya = s_cache[j * 4 + 1];
-          const double za = s_cache[j * 4 + 2];
-          const double qa = s_cache[j * 4 + 3];
-
-          const double theta = xc * xa + yc * ya + zc * za;
-          double re = 0.0, im = 0.0;
-          sincos(theta, &im, &re);
-
-          sf_re0 += qa * re;
-          sf_im0 -= qa * im;
-        }
-      }
-    }
-
-    if (active) {
-      sf_re[cell * nc + idx] = sf_re0;
-      sf_im[cell * nc + idx] = sf_im0;
-    }
-  }
-
-  return;
-}
-
 template <typename CT> void glst_force<CT>::calc_sf(void) {
-  this->calc_sf_tile(0);
-  return;
-}
-
-template <typename CT>
-__global__ static void
-calc_prefix_sum_z_kernel(CT *__restrict__ sf_re, CT *__restrict__ sf_im,
-                         const unsigned int nc, const unsigned int nx,
-                         const unsigned int ny, const unsigned int nz) {
-  const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  const unsigned int x = blockIdx.y / ny;
-  const unsigned int y = blockIdx.y % ny;
-
-  if (idx >= nc)
-    return;
-
-  CT sum_re = static_cast<CT>(0.0), sum_im = static_cast<CT>(0.0);
-  for (unsigned int z = 0; z < nz; z++) {
-    const unsigned int cell = (x * ny + y) * nz + z;
-    sum_re += sf_re[cell * nc + idx];
-    sum_im += sf_im[cell * nc + idx];
-    sf_re[cell * nc + idx] = sum_re;
-    sf_im[cell * nc + idx] = sum_im;
-  }
-
-  return;
-}
-
-template <typename CT>
-__global__ static void
-calc_prefix_sum_y_kernel(CT *__restrict__ sf_re, CT *__restrict__ sf_im,
-                         const unsigned int nc, const unsigned int nx,
-                         const unsigned int ny, const unsigned int nz) {
-  const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  const unsigned int x = blockIdx.y / nz;
-  const unsigned int z = blockIdx.y % nz;
-
-  if (idx >= nc)
-    return;
-
-  CT sum_re = static_cast<CT>(0.0), sum_im = static_cast<CT>(0.0);
-  for (unsigned int y = 0; y < ny; y++) {
-    const unsigned int cell = (x * ny + y) * nz + z;
-    sum_re += sf_re[cell * nc + idx];
-    sum_im += sf_im[cell * nc + idx];
-    sf_re[cell * nc + idx] = sum_re;
-    sf_im[cell * nc + idx] = sum_im;
-  }
-
-  return;
-}
-
-template <typename CT>
-__global__ static void
-calc_prefix_sum_x_kernel(CT *__restrict__ sf_re, CT *__restrict__ sf_im,
-                         const unsigned int nc, const unsigned int nx,
-                         const unsigned int ny, const unsigned int nz) {
-  const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  const unsigned int y = blockIdx.y / nz;
-  const unsigned int z = blockIdx.y % nz;
-
-  if (idx >= nc)
-    return;
-
-  CT sum_re = static_cast<CT>(0.0), sum_im = static_cast<CT>(0.0);
-  for (unsigned int x = 0; x < nx; x++) {
-    const unsigned int cell = (x * ny + y) * nz + z;
-    sum_re += sf_re[cell * nc + idx];
-    sum_im += sf_im[cell * nc + idx];
-    sf_re[cell * nc + idx] = sum_re;
-    sf_im[cell * nc + idx] = sum_im;
-  }
-
-  return;
-}
-
-template <typename CT>
-__device__ void box_sum(CT &box_re, CT &box_im, const CT *__restrict__ P_re,
-                        const CT *__restrict__ P_im, const unsigned int x0,
-                        const unsigned int y0, const unsigned int z0,
-                        const unsigned int x1, const unsigned int y1,
-                        const unsigned int z1, const unsigned int nx,
-                        const unsigned int ny, const unsigned int nz,
-                        const unsigned int idx, const unsigned int nc) {
-  // Need to check if x0-1, y0-1, z0-1 < 0
-  const bool xb = (x0 == 0);
-  const bool yb = (y0 == 0);
-  const bool zb = (z0 == 0);
-  const unsigned int xm = (xb) ? 0 : x0 - 1;
-  const unsigned int ym = (yb) ? 0 : y0 - 1;
-  const unsigned int zm = (zb) ? 0 : z0 - 1;
-  const unsigned int cell0 = (x1 * ny + y1) * nz + z1; // ( x1,   y1,   z1   )
-  const unsigned int cell1 = (xm * ny + y1) * nz + z1; // ( x0-1, y1,   z1   )
-  const unsigned int cell2 = (x1 * ny + ym) * nz + z1; // ( x1,   y0-1, z1   )
-  const unsigned int cell3 = (x1 * ny + y1) * nz + zm; // ( x1,   y1,   z0-1 )
-  const unsigned int cell4 = (xm * ny + ym) * nz + z1; // ( x0-1, y0-1, z1   )
-  const unsigned int cell5 = (xm * ny + y1) * nz + zm; // ( x0-1, y1,   z0-1 )
-  const unsigned int cell6 = (x1 * ny + ym) * nz + zm; // ( x1,   y0-1, z0-1 )
-  const unsigned int cell7 = (xm * ny + ym) * nz + zm; // ( x0-1, y0-1, z0-1 )
-
-  const CT g0_re = P_re[cell0 * nc + idx]; // Include
-  const CT g1_re =
-      (xb) ? static_cast<CT>(0.0) : P_re[cell1 * nc + idx]; // Exclude
-  const CT g2_re =
-      (yb) ? static_cast<CT>(0.0) : P_re[cell2 * nc + idx]; // Exclude
-  const CT g3_re =
-      (zb) ? static_cast<CT>(0.0) : P_re[cell3 * nc + idx]; // Exclude
-  const CT g4_re =
-      (xb || yb) ? static_cast<CT>(0.0) : P_re[cell4 * nc + idx]; // Include
-  const CT g5_re =
-      (xb || zb) ? static_cast<CT>(0.0) : P_re[cell5 * nc + idx]; // Include
-  const CT g6_re =
-      (yb || zb) ? static_cast<CT>(0.0) : P_re[cell6 * nc + idx]; // Include
-  const CT g7_re = (xb || yb || zb) ? static_cast<CT>(0.0)
-                                    : P_re[cell7 * nc + idx]; // Exclude
-
-  const CT g0_im = P_im[cell0 * nc + idx]; // Include
-  const CT g1_im =
-      (xb) ? static_cast<CT>(0.0) : P_im[cell1 * nc + idx]; // Exclude
-  const CT g2_im =
-      (yb) ? static_cast<CT>(0.0) : P_im[cell2 * nc + idx]; // Exclude
-  const CT g3_im =
-      (zb) ? static_cast<CT>(0.0) : P_im[cell3 * nc + idx]; // Exclude
-  const CT g4_im =
-      (xb || yb) ? static_cast<CT>(0.0) : P_im[cell4 * nc + idx]; // Include
-  const CT g5_im =
-      (xb || zb) ? static_cast<CT>(0.0) : P_im[cell5 * nc + idx]; // Include
-  const CT g6_im =
-      (yb || zb) ? static_cast<CT>(0.0) : P_im[cell6 * nc + idx]; // Include
-  const CT g7_im = (xb || yb || zb) ? static_cast<CT>(0.0)
-                                    : P_im[cell7 * nc + idx]; // Exclude
-
-  box_re = g0_re - g1_re - g2_re - g3_re + g4_re + g5_re + g6_re - g7_re;
-  box_im = g0_im - g1_im - g2_im - g3_im + g4_im + g5_im + g6_im - g7_im;
-
-  return;
-}
-
-template <typename CT>
-__device__ void cube_sum(CT &cube_re, CT &cube_im, const CT *__restrict__ P_re,
-                         const CT *__restrict__ P_im, const unsigned int x,
-                         const unsigned int y, const unsigned int z,
-                         const unsigned int r, const unsigned int nx,
-                         const unsigned int ny, const unsigned int nz,
-                         const unsigned int idx, const unsigned int nc) {
-  // Need to check if x-r, y-r, z-r is < 0
-  const unsigned int x0 = (x < r) ? 0 : x - r;
-  const unsigned int y0 = (y < r) ? 0 : y - r;
-  const unsigned int z0 = (z < r) ? 0 : z - r;
-
-  // Need to check if x+r, y+r, z+r is > nx-1, ny-1, nz-1
-  unsigned int x1 = x + r;
-  unsigned int y1 = y + r;
-  unsigned int z1 = z + r;
-  x1 = (x1 >= nx) ? nx - 1 : x1;
-  y1 = (y1 >= ny) ? ny - 1 : y1;
-  z1 = (z1 >= nz) ? nz - 1 : z1;
-
-  box_sum<CT>(cube_re, cube_im, P_re, P_im, x0, y0, z0, x1, y1, z1, nx, ny, nz,
-              idx, nc);
-  return;
-}
-
-template <typename CT>
-__device__ void
-shell_sum(CT &shell_re, CT &shell_im, const CT *__restrict__ P_re,
-          const CT *__restrict__ P_im, const unsigned int x,
-          const unsigned int y, const unsigned int z, const unsigned int inner,
-          const unsigned int outer, const unsigned int nx,
-          const unsigned int ny, const unsigned int nz, const unsigned int idx,
-          const unsigned int nc) {
-  CT osum_re = static_cast<CT>(0.0), osum_im = static_cast<CT>(0.0);
-  cube_sum<CT>(osum_re, osum_im, P_re, P_im, x, y, z, outer, nx, ny, nz, idx,
-               nc);
-  CT isum_re = static_cast<CT>(0.0), isum_im = static_cast<CT>(0.0);
-  cube_sum<CT>(isum_re, isum_im, P_re, P_im, x, y, z, inner, nx, ny, nz, idx,
-               nc);
-  shell_re = osum_re - isum_re;
-  shell_im = osum_im - isum_im;
-  return;
-}
-
-template <typename CT>
-__global__ static void calc_rmt_sum_kernel(
-    CT *__restrict__ rmt_sum_re, CT *__restrict__ rmt_sum_im,
-    const CT *__restrict__ sf_re, CT *__restrict__ sf_im,
-    const double *__restrict__ cw, const unsigned int *__restrict__ groups,
-    const unsigned int nc, const unsigned int *__restrict__ grp_r_in,
-    const unsigned int *__restrict__ grp_r_out, const unsigned int nx,
-    const unsigned int ny, const unsigned int nz, const unsigned int ncell) {
-  const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
-
-  if (idx >= nc)
-    return;
-
-  const CT wc = cw[idx];
-  const unsigned int grp = groups[idx];
-
-  for (unsigned int cell = blockIdx.y; cell < ncell; cell += gridDim.y) {
-    const unsigned int x = cell / (ny * nz);
-    const unsigned int y = (cell / nz) % ny;
-    const unsigned int z = cell % nz;
-    const unsigned int inner = grp_r_in[grp];
-    const unsigned int outer = grp_r_out[grp];
-
-    CT shell_re = static_cast<CT>(0.0), shell_im = static_cast<CT>(0.0);
-    shell_sum<CT>(shell_re, shell_im, sf_re, sf_im, x, y, z, inner, outer, nx,
-                  ny, nz, idx, nc);
-    shell_re *= wc;
-    shell_im *= wc;
-    rmt_sum_re[cell * nc + idx] = shell_re;
-    rmt_sum_im[cell * nc + idx] = shell_im;
-  }
-
+  // this->calc_sf_tile(0);
   return;
 }
 
 template <typename CT> void glst_force<CT>::sum_rmt_sf(void) {
-  this->sum_rmt_sf_tile(0);
-  return;
-}
-
-// SINGLE-PRECISION
-template <unsigned int BLOCK>
-__global__ static void
-calc_lr_ef_kernel(double *__restrict__ fx, double *__restrict__ fy,
-                  double *__restrict__ fz, double *__restrict__ en,
-                  const float *__restrict__ rx, const float *__restrict__ ry,
-                  const float *__restrict__ rz, const float *__restrict__ qc,
-                  const unsigned int *__restrict__ cell_atom_points,
-                  const unsigned int *__restrict__ cell_atom_counts,
-                  const double *__restrict__ cx, const double *__restrict__ cy,
-                  const double *__restrict__ cz,
-                  const float *__restrict__ rmt_sum_re,
-                  const float *__restrict__ rmt_sum_im, const unsigned int nc,
-                  const unsigned int ncell) {
-  __shared__ float s_cache[BLOCK * 5];
-
-  const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
-
-  for (unsigned int cell = blockIdx.y; cell < ncell; cell += gridDim.y) {
-    const unsigned int apnt = cell_atom_points[cell];
-    const unsigned int acnt = cell_atom_counts[cell];
-    const bool active = (idx < acnt);
-
-    float xa = 0.0f, ya = 0.0f, za = 0.0f, qa = 0.0f;
-    if (active) {
-      xa = rx[apnt + idx];
-      ya = ry[apnt + idx];
-      za = rz[apnt + idx];
-      qa = qc[apnt + idx];
-    }
-
-    double fx0 = 0.0, fy0 = 0.0, fz0 = 0.0, en0 = 0.0;
-    for (unsigned int i = 0; i < nc; i += BLOCK) {
-      __syncthreads();
-      if (i + threadIdx.x < nc) {
-        s_cache[threadIdx.x * 5 + 0] = cx[i + threadIdx.x];
-        s_cache[threadIdx.x * 5 + 1] = cy[i + threadIdx.x];
-        s_cache[threadIdx.x * 5 + 2] = cz[i + threadIdx.x];
-        s_cache[threadIdx.x * 5 + 3] = rmt_sum_re[cell * nc + i + threadIdx.x];
-        s_cache[threadIdx.x * 5 + 4] = rmt_sum_im[cell * nc + i + threadIdx.x];
-      }
-      __syncthreads();
-
-      if (active) { // Only "active" threads do expensive sincos work
-        const unsigned int n = min(BLOCK, nc - i);
-        for (unsigned int j = 0; j < n; j++) {
-          const float xc = s_cache[j * 5 + 0];
-          const float yc = s_cache[j * 5 + 1];
-          const float zc = s_cache[j * 5 + 2];
-          const float rmt_re = s_cache[j * 5 + 3];
-          const float rmt_im = s_cache[j * 5 + 4];
-
-          const float theta = xc * xa + yc * ya + zc * za;
-          float re = 0.0f, im = 0.0f;
-          sincosf(theta, &im, &re);
-
-          const float dre = qa * (re * rmt_re - im * rmt_im);
-          const float dim = qa * (re * rmt_im + im * rmt_re);
-          fx0 += static_cast<double>(dim * xc);
-          fy0 += static_cast<double>(dim * yc);
-          fz0 += static_cast<double>(dim * zc);
-          en0 += static_cast<double>(dre);
-        }
-      }
-    }
-
-    if (active) {
-      fx[apnt + idx] += fx0;
-      fy[apnt + idx] += fy0;
-      fz[apnt + idx] += fz0;
-      en[apnt + idx] += en0;
-    }
-  }
-
-  return;
-}
-
-// DOUBLE-PRECISION
-template <unsigned int BLOCK>
-__global__ static void
-calc_lr_ef_kernel(double *__restrict__ fx, double *__restrict__ fy,
-                  double *__restrict__ fz, double *__restrict__ en,
-                  const double *__restrict__ rx, const double *__restrict__ ry,
-                  const double *__restrict__ rz, const double *__restrict__ qc,
-                  const unsigned int *__restrict__ cell_atom_points,
-                  const unsigned int *__restrict__ cell_atom_counts,
-                  const double *__restrict__ cx, const double *__restrict__ cy,
-                  const double *__restrict__ cz,
-                  const double *__restrict__ rmt_sum_re,
-                  const double *__restrict__ rmt_sum_im, const unsigned int nc,
-                  const unsigned int ncell) {
-  __shared__ double s_cache[BLOCK * 5];
-
-  const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
-
-  for (unsigned int cell = blockIdx.y; cell < ncell; cell += gridDim.y) {
-    const unsigned int apnt = cell_atom_points[cell];
-    const unsigned int acnt = cell_atom_counts[cell];
-    const bool active = (idx < acnt);
-
-    double xa = 0.0, ya = 0.0, za = 0.0, qa = 0.0;
-    if (active) {
-      xa = rx[apnt + idx];
-      ya = ry[apnt + idx];
-      za = rz[apnt + idx];
-      qa = qc[apnt + idx];
-    }
-
-    double fx0 = 0.0, fy0 = 0.0, fz0 = 0.0, en0 = 0.0;
-    for (unsigned int i = 0; i < nc; i += BLOCK) {
-      __syncthreads();
-      if (i + threadIdx.x < nc) {
-        s_cache[threadIdx.x * 5 + 0] = cx[i + threadIdx.x];
-        s_cache[threadIdx.x * 5 + 1] = cy[i + threadIdx.x];
-        s_cache[threadIdx.x * 5 + 2] = cz[i + threadIdx.x];
-        s_cache[threadIdx.x * 5 + 3] = rmt_sum_re[cell * nc + i + threadIdx.x];
-        s_cache[threadIdx.x * 5 + 4] = rmt_sum_im[cell * nc + i + threadIdx.x];
-      }
-      __syncthreads();
-
-      if (active) { // Only "active" threads do expensive sincos work
-        const unsigned int n = min(BLOCK, nc - i);
-        for (unsigned int j = 0; j < n; j++) {
-          const double xc = s_cache[j * 5 + 0];
-          const double yc = s_cache[j * 5 + 1];
-          const double zc = s_cache[j * 5 + 2];
-          const double rmt_re = s_cache[j * 5 + 3];
-          const double rmt_im = s_cache[j * 5 + 4];
-
-          const double theta = xc * xa + yc * ya + zc * za;
-          double re = 0.0, im = 0.0;
-          sincos(theta, &im, &re);
-
-          const double dre = qa * (re * rmt_re - im * rmt_im);
-          const double dim = qa * (re * rmt_im + im * rmt_re);
-          fx0 += dim * xc;
-          fy0 += dim * yc;
-          fz0 += dim * zc;
-          en0 += dre;
-        }
-      }
-    }
-
-    if (active) {
-      fx[apnt + idx] += fx0;
-      fy[apnt + idx] += fy0;
-      fz[apnt + idx] += fz0;
-      en[apnt + idx] += en0;
-    }
-  }
-
+  // this->sum_rmt_sf_tile(0);
   return;
 }
 
 template <typename CT> void glst_force<CT>::calc_lr_ef(void) {
-  this->calc_lr_ef_tile(0);
+  if (this->plan_ == nullptr) {
+    throw std::runtime_error(
+        "FATAL ERROR: glst_force<CT>::calc_lr_ef: Plan is not initialized");
+  }
+
+  for (int dev = 0; dev < this->cuda_count_; dev++) {
+    cudaCheck(cudaSetDevice(dev));
+
+    const std::size_t nbytes =
+        static_cast<std::size_t>(this->natom_) * sizeof(double);
+
+    cudaCheck(
+        cudaMemsetAsync(static_cast<void *>(this->fx_[dev].d_array().data()), 0,
+                        nbytes, this->comp_streams_[dev]));
+    cudaCheck(
+        cudaMemsetAsync(static_cast<void *>(this->fy_[dev].d_array().data()), 0,
+                        nbytes, this->comp_streams_[dev]));
+    cudaCheck(
+        cudaMemsetAsync(static_cast<void *>(this->fz_[dev].d_array().data()), 0,
+                        nbytes, this->comp_streams_[dev]));
+    cudaCheck(
+        cudaMemsetAsync(static_cast<void *>(this->en_[dev].d_array().data()), 0,
+                        nbytes, this->comp_streams_[dev]));
+  }
+
+  for (unsigned int tile = 0; tile < this->plan_->tile_count(); tile++) {
+    this->calc_sf_tile(tile);
+    this->sum_rmt_sf_tile(tile);
+    this->calc_lr_ef_tile(tile);
+  }
+
   return;
 }
 
@@ -1528,6 +1063,136 @@ void glst_force<CT>::calc_ener_force(const double *d_rx, const double *d_ry,
   return;
 }
 
+// SINGLE-PRECISION
+template <unsigned int ATOM_TILE>
+__global__ static void
+calc_sf_kernel(float *__restrict__ sf_re, float *__restrict__ sf_im,
+               const double *__restrict__ cx, const double *__restrict__ cy,
+               const double *__restrict__ cz, const unsigned int nc,
+               const float *__restrict__ rx, const float *__restrict__ ry,
+               const float *__restrict__ rz, const float *__restrict__ qc,
+               const unsigned int *__restrict__ cell_atom_points,
+               const unsigned int *__restrict__ cell_atom_counts,
+               const unsigned int ncell) {
+  __shared__ float s_cache[ATOM_TILE * 4];
+
+  const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const bool active = (idx < nc);
+
+  float xc = 0.0f, yc = 0.0f, zc = 0.0f;
+  if (active) {
+    xc = cx[idx];
+    yc = cy[idx];
+    zc = cz[idx];
+  }
+
+  for (unsigned int cell = blockIdx.y; cell < ncell; cell += gridDim.y) {
+    const unsigned int apnt = cell_atom_points[cell];
+    const unsigned int acnt = cell_atom_counts[cell];
+
+    float sf_re0 = 0.0f, sf_im0 = 0.0f;
+    for (unsigned int i = 0; i < acnt; i += ATOM_TILE) {
+      __syncthreads();
+      if ((threadIdx.x < ATOM_TILE) && (i + threadIdx.x < acnt)) {
+        s_cache[threadIdx.x * 4 + 0] = rx[apnt + i + threadIdx.x];
+        s_cache[threadIdx.x * 4 + 1] = ry[apnt + i + threadIdx.x];
+        s_cache[threadIdx.x * 4 + 2] = rz[apnt + i + threadIdx.x];
+        s_cache[threadIdx.x * 4 + 3] = qc[apnt + i + threadIdx.x];
+      }
+      __syncthreads();
+
+      if (active) { // Only "active" threads do expensive sincos work
+        const unsigned int n = min(ATOM_TILE, acnt - i);
+        for (unsigned int j = 0; j < n; j++) {
+          const float xa = s_cache[j * 4 + 0];
+          const float ya = s_cache[j * 4 + 1];
+          const float za = s_cache[j * 4 + 2];
+          const float qa = s_cache[j * 4 + 3];
+
+          const float theta = xc * xa + yc * ya + zc * za;
+          float re = 0.0, im = 0.0;
+          sincosf(theta, &im, &re);
+
+          sf_re0 += qa * re;
+          sf_im0 -= qa * im;
+        }
+      }
+    }
+
+    if (active) {
+      sf_re[cell * nc + idx] = sf_re0;
+      sf_im[cell * nc + idx] = sf_im0;
+    }
+  }
+
+  return;
+}
+
+// DOUBLE-PRECISION
+template <unsigned int ATOM_TILE>
+__global__ static void
+calc_sf_kernel(double *__restrict__ sf_re, double *__restrict__ sf_im,
+               const double *__restrict__ cx, const double *__restrict__ cy,
+               const double *__restrict__ cz, const unsigned int nc,
+               const double *__restrict__ rx, const double *__restrict__ ry,
+               const double *__restrict__ rz, const double *__restrict__ qc,
+               const unsigned int *__restrict__ cell_atom_points,
+               const unsigned int *__restrict__ cell_atom_counts,
+               const unsigned int ncell) {
+  __shared__ double s_cache[ATOM_TILE * 4];
+
+  const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const bool active = (idx < nc);
+
+  double xc = 0.0, yc = 0.0, zc = 0.0;
+  if (active) {
+    xc = cx[idx];
+    yc = cy[idx];
+    zc = cz[idx];
+  }
+
+  for (unsigned int cell = blockIdx.y; cell < ncell; cell += gridDim.y) {
+    const unsigned int apnt = cell_atom_points[cell];
+    const unsigned int acnt = cell_atom_counts[cell];
+
+    double sf_re0 = 0.0, sf_im0 = 0.0;
+    for (unsigned int i = 0; i < acnt; i += ATOM_TILE) {
+      __syncthreads();
+      if ((threadIdx.x < ATOM_TILE) && (i + threadIdx.x < acnt)) {
+        s_cache[threadIdx.x * 4 + 0] = rx[apnt + i + threadIdx.x];
+        s_cache[threadIdx.x * 4 + 1] = ry[apnt + i + threadIdx.x];
+        s_cache[threadIdx.x * 4 + 2] = rz[apnt + i + threadIdx.x];
+        s_cache[threadIdx.x * 4 + 3] = qc[apnt + i + threadIdx.x];
+      }
+      __syncthreads();
+
+      if (active) { // Only "active" threads do expensive sincos work
+        const unsigned int n = min(ATOM_TILE, acnt - i);
+        for (unsigned int j = 0; j < n; j++) {
+          const double xa = s_cache[j * 4 + 0];
+          const double ya = s_cache[j * 4 + 1];
+          const double za = s_cache[j * 4 + 2];
+          const double qa = s_cache[j * 4 + 3];
+
+          const double theta = xc * xa + yc * ya + zc * za;
+          double re = 0.0, im = 0.0;
+          sincos(theta, &im, &re);
+
+          sf_re0 += qa * re;
+          sf_im0 -= qa * im;
+        }
+      }
+    }
+
+    if (active) {
+      sf_re[cell * nc + idx] = sf_re0;
+      sf_im[cell * nc + idx] = sf_im0;
+    }
+  }
+
+  return;
+}
+
 template <typename CT>
 void glst_force<CT>::calc_sf_tile(const unsigned int tile) {
   if (this->plan_ == nullptr) {
@@ -1592,6 +1257,219 @@ void glst_force<CT>::calc_sf_tile(const unsigned int tile) {
 }
 
 template <typename CT>
+__global__ static void
+calc_prefix_sum_z_kernel(CT *__restrict__ sf_re, CT *__restrict__ sf_im,
+                         const unsigned int nc, const unsigned int nx,
+                         const unsigned int ny, const unsigned int nz) {
+  const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const unsigned int x = blockIdx.y / ny;
+  const unsigned int y = blockIdx.y % ny;
+
+  if (idx >= nc)
+    return;
+
+  CT sum_re = static_cast<CT>(0.0), sum_im = static_cast<CT>(0.0);
+  for (unsigned int z = 0; z < nz; z++) {
+    const unsigned int cell = (x * ny + y) * nz + z;
+    sum_re += sf_re[cell * nc + idx];
+    sum_im += sf_im[cell * nc + idx];
+    sf_re[cell * nc + idx] = sum_re;
+    sf_im[cell * nc + idx] = sum_im;
+  }
+
+  return;
+}
+
+template <typename CT>
+__global__ static void
+calc_prefix_sum_y_kernel(CT *__restrict__ sf_re, CT *__restrict__ sf_im,
+                         const unsigned int nc, const unsigned int nx,
+                         const unsigned int ny, const unsigned int nz) {
+  const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const unsigned int x = blockIdx.y / nz;
+  const unsigned int z = blockIdx.y % nz;
+
+  if (idx >= nc)
+    return;
+
+  CT sum_re = static_cast<CT>(0.0), sum_im = static_cast<CT>(0.0);
+  for (unsigned int y = 0; y < ny; y++) {
+    const unsigned int cell = (x * ny + y) * nz + z;
+    sum_re += sf_re[cell * nc + idx];
+    sum_im += sf_im[cell * nc + idx];
+    sf_re[cell * nc + idx] = sum_re;
+    sf_im[cell * nc + idx] = sum_im;
+  }
+
+  return;
+}
+
+template <typename CT>
+__global__ static void
+calc_prefix_sum_x_kernel(CT *__restrict__ sf_re, CT *__restrict__ sf_im,
+                         const unsigned int nc, const unsigned int nx,
+                         const unsigned int ny, const unsigned int nz) {
+  const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const unsigned int y = blockIdx.y / nz;
+  const unsigned int z = blockIdx.y % nz;
+
+  if (idx >= nc)
+    return;
+
+  CT sum_re = static_cast<CT>(0.0), sum_im = static_cast<CT>(0.0);
+  for (unsigned int x = 0; x < nx; x++) {
+    const unsigned int cell = (x * ny + y) * nz + z;
+    sum_re += sf_re[cell * nc + idx];
+    sum_im += sf_im[cell * nc + idx];
+    sf_re[cell * nc + idx] = sum_re;
+    sf_im[cell * nc + idx] = sum_im;
+  }
+
+  return;
+}
+
+template <typename CT>
+__device__ void box_sum(CT &box_re, CT &box_im, const CT *__restrict__ P_re,
+                        const CT *__restrict__ P_im, const unsigned int x0,
+                        const unsigned int y0, const unsigned int z0,
+                        const unsigned int x1, const unsigned int y1,
+                        const unsigned int z1, const unsigned int nx,
+                        const unsigned int ny, const unsigned int nz,
+                        const unsigned int idx, const unsigned int nc) {
+  // Need to check if x0-1, y0-1, z0-1 < 0
+  const bool xb = (x0 == 0);
+  const bool yb = (y0 == 0);
+  const bool zb = (z0 == 0);
+  const unsigned int xm = (xb) ? 0 : x0 - 1;
+  const unsigned int ym = (yb) ? 0 : y0 - 1;
+  const unsigned int zm = (zb) ? 0 : z0 - 1;
+  const unsigned int cell0 = (x1 * ny + y1) * nz + z1; // ( x1,   y1,   z1   )
+  const unsigned int cell1 = (xm * ny + y1) * nz + z1; // ( x0-1, y1,   z1   )
+  const unsigned int cell2 = (x1 * ny + ym) * nz + z1; // ( x1,   y0-1, z1   )
+  const unsigned int cell3 = (x1 * ny + y1) * nz + zm; // ( x1,   y1,   z0-1 )
+  const unsigned int cell4 = (xm * ny + ym) * nz + z1; // ( x0-1, y0-1, z1   )
+  const unsigned int cell5 = (xm * ny + y1) * nz + zm; // ( x0-1, y1,   z0-1 )
+  const unsigned int cell6 = (x1 * ny + ym) * nz + zm; // ( x1,   y0-1, z0-1 )
+  const unsigned int cell7 = (xm * ny + ym) * nz + zm; // ( x0-1, y0-1, z0-1 )
+
+  const CT g0_re = P_re[cell0 * nc + idx]; // Include
+  const CT g1_re =
+      (xb) ? static_cast<CT>(0.0) : P_re[cell1 * nc + idx]; // Exclude
+  const CT g2_re =
+      (yb) ? static_cast<CT>(0.0) : P_re[cell2 * nc + idx]; // Exclude
+  const CT g3_re =
+      (zb) ? static_cast<CT>(0.0) : P_re[cell3 * nc + idx]; // Exclude
+  const CT g4_re =
+      (xb || yb) ? static_cast<CT>(0.0) : P_re[cell4 * nc + idx]; // Include
+  const CT g5_re =
+      (xb || zb) ? static_cast<CT>(0.0) : P_re[cell5 * nc + idx]; // Include
+  const CT g6_re =
+      (yb || zb) ? static_cast<CT>(0.0) : P_re[cell6 * nc + idx]; // Include
+  const CT g7_re = (xb || yb || zb) ? static_cast<CT>(0.0)
+                                    : P_re[cell7 * nc + idx]; // Exclude
+
+  const CT g0_im = P_im[cell0 * nc + idx]; // Include
+  const CT g1_im =
+      (xb) ? static_cast<CT>(0.0) : P_im[cell1 * nc + idx]; // Exclude
+  const CT g2_im =
+      (yb) ? static_cast<CT>(0.0) : P_im[cell2 * nc + idx]; // Exclude
+  const CT g3_im =
+      (zb) ? static_cast<CT>(0.0) : P_im[cell3 * nc + idx]; // Exclude
+  const CT g4_im =
+      (xb || yb) ? static_cast<CT>(0.0) : P_im[cell4 * nc + idx]; // Include
+  const CT g5_im =
+      (xb || zb) ? static_cast<CT>(0.0) : P_im[cell5 * nc + idx]; // Include
+  const CT g6_im =
+      (yb || zb) ? static_cast<CT>(0.0) : P_im[cell6 * nc + idx]; // Include
+  const CT g7_im = (xb || yb || zb) ? static_cast<CT>(0.0)
+                                    : P_im[cell7 * nc + idx]; // Exclude
+
+  box_re = g0_re - g1_re - g2_re - g3_re + g4_re + g5_re + g6_re - g7_re;
+  box_im = g0_im - g1_im - g2_im - g3_im + g4_im + g5_im + g6_im - g7_im;
+
+  return;
+}
+
+template <typename CT>
+__device__ void cube_sum(CT &cube_re, CT &cube_im, const CT *__restrict__ P_re,
+                         const CT *__restrict__ P_im, const unsigned int x,
+                         const unsigned int y, const unsigned int z,
+                         const unsigned int r, const unsigned int nx,
+                         const unsigned int ny, const unsigned int nz,
+                         const unsigned int idx, const unsigned int nc) {
+  // Need to check if x-r, y-r, z-r is < 0
+  const unsigned int x0 = (x < r) ? 0 : x - r;
+  const unsigned int y0 = (y < r) ? 0 : y - r;
+  const unsigned int z0 = (z < r) ? 0 : z - r;
+
+  // Need to check if x+r, y+r, z+r is > nx-1, ny-1, nz-1
+  unsigned int x1 = x + r;
+  unsigned int y1 = y + r;
+  unsigned int z1 = z + r;
+  x1 = (x1 >= nx) ? nx - 1 : x1;
+  y1 = (y1 >= ny) ? ny - 1 : y1;
+  z1 = (z1 >= nz) ? nz - 1 : z1;
+
+  box_sum<CT>(cube_re, cube_im, P_re, P_im, x0, y0, z0, x1, y1, z1, nx, ny, nz,
+              idx, nc);
+  return;
+}
+
+template <typename CT>
+__device__ void
+shell_sum(CT &shell_re, CT &shell_im, const CT *__restrict__ P_re,
+          const CT *__restrict__ P_im, const unsigned int x,
+          const unsigned int y, const unsigned int z, const unsigned int inner,
+          const unsigned int outer, const unsigned int nx,
+          const unsigned int ny, const unsigned int nz, const unsigned int idx,
+          const unsigned int nc) {
+  CT osum_re = static_cast<CT>(0.0), osum_im = static_cast<CT>(0.0);
+  cube_sum<CT>(osum_re, osum_im, P_re, P_im, x, y, z, outer, nx, ny, nz, idx,
+               nc);
+  CT isum_re = static_cast<CT>(0.0), isum_im = static_cast<CT>(0.0);
+  cube_sum<CT>(isum_re, isum_im, P_re, P_im, x, y, z, inner, nx, ny, nz, idx,
+               nc);
+  shell_re = osum_re - isum_re;
+  shell_im = osum_im - isum_im;
+  return;
+}
+
+template <typename CT>
+__global__ static void calc_rmt_sum_kernel(
+    CT *__restrict__ rmt_sum_re, CT *__restrict__ rmt_sum_im,
+    const CT *__restrict__ sf_re, const CT *__restrict__ sf_im,
+    const double *__restrict__ cw, const unsigned int *__restrict__ groups,
+    const unsigned int nc, const unsigned int *__restrict__ grp_r_in,
+    const unsigned int *__restrict__ grp_r_out, const unsigned int nx,
+    const unsigned int ny, const unsigned int nz, const unsigned int ncell) {
+  const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+  if (idx >= nc)
+    return;
+
+  const CT wc = cw[idx];
+  const unsigned int grp = groups[idx];
+
+  for (unsigned int cell = blockIdx.y; cell < ncell; cell += gridDim.y) {
+    const unsigned int x = cell / (ny * nz);
+    const unsigned int y = (cell / nz) % ny;
+    const unsigned int z = cell % nz;
+    const unsigned int inner = grp_r_in[grp];
+    const unsigned int outer = grp_r_out[grp];
+
+    CT shell_re = static_cast<CT>(0.0), shell_im = static_cast<CT>(0.0);
+    shell_sum<CT>(shell_re, shell_im, sf_re, sf_im, x, y, z, inner, outer, nx,
+                  ny, nz, idx, nc);
+    shell_re *= wc;
+    shell_im *= wc;
+    rmt_sum_re[cell * nc + idx] = shell_re;
+    rmt_sum_im[cell * nc + idx] = shell_im;
+  }
+
+  return;
+}
+
+template <typename CT>
 void glst_force<CT>::sum_rmt_sf_tile(const unsigned int tile) {
   if (this->plan_ == nullptr) {
     throw std::runtime_error("FATAL ERROR: glst_force<CT>::sum_rmt_sf_tile: "
@@ -1610,6 +1488,16 @@ void glst_force<CT>::sum_rmt_sf_tile(const unsigned int tile) {
 
   const unsigned int tile_node_point = this->plan_->tile_node_point(tile);
   const unsigned int tile_node_count = this->plan_->tile_node_count(tile);
+
+  if (tile_node_count == 0) {
+    throw std::runtime_error(
+        "FATAL ERROR: glst_force<CT>::sum_rmt_sf_tile: Tile node count is 0");
+  }
+
+  if (tile_node_count > this->plan_->max_tile_nodes()) {
+    throw std::runtime_error("FATAL ERROR: glst_force<CT>::sum_rmt_sf_tile: "
+                             "Tile exceeds buffer size");
+  }
 
   for (int dev = 0; dev < this->cuda_count_; dev++) {
     cudaCheck(cudaSetDevice(dev));
@@ -1655,7 +1543,7 @@ void glst_force<CT>::sum_rmt_sf_tile(const unsigned int tile) {
 
     {
 #ifdef __GLST_DEBUG__
-      constexpr dim3 num_threads(128, 1, 1);
+      constexpr dim3 num_threads(256, 1, 1);
 #else
       constexpr dim3 num_threads(512, 1, 1);
 #endif
@@ -1673,6 +1561,160 @@ void glst_force<CT>::sum_rmt_sf_tile(const unsigned int tile) {
               this->grp_r_out_[dev].d_array().data(), this->ncell_x_,
               this->ncell_y_, this->ncell_z_, this->ncell_);
       cudaCheck(cudaGetLastError());
+    }
+  }
+
+  return;
+}
+
+// SINGLE-PRECISION
+template <unsigned int BLOCK>
+__global__ static void
+calc_lr_ef_kernel(double *__restrict__ fx, double *__restrict__ fy,
+                  double *__restrict__ fz, double *__restrict__ en,
+                  const float *__restrict__ rx, const float *__restrict__ ry,
+                  const float *__restrict__ rz, const float *__restrict__ qc,
+                  const unsigned int *__restrict__ cell_atom_points,
+                  const unsigned int *__restrict__ cell_atom_counts,
+                  const double *__restrict__ cx, const double *__restrict__ cy,
+                  const double *__restrict__ cz,
+                  const float *__restrict__ rmt_sum_re,
+                  const float *__restrict__ rmt_sum_im, const unsigned int nc,
+                  const unsigned int ncell) {
+  __shared__ float s_cache[BLOCK * 5];
+
+  const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+  for (unsigned int cell = blockIdx.y; cell < ncell; cell += gridDim.y) {
+    const unsigned int apnt = cell_atom_points[cell];
+    const unsigned int acnt = cell_atom_counts[cell];
+    const bool active = (idx < acnt);
+
+    float xa = 0.0f, ya = 0.0f, za = 0.0f, qa = 0.0f;
+    if (active) {
+      xa = rx[apnt + idx];
+      ya = ry[apnt + idx];
+      za = rz[apnt + idx];
+      qa = qc[apnt + idx];
+    }
+
+    double fx0 = 0.0, fy0 = 0.0, fz0 = 0.0, en0 = 0.0;
+    for (unsigned int i = 0; i < nc; i += BLOCK) {
+      __syncthreads();
+      if (i + threadIdx.x < nc) {
+        s_cache[threadIdx.x * 5 + 0] = cx[i + threadIdx.x];
+        s_cache[threadIdx.x * 5 + 1] = cy[i + threadIdx.x];
+        s_cache[threadIdx.x * 5 + 2] = cz[i + threadIdx.x];
+        s_cache[threadIdx.x * 5 + 3] = rmt_sum_re[cell * nc + i + threadIdx.x];
+        s_cache[threadIdx.x * 5 + 4] = rmt_sum_im[cell * nc + i + threadIdx.x];
+      }
+      __syncthreads();
+
+      if (active) { // Only "active" threads do expensive sincos work
+        const unsigned int n = min(BLOCK, nc - i);
+        for (unsigned int j = 0; j < n; j++) {
+          const float xc = s_cache[j * 5 + 0];
+          const float yc = s_cache[j * 5 + 1];
+          const float zc = s_cache[j * 5 + 2];
+          const float rmt_re = s_cache[j * 5 + 3];
+          const float rmt_im = s_cache[j * 5 + 4];
+
+          const float theta = xc * xa + yc * ya + zc * za;
+          float re = 0.0f, im = 0.0f;
+          sincosf(theta, &im, &re);
+
+          const float dre = qa * (re * rmt_re - im * rmt_im);
+          const float dim = qa * (re * rmt_im + im * rmt_re);
+          fx0 += static_cast<double>(dim * xc);
+          fy0 += static_cast<double>(dim * yc);
+          fz0 += static_cast<double>(dim * zc);
+          en0 += static_cast<double>(dre);
+        }
+      }
+    }
+
+    if (active) {
+      fx[apnt + idx] += fx0;
+      fy[apnt + idx] += fy0;
+      fz[apnt + idx] += fz0;
+      en[apnt + idx] += en0;
+    }
+  }
+
+  return;
+}
+
+// DOUBLE-PRECISION
+template <unsigned int BLOCK>
+__global__ static void
+calc_lr_ef_kernel(double *__restrict__ fx, double *__restrict__ fy,
+                  double *__restrict__ fz, double *__restrict__ en,
+                  const double *__restrict__ rx, const double *__restrict__ ry,
+                  const double *__restrict__ rz, const double *__restrict__ qc,
+                  const unsigned int *__restrict__ cell_atom_points,
+                  const unsigned int *__restrict__ cell_atom_counts,
+                  const double *__restrict__ cx, const double *__restrict__ cy,
+                  const double *__restrict__ cz,
+                  const double *__restrict__ rmt_sum_re,
+                  const double *__restrict__ rmt_sum_im, const unsigned int nc,
+                  const unsigned int ncell) {
+  __shared__ double s_cache[BLOCK * 5];
+
+  const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+  for (unsigned int cell = blockIdx.y; cell < ncell; cell += gridDim.y) {
+    const unsigned int apnt = cell_atom_points[cell];
+    const unsigned int acnt = cell_atom_counts[cell];
+    const bool active = (idx < acnt);
+
+    double xa = 0.0, ya = 0.0, za = 0.0, qa = 0.0;
+    if (active) {
+      xa = rx[apnt + idx];
+      ya = ry[apnt + idx];
+      za = rz[apnt + idx];
+      qa = qc[apnt + idx];
+    }
+
+    double fx0 = 0.0, fy0 = 0.0, fz0 = 0.0, en0 = 0.0;
+    for (unsigned int i = 0; i < nc; i += BLOCK) {
+      __syncthreads();
+      if (i + threadIdx.x < nc) {
+        s_cache[threadIdx.x * 5 + 0] = cx[i + threadIdx.x];
+        s_cache[threadIdx.x * 5 + 1] = cy[i + threadIdx.x];
+        s_cache[threadIdx.x * 5 + 2] = cz[i + threadIdx.x];
+        s_cache[threadIdx.x * 5 + 3] = rmt_sum_re[cell * nc + i + threadIdx.x];
+        s_cache[threadIdx.x * 5 + 4] = rmt_sum_im[cell * nc + i + threadIdx.x];
+      }
+      __syncthreads();
+
+      if (active) { // Only "active" threads do expensive sincos work
+        const unsigned int n = min(BLOCK, nc - i);
+        for (unsigned int j = 0; j < n; j++) {
+          const double xc = s_cache[j * 5 + 0];
+          const double yc = s_cache[j * 5 + 1];
+          const double zc = s_cache[j * 5 + 2];
+          const double rmt_re = s_cache[j * 5 + 3];
+          const double rmt_im = s_cache[j * 5 + 4];
+
+          const double theta = xc * xa + yc * ya + zc * za;
+          double re = 0.0, im = 0.0;
+          sincos(theta, &im, &re);
+
+          const double dre = qa * (re * rmt_re - im * rmt_im);
+          const double dim = qa * (re * rmt_im + im * rmt_re);
+          fx0 += dim * xc;
+          fy0 += dim * yc;
+          fz0 += dim * zc;
+          en0 += dre;
+        }
+      }
+    }
+
+    if (active) {
+      fx[apnt + idx] += fx0;
+      fy[apnt + idx] += fy0;
+      fz[apnt + idx] += fz0;
+      en[apnt + idx] += en0;
     }
   }
 
@@ -1698,6 +1740,16 @@ void glst_force<CT>::calc_lr_ef_tile(const unsigned int tile) {
 
   const unsigned int tile_node_point = this->plan_->tile_node_point(tile);
   const unsigned int tile_node_count = this->plan_->tile_node_count(tile);
+
+  if (tile_node_count == 0) {
+    throw std::runtime_error(
+        "FATAL ERROR: glst_force<CT>::calc_lr_ef_tile: Tile node count is 0");
+  }
+
+  if (tile_node_count > this->plan_->max_tile_nodes()) {
+    throw std::runtime_error("FATAL ERROR: glst_force<CT>::calc_lr_ef_tile: "
+                             "Tile exceeds buffer size");
+  }
 
   for (int dev = 0; dev < this->cuda_count_; dev++) {
     cudaCheck(cudaSetDevice(dev));
