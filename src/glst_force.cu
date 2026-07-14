@@ -331,10 +331,13 @@ void glst_force<CT>::init(const unsigned int natom, const double tol,
     this->cell_atom_point_[dev].resize(this->ncell_);
     this->cell_atom_count_[dev].resize(this->ncell_);
     this->max_atoms_cell_[dev].resize(1);
-    this->sf_re_[dev].resize(this->ncell_ * this->dev_cub_counts_[dev]);
-    this->sf_im_[dev].resize(this->ncell_ * this->dev_cub_counts_[dev]);
-    this->rmt_sum_re_[dev].resize(this->ncell_ * this->dev_cub_counts_[dev]);
-    this->rmt_sum_im_[dev].resize(this->ncell_ * this->dev_cub_counts_[dev]);
+
+    const unsigned int max_tile_nodes = this->plan_->max_tile_nodes();
+
+    this->sf_re_[dev].resize(this->ncell_ * max_tile_nodes);
+    this->sf_im_[dev].resize(this->ncell_ * max_tile_nodes);
+    this->rmt_sum_re_[dev].resize(this->ncell_ * max_tile_nodes);
+    this->rmt_sum_im_[dev].resize(this->ncell_ * max_tile_nodes);
   }
 
   this->allocate();
@@ -1532,6 +1535,11 @@ void glst_force<CT>::calc_sf_tile(const unsigned int tile) {
         "FATAL ERROR: glst_force<CT>::calc_sf_tile: Plan is not initialized");
   }
 
+  const bool has_long_range_cells =
+      ((this->ncell_x_ > 2) && (this->ncell_y_ > 2) && (this->ncell_z_ > 2));
+  if (!has_long_range_cells)
+    return;
+
   if (tile >= this->plan_->tile_count()) {
     throw std::runtime_error(
         "FATAL ERROR: glst_force<CT>::calc_sf_tile: Tile is out of bounds");
@@ -1539,18 +1547,22 @@ void glst_force<CT>::calc_sf_tile(const unsigned int tile) {
 
   const unsigned int tile_node_point = this->plan_->tile_node_point(tile);
   const unsigned int tile_node_count = this->plan_->tile_node_count(tile);
-  static_cast<void>(tile_node_point);
-  static_cast<void>(tile_node_count);
 
-  const bool has_long_range_cells =
-      ((this->ncell_x_ > 2) && (this->ncell_y_ > 2) && (this->ncell_z_ > 2));
-  if (!has_long_range_cells)
-    return;
+  if (tile_node_count == 0) {
+    throw std::runtime_error(
+        "FATAL ERROR: glst_force<CT>::calc_sf_tile: Tile node count is 0");
+  }
+
+  if (tile_node_count > this->plan_->max_tile_nodes()) {
+    throw std::runtime_error(
+        "FATAL ERROR: glst_force<CT>::calc_sf_tile: Tile exceeds buffer size");
+  }
 
   for (int dev = 0; dev < this->cuda_count_; dev++) {
     cudaCheck(cudaSetDevice(dev));
-    const unsigned int nc = this->dev_cub_counts_[dev];
-    const unsigned int off = this->dev_cub_points_[dev];
+
+    const unsigned int nc = tile_node_count;
+    const unsigned int off = tile_node_point;
 
     cudaCheck(cudaMemsetAsync(
         static_cast<void *>(this->sf_re_[dev].d_array().data()), 0,
@@ -1586,6 +1598,11 @@ void glst_force<CT>::sum_rmt_sf_tile(const unsigned int tile) {
                              "Plan is not initialized");
   }
 
+  const bool has_long_range_cells =
+      ((this->ncell_x_ > 2) && (this->ncell_y_ > 2) && (this->ncell_z_ > 2));
+  if (!has_long_range_cells)
+    return;
+
   if (tile >= this->plan_->tile_count()) {
     throw std::runtime_error(
         "FATAL ERROR: glst_force<CT>::sum_rmt_sf_tile: Tile is out of bounds");
@@ -1593,18 +1610,12 @@ void glst_force<CT>::sum_rmt_sf_tile(const unsigned int tile) {
 
   const unsigned int tile_node_point = this->plan_->tile_node_point(tile);
   const unsigned int tile_node_count = this->plan_->tile_node_count(tile);
-  static_cast<void>(tile_node_point);
-  static_cast<void>(tile_node_count);
-
-  const bool has_long_range_cells =
-      ((this->ncell_x_ > 2) && (this->ncell_y_ > 2) && (this->ncell_z_ > 2));
-  if (!has_long_range_cells)
-    return;
 
   for (int dev = 0; dev < this->cuda_count_; dev++) {
     cudaCheck(cudaSetDevice(dev));
-    const unsigned int nc = this->dev_cub_counts_[dev];
-    const unsigned int off = this->dev_cub_points_[dev];
+
+    const unsigned int nc = tile_node_count;
+    const unsigned int off = tile_node_point;
 
     {
       constexpr dim3 num_threads(512, 1, 1);
@@ -1671,9 +1682,14 @@ void glst_force<CT>::sum_rmt_sf_tile(const unsigned int tile) {
 template <typename CT>
 void glst_force<CT>::calc_lr_ef_tile(const unsigned int tile) {
   if (this->plan_ == nullptr) {
-    throw std::runtime_error(
-        "FATAL ERROR: glst_force<CT>: Plan is not initialized");
+    throw std::runtime_error("FATAL ERROR: glst_force<CT>::calc_lr_ef_tile: "
+                             "Plan is not initialized");
   }
+
+  const bool has_long_range_cells =
+      ((this->ncell_x_ > 2) && (this->ncell_y_ > 2) && (this->ncell_z_ > 2));
+  if (!has_long_range_cells)
+    return;
 
   if (tile >= this->plan_->tile_count()) {
     throw std::runtime_error(
@@ -1682,18 +1698,12 @@ void glst_force<CT>::calc_lr_ef_tile(const unsigned int tile) {
 
   const unsigned int tile_node_point = this->plan_->tile_node_point(tile);
   const unsigned int tile_node_count = this->plan_->tile_node_count(tile);
-  static_cast<void>(tile_node_point);
-  static_cast<void>(tile_node_count);
-
-  const bool has_long_range_cells =
-      ((this->ncell_x_ > 2) && (this->ncell_y_ > 2) && (this->ncell_z_ > 2));
-  if (!has_long_range_cells)
-    return;
 
   for (int dev = 0; dev < this->cuda_count_; dev++) {
     cudaCheck(cudaSetDevice(dev));
-    const unsigned int nc = this->dev_cub_counts_[dev];
-    const unsigned int off = this->dev_cub_points_[dev];
+
+    const unsigned int nc = tile_node_count;
+    const unsigned int off = tile_node_point;
 
     constexpr dim3 num_threads(64, 1, 1);
     const dim3 num_blocks((this->max_atoms_cell_[dev][0] + num_threads.x - 1) /
