@@ -79,11 +79,13 @@ double glst_plan::cell_dim_z(void) const { return this->cell_dim_z_; }
 
 unsigned int glst_plan::ngroup(void) const { return this->ngroup_; }
 
-const std::vector<unsigned int> &glst_plan::grp_r_in(void) const {
+const std::vector<cuda_container<unsigned int>> &
+glst_plan::grp_r_in(void) const {
   return this->grp_r_in_;
 }
 
-const std::vector<unsigned int> &glst_plan::grp_r_out(void) const {
+const std::vector<cuda_container<unsigned int>> &
+glst_plan::grp_r_out(void) const {
   return this->grp_r_out_;
 }
 
@@ -282,16 +284,22 @@ void glst_plan::init_alpha_groups(const double tol) {
 
   this->ngroup_ = static_cast<unsigned int>(this->ncell_alpha_group_.size());
 
-  this->grp_r_in_.resize((this->ngroup_ > 0) ? this->ngroup_ : 1);
-  this->grp_r_out_.resize((this->ngroup_ > 0) ? this->ngroup_ : 1);
+  this->grp_r_in_.resize(1);
+  this->grp_r_out_.resize(1);
 
-  this->grp_r_in_[0] = 1;
+  this->grp_r_in_[0].resize((this->ngroup_ > 0) ? this->ngroup_ : 1);
+  this->grp_r_out_[0].resize((this->ngroup_ > 0) ? this->ngroup_ : 1);
+
+  this->grp_r_in_[0][0] = 1;
   for (unsigned int group = 0; group < this->ngroup_; group++) {
     if (group > 0)
-      this->grp_r_in_[group] = this->grp_r_out_[group - 1];
-    this->grp_r_out_[group] =
-        this->grp_r_in_[group] + this->ncell_alpha_group_[group];
+      this->grp_r_in_[0][group] = this->grp_r_out_[0][group - 1];
+    this->grp_r_out_[0][group] =
+        this->grp_r_in_[0][group] + this->ncell_alpha_group_[group];
   }
+
+  this->grp_r_in_[0].transfer_to_device();
+  this->grp_r_out_[0].transfer_to_device();
 
   return;
 }
@@ -390,8 +398,8 @@ void glst_plan::validate(void) const {
                              "not match cubature num_cubatures");
   }
 
-  if ((this->grp_r_in_.size() != static_cast<std::size_t>(this->ngroup_)) ||
-      (this->grp_r_out_.size() != static_cast<std::size_t>(this->ngroup_)) ||
+  if ((this->grp_r_in_[0].size() != static_cast<std::size_t>(this->ngroup_)) ||
+      (this->grp_r_out_[0].size() != static_cast<std::size_t>(this->ngroup_)) ||
       (this->ncell_alpha_group_.size() !=
        static_cast<std::size_t>(this->ngroup_)) ||
       (this->rmax_.size() != static_cast<std::size_t>(this->ngroup_)) ||

@@ -11,7 +11,6 @@
 #ifndef __GLST_GLST_FORCE__
 #define __GLST_GLST_FORCE__
 
-#include "atom_packet.hcu"
 #include "cuda_container.hcu"
 #include "glst_plan.hcu"
 #include "glst_workspace.hcu"
@@ -22,9 +21,7 @@
 #include <string>
 #include <vector>
 
-// CT = Calculation Type
-
-template <typename CT> class glst_force {
+class glst_force {
 public: // Constructors and destructors
   glst_force(void);
   glst_force(const unsigned int natom, const double tol, const double box_dim_x,
@@ -74,46 +71,8 @@ private:
   void cells2dev(void);
 
 private:
-  unsigned int natom_;
-  std::vector<cuda_container<unsigned int>> idx_;
-  std::vector<cuda_container<unsigned int>> sorted_idx_;
-  std::vector<cuda_container<CT>> rx_;
-  std::vector<cuda_container<CT>> ry_;
-  std::vector<cuda_container<CT>> rz_;
-  std::vector<cuda_container<CT>> qc_;
-  std::vector<cuda_container<atom_packet<CT>>> packets_;
-  std::vector<cuda_container<atom_packet<CT>>> sorted_packets_;
-  std::vector<cuda_container<double>> fx_;
-  std::vector<cuda_container<double>> fy_;
-  std::vector<cuda_container<double>> fz_;
-  std::vector<cuda_container<double>> en_;
-  std::vector<cuda_container<unsigned int>> atom_cell_idx_;
-  std::vector<cuda_container<unsigned int>> atom_cell_sorted_idx_;
-
-  unsigned int ncell_x_;
-  unsigned int ncell_y_;
-  unsigned int ncell_z_;
-  unsigned int ncell_;
-  CT cell_dim_x_;
-  CT cell_dim_y_;
-  CT cell_dim_z_;
-
-  unsigned int ngroup_;
-  std::vector<cuda_container<unsigned int>> grp_r_in_;
-  std::vector<cuda_container<unsigned int>> grp_r_out_;
-
   std::unique_ptr<glst_plan> plan_;
   std::unique_ptr<glst_workspace> workspace_;
-  std::vector<unsigned int> dev_cub_counts_;
-  std::vector<unsigned int> dev_cub_points_;
-
-  std::vector<cuda_container<unsigned int>> cell_atom_point_;
-  std::vector<cuda_container<unsigned int>> cell_atom_count_;
-  std::vector<cuda_container<unsigned int>> max_atoms_cell_;
-  std::vector<cuda_container<CT>> sf_re_;
-  std::vector<cuda_container<CT>> sf_im_;
-  std::vector<cuda_container<CT>> rmt_sum_re_;
-  std::vector<cuda_container<CT>> rmt_sum_im_;
 
   std::vector<void *> cub_work_buffer_;
   std::vector<std::size_t> cub_work_buffer_size_;

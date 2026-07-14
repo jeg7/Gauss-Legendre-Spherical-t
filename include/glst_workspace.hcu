@@ -11,6 +11,7 @@
 #ifndef __GLST_GLST_WORKSPACE__
 #define __GLST_GLST_WORKSPACE__
 
+#include "atom_packet.hcu"
 #include "cuda_container.hcu"
 #include "glst_plan.hcu"
 
@@ -30,10 +31,17 @@ public:
   std::size_t tile_node_capacity(void) const;
   std::size_t tile_buffer_capacity(void) const;
 
+  const std::vector<cuda_container<unsigned int>> &idx(void) const;
+  const std::vector<cuda_container<unsigned int>> &sorted_idx(void) const;
   const std::vector<cuda_container<double>> &rx(void) const;
   const std::vector<cuda_container<double>> &ry(void) const;
   const std::vector<cuda_container<double>> &rz(void) const;
   const std::vector<cuda_container<double>> &qc(void) const;
+  const std::vector<cuda_container<atom_packet>> &packets(void) const;
+  const std::vector<cuda_container<atom_packet>> &sorted_packets(void) const;
+  const std::vector<cuda_container<unsigned int>> &atom_cell_idx(void) const;
+  const std::vector<cuda_container<unsigned int>> &
+  atom_cell_sorted_idx(void) const;
 
   const std::vector<cuda_container<double>> &fx(void) const;
   const std::vector<cuda_container<double>> &fy(void) const;
@@ -49,10 +57,16 @@ public:
   const std::vector<cuda_container<double>> &rmt_sum_re(void) const;
   const std::vector<cuda_container<double>> &rmt_sum_im(void) const;
 
+  std::vector<cuda_container<unsigned int>> &idx(void);
+  std::vector<cuda_container<unsigned int>> &sorted_idx(void);
   std::vector<cuda_container<double>> &rx(void);
   std::vector<cuda_container<double>> &ry(void);
   std::vector<cuda_container<double>> &rz(void);
   std::vector<cuda_container<double>> &qc(void);
+  std::vector<cuda_container<atom_packet>> &packets(void);
+  std::vector<cuda_container<atom_packet>> &sorted_packets(void);
+  std::vector<cuda_container<unsigned int>> &atom_cell_idx(void);
+  std::vector<cuda_container<unsigned int>> &atom_cell_sorted_idx(void);
 
   std::vector<cuda_container<double>> &fx(void);
   std::vector<cuda_container<double>> &fy(void);
@@ -79,10 +93,16 @@ private:
   std::size_t tile_buffer_capacity_;
 
   // Atom arrays: Size atom_capacity_ (natom)
+  std::vector<cuda_container<unsigned int>> idx_;
+  std::vector<cuda_container<unsigned int>> sorted_idx_;
   std::vector<cuda_container<double>> rx_;
   std::vector<cuda_container<double>> ry_;
   std::vector<cuda_container<double>> rz_;
   std::vector<cuda_container<double>> qc_;
+  std::vector<cuda_container<atom_packet>> packets_;
+  std::vector<cuda_container<atom_packet>> sorted_packets_;
+  std::vector<cuda_container<unsigned int>> atom_cell_idx_;
+  std::vector<cuda_container<unsigned int>> atom_cell_sorted_idx_;
 
   std::vector<cuda_container<double>> fx_;
   std::vector<cuda_container<double>> fy_;

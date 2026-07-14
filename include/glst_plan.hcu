@@ -41,8 +41,8 @@ public:
 
   unsigned int ngroup(void) const;
 
-  const std::vector<unsigned int> &grp_r_in(void) const;
-  const std::vector<unsigned int> &grp_r_out(void) const;
+  const std::vector<cuda_container<unsigned int>> &grp_r_in(void) const;
+  const std::vector<cuda_container<unsigned int>> &grp_r_out(void) const;
   const std::vector<unsigned int> &ncell_alpha_group(void) const;
   const std::vector<double> &rmax(void) const;
   const std::vector<double> &alpha(void) const;
@@ -107,8 +107,8 @@ private:
   double cell_dim_z_;
 
   unsigned int ngroup_;
-  std::vector<unsigned int> grp_r_in_;
-  std::vector<unsigned int> grp_r_out_;
+  std::vector<cuda_container<unsigned int>> grp_r_in_;
+  std::vector<cuda_container<unsigned int>> grp_r_out_;
   std::vector<unsigned int> ncell_alpha_group_;
   std::vector<double> rmax_;
   std::vector<double> alpha_;

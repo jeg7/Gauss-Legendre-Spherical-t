@@ -118,15 +118,13 @@ int main(int argc, char **argv) {
   cuda_container<double> fx_glst(natom), fy_glst(natom), fz_glst(natom),
       en_glst(natom);
 
-  // typedef float real_type;
-  typedef double real_type;
-  std::unique_ptr<glst_force<real_type>> glst = nullptr;
+  std::unique_ptr<glst_force> glst = nullptr;
   if (argc == 5)
-    glst = std::make_unique<glst_force<real_type>>(natom, tol, box_dim_x,
-                                                   box_dim_y, box_dim_z, rcut);
+    glst = std::make_unique<glst_force>(natom, tol, box_dim_x, box_dim_y,
+                                        box_dim_z, rcut);
   else if (argc == 7)
-    glst = std::make_unique<glst_force<real_type>>(
-        natom, tol, box_dim_x, box_dim_y, box_dim_z, ncell_x, ncell_y, ncell_z);
+    glst = std::make_unique<glst_force>(natom, tol, box_dim_x, box_dim_y,
+                                        box_dim_z, ncell_x, ncell_y, ncell_z);
 
   std::cout << std::endl;
 

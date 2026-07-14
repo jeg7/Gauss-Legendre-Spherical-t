@@ -223,11 +223,10 @@ void run_plan_workspace_checks(const setup_case &test_case) {
 }
 
 void run_force_setup_smoke(const setup_case &test_case) {
-  glst_force<double> force(test_case.natom, test_case.tol, test_case.box_dim_x,
-                           test_case.box_dim_y, test_case.box_dim_z,
-                           test_case.rcut);
+  glst_force force(test_case.natom, test_case.tol, test_case.box_dim_x,
+                   test_case.box_dim_y, test_case.box_dim_z, test_case.rcut);
 
-  std::cout << "PASS glst_force<double> setup: " << test_case.name << std::endl;
+  std::cout << "PASS glst_force setup: " << test_case.name << std::endl;
 
   return;
 }

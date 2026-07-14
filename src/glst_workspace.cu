@@ -27,9 +27,11 @@ inline static std::size_t checked_mul(const std::size_t a, const std::size_t b,
 
 glst_workspace::glst_workspace(void)
     : atom_capacity_(0), cell_capacity_(0), tile_node_capacity_(0),
-      tile_buffer_capacity_(0), rx_(), ry_(), rz_(), qc_(), fx_(), fy_(), fz_(),
-      en_(), cell_atom_point_(), cell_atom_count_(), max_atoms_cell_(),
-      sf_re_(), sf_im_(), rmt_sum_re_(), rmt_sum_im_() {}
+      tile_buffer_capacity_(0), idx_(), sorted_idx_(), rx_(), ry_(), rz_(),
+      qc_(), packets_(), sorted_packets_(), atom_cell_idx_(),
+      atom_cell_sorted_idx_(), fx_(), fy_(), fz_(), en_(), cell_atom_point_(),
+      cell_atom_count_(), max_atoms_cell_(), sf_re_(), sf_im_(), rmt_sum_re_(),
+      rmt_sum_im_() {}
 
 glst_workspace::glst_workspace(const glst_plan &plan) : glst_workspace() {
   this->init(plan);
@@ -53,6 +55,16 @@ std::size_t glst_workspace::tile_buffer_capacity(void) const {
   return this->tile_buffer_capacity_;
 }
 
+const std::vector<cuda_container<unsigned int>> &
+glst_workspace::idx(void) const {
+  return this->idx_;
+}
+
+const std::vector<cuda_container<unsigned int>> &
+glst_workspace::sorted_idx(void) const {
+  return this->sorted_idx_;
+}
+
 const std::vector<cuda_container<double>> &glst_workspace::rx(void) const {
   return this->rx_;
 }
@@ -67,6 +79,26 @@ const std::vector<cuda_container<double>> &glst_workspace::rz(void) const {
 
 const std::vector<cuda_container<double>> &glst_workspace::qc(void) const {
   return this->qc_;
+}
+
+const std::vector<cuda_container<atom_packet>> &
+glst_workspace::packets(void) const {
+  return this->packets_;
+}
+
+const std::vector<cuda_container<atom_packet>> &
+glst_workspace::sorted_packets(void) const {
+  return this->sorted_packets_;
+}
+
+const std::vector<cuda_container<unsigned int>> &
+glst_workspace::atom_cell_idx(void) const {
+  return this->atom_cell_idx_;
+}
+
+const std::vector<cuda_container<unsigned int>> &
+glst_workspace::atom_cell_sorted_idx(void) const {
+  return this->atom_cell_sorted_idx_;
 }
 
 const std::vector<cuda_container<double>> &glst_workspace::fx(void) const {
@@ -118,6 +150,14 @@ glst_workspace::rmt_sum_im(void) const {
   return this->rmt_sum_im_;
 }
 
+std::vector<cuda_container<unsigned int>> &glst_workspace::idx(void) {
+  return this->idx_;
+}
+
+std::vector<cuda_container<unsigned int>> &glst_workspace::sorted_idx(void) {
+  return this->sorted_idx_;
+}
+
 std::vector<cuda_container<double>> &glst_workspace::rx(void) {
   return this->rx_;
 }
@@ -132,6 +172,23 @@ std::vector<cuda_container<double>> &glst_workspace::rz(void) {
 
 std::vector<cuda_container<double>> &glst_workspace::qc(void) {
   return this->qc_;
+}
+
+std::vector<cuda_container<atom_packet>> &glst_workspace::packets(void) {
+  return this->packets_;
+}
+
+std::vector<cuda_container<atom_packet>> &glst_workspace::sorted_packets(void) {
+  return this->sorted_packets_;
+}
+
+std::vector<cuda_container<unsigned int>> &glst_workspace::atom_cell_idx(void) {
+  return this->atom_cell_idx_;
+}
+
+std::vector<cuda_container<unsigned int>> &
+glst_workspace::atom_cell_sorted_idx(void) {
+  return this->atom_cell_sorted_idx_;
 }
 
 std::vector<cuda_container<double>> &glst_workspace::fx(void) {
@@ -209,10 +266,16 @@ void glst_workspace::init(const glst_plan &plan) {
   this->tile_buffer_capacity_ = tile_buffer_nodes;
 
   // JEG260714: Use vector-of-one storage for the initial single-GPU tiled path
+  this->idx_.resize(1);
+  this->sorted_idx_.resize(1);
   this->rx_.resize(1);
   this->ry_.resize(1);
   this->rz_.resize(1);
   this->qc_.resize(1);
+  this->packets_.resize(1);
+  this->sorted_packets_.resize(1);
+  this->atom_cell_idx_.resize(1);
+  this->atom_cell_sorted_idx_.resize(1);
 
   this->fx_.resize(1);
   this->fy_.resize(1);
@@ -228,10 +291,16 @@ void glst_workspace::init(const glst_plan &plan) {
   this->rmt_sum_re_.resize(1);
   this->rmt_sum_im_.resize(1);
 
+  this->idx_[0].resize(this->atom_capacity_);
+  this->sorted_idx_[0].resize(this->atom_capacity_);
   this->rx_[0].resize(this->atom_capacity_);
   this->ry_[0].resize(this->atom_capacity_);
   this->rz_[0].resize(this->atom_capacity_);
   this->qc_[0].resize(this->atom_capacity_);
+  this->packets_[0].resize(this->atom_capacity_);
+  this->sorted_packets_[0].resize(this->atom_capacity_);
+  this->atom_cell_idx_[0].resize(this->atom_capacity_);
+  this->atom_cell_sorted_idx_[0].resize(this->atom_capacity_);
 
   this->fx_[0].resize(this->atom_capacity_);
   this->fy_[0].resize(this->atom_capacity_);
@@ -256,10 +325,16 @@ void glst_workspace::clear(void) {
   this->tile_node_capacity_ = 0;
   this->tile_buffer_capacity_ = 0;
 
+  this->idx_.clear();
+  this->sorted_idx_.clear();
   this->rx_.clear();
   this->ry_.clear();
   this->rz_.clear();
   this->qc_.clear();
+  this->packets_.clear();
+  this->sorted_packets_.clear();
+  this->atom_cell_idx_.clear();
+  this->atom_cell_sorted_idx_.clear();
 
   this->fx_.clear();
   this->fy_.clear();

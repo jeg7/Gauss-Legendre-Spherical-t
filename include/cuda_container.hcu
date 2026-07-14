@@ -84,7 +84,6 @@ template class cuda_container<double>;
 template class cuda_container<double2>;
 template class cuda_container<double3>;
 template class cuda_container<double4>;
-template class cuda_container<atom_packet<float>>;
-template class cuda_container<atom_packet<double>>;
+template class cuda_container<atom_packet>;
 
 #endif
