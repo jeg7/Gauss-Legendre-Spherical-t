@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
 #include <iostream>
 #include <limits>
 #include <numeric>
@@ -425,8 +426,22 @@ void glst_plan::init_tile_schedule(const unsigned int max_tile_nodes) {
 }
 
 void glst_plan::print_tile_diagnostics(std::ostream &os) const {
+  const std::size_t tile_buffer_count =
+      static_cast<std::size_t>(this->ncell_) *
+      static_cast<std::size_t>(this->max_tile_nodes_);
+
+  // Initial tiled workspace stores four tile-sized double buffers: sf_re,
+  // sf_im, rmt_sum_re, rmt_sum_im
+  const std::size_t tile_buffer_bytes =
+      static_cast<std::size_t>(4) * tile_buffer_count * sizeof(double);
+
+  const double tile_buffer_mib =
+      static_cast<double>(tile_buffer_bytes) / (1024.0 * 1024.0);
+
   os << "              Number of GLST tiles: " << tile_count_ << '\n';
   os << "   Maximum cubature nodes per tile: " << max_tile_nodes_ << '\n';
+  os << "       Tile-buffer memory estimate: " << tile_buffer_mib << " MiB ("
+     << tile_buffer_bytes << " bytes)" << '\n';
   for (unsigned int group = 0; group < this->ngroup_; group++) {
     os << "      Number of tiles in group " << group << ": "
        << tiles_in_group(group) << '\n';

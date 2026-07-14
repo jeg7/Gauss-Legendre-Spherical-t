@@ -256,8 +256,6 @@ void glst_force<CT>::init(const unsigned int natom, const double tol,
             << static_cast<CT>(this->ncell_z_) * this->cell_dim_z_ << std::endl;
   std::cout << "           Number of GPUs: " << this->cuda_count_ << std::endl;
 
-  this->plan_->print_tile_diagnostics(std::cout);
-
   this->ngroup_ = this->plan_->ngroup();
 
   this->grp_r_in_.resize(this->cuda_count_);
@@ -276,6 +274,9 @@ void glst_force<CT>::init(const unsigned int natom, const double tol,
     std::cout << "  Number of cubature nodes in group " << grp << ": "
               << this->plan_->num_nodes()[0][grp] << std::endl;
   }
+  std::cout << std::endl;
+
+  this->plan_->print_tile_diagnostics(std::cout);
 
   { // Distribute cubature nodes across devices
     const unsigned int size = this->plan_->tot_num_nodes() /
