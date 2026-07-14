@@ -66,6 +66,7 @@ private:
   void calc_sf_tile(const unsigned int tile);
   void sum_rmt_sf_tile(const unsigned int tile);
   void calc_lr_ef_tile(const unsigned int tile);
+  void zero_ef(void);
 
 private:
   void allocate(void);

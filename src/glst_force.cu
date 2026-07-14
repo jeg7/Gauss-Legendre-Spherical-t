@@ -582,25 +582,7 @@ template <typename CT> void glst_force<CT>::calc_lr_ef(void) {
         "FATAL ERROR: glst_force<CT>::calc_lr_ef: Plan is not initialized");
   }
 
-  for (int dev = 0; dev < this->cuda_count_; dev++) {
-    cudaCheck(cudaSetDevice(dev));
-
-    const std::size_t nbytes =
-        static_cast<std::size_t>(this->natom_) * sizeof(double);
-
-    cudaCheck(
-        cudaMemsetAsync(static_cast<void *>(this->fx_[dev].d_array().data()), 0,
-                        nbytes, this->comp_streams_[dev]));
-    cudaCheck(
-        cudaMemsetAsync(static_cast<void *>(this->fy_[dev].d_array().data()), 0,
-                        nbytes, this->comp_streams_[dev]));
-    cudaCheck(
-        cudaMemsetAsync(static_cast<void *>(this->fz_[dev].d_array().data()), 0,
-                        nbytes, this->comp_streams_[dev]));
-    cudaCheck(
-        cudaMemsetAsync(static_cast<void *>(this->en_[dev].d_array().data()), 0,
-                        nbytes, this->comp_streams_[dev]));
-  }
+  this->zero_ef();
 
   for (unsigned int tile = 0; tile < this->plan_->tile_count(); tile++) {
     this->calc_sf_tile(tile);
@@ -1054,12 +1036,23 @@ template <typename CT> void glst_force<CT>::comm_ef(void) {
 template <typename CT>
 void glst_force<CT>::calc_ener_force(const double *d_rx, const double *d_ry,
                                      const double *d_rz, const double *d_qc) {
+  if (this->plan_ == nullptr) {
+    throw std::runtime_error("FATAL ERROR: glst_force<CT>::calc_ener_force: "
+                             "Plan is not initialized");
+  }
+
   this->assign_atoms(d_rx, d_ry, d_rz, d_qc);
-  this->calc_sf();
-  this->sum_rmt_sf();
-  this->calc_lr_ef();
+  this->zero_ef();
+
+  for (unsigned int tile = 0; tile < this->plan_->tile_count(); tile++) {
+    this->calc_sf_tile(tile);
+    this->sum_rmt_sf_tile(tile);
+    this->calc_lr_ef_tile(tile);
+  }
+
   this->calc_sr_ef();
   this->comm_ef();
+
   return;
 }
 
@@ -1776,6 +1769,30 @@ void glst_force<CT>::calc_lr_ef_tile(const unsigned int tile) {
             this->rmt_sum_re_[dev].d_array().data(),
             this->rmt_sum_im_[dev].d_array().data(), nc, this->ncell_);
     cudaCheck(cudaGetLastError());
+  }
+
+  return;
+}
+
+template <typename CT> void glst_force<CT>::zero_ef(void) {
+  for (int dev = 0; dev < this->cuda_count_; dev++) {
+    cudaCheck(cudaSetDevice(dev));
+
+    const std::size_t nbytes =
+        static_cast<std::size_t>(this->natom_) * sizeof(double);
+
+    cudaCheck(
+        cudaMemsetAsync(static_cast<void *>(this->fx_[dev].d_array().data()), 0,
+                        nbytes, this->comp_streams_[dev]));
+    cudaCheck(
+        cudaMemsetAsync(static_cast<void *>(this->fy_[dev].d_array().data()), 0,
+                        nbytes, this->comp_streams_[dev]));
+    cudaCheck(
+        cudaMemsetAsync(static_cast<void *>(this->fz_[dev].d_array().data()), 0,
+                        nbytes, this->comp_streams_[dev]));
+    cudaCheck(
+        cudaMemsetAsync(static_cast<void *>(this->en_[dev].d_array().data()), 0,
+                        nbytes, this->comp_streams_[dev]));
   }
 
   return;
