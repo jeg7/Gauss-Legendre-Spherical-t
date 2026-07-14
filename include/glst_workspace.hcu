@@ -6,17 +6,100 @@
 //
 // Author: James E. Gonzales II
 //
-// ENDLICENS
+// ENDLICENSE
 
 #ifndef __GLST_GLST_WORKSPACE__
 #define __GLST_GLST_WORKSPACE__
 
-// CT = Calculation Type
+#include "cuda_container.hcu"
+#include "glst_plan.hcu"
 
-template <typename CT> class glst_workspace {
+#include <cstddef>
+#include <memory>
+#include <vector>
+
+class glst_workspace {
 public:
   glst_workspace(void);
+  glst_workspace(const glst_plan &plan);
   ~glst_workspace(void);
+
+public:
+  std::size_t atom_capacity(void) const;
+  std::size_t cell_capacity(void) const;
+  std::size_t tile_node_capacity(void) const;
+  std::size_t tile_buffer_capacity(void) const;
+
+  const std::vector<cuda_container<double>> &rx(void) const;
+  const std::vector<cuda_container<double>> &ry(void) const;
+  const std::vector<cuda_container<double>> &rz(void) const;
+  const std::vector<cuda_container<double>> &qc(void) const;
+
+  const std::vector<cuda_container<double>> &fx(void) const;
+  const std::vector<cuda_container<double>> &fy(void) const;
+  const std::vector<cuda_container<double>> &fz(void) const;
+  const std::vector<cuda_container<double>> &en(void) const;
+
+  const std::vector<cuda_container<unsigned int>> &cell_atom_point(void) const;
+  const std::vector<cuda_container<unsigned int>> &cell_atom_count(void) const;
+  const std::vector<cuda_container<unsigned int>> &max_atoms_cell(void) const;
+
+  const std::vector<cuda_container<double>> &sf_re(void) const;
+  const std::vector<cuda_container<double>> &sf_im(void) const;
+  const std::vector<cuda_container<double>> &rmt_sum_re(void) const;
+  const std::vector<cuda_container<double>> &rmt_sum_im(void) const;
+
+  std::vector<cuda_container<double>> &rx(void);
+  std::vector<cuda_container<double>> &ry(void);
+  std::vector<cuda_container<double>> &rz(void);
+  std::vector<cuda_container<double>> &qc(void);
+
+  std::vector<cuda_container<double>> &fx(void);
+  std::vector<cuda_container<double>> &fy(void);
+  std::vector<cuda_container<double>> &fz(void);
+  std::vector<cuda_container<double>> &en(void);
+
+  std::vector<cuda_container<unsigned int>> &cell_atom_point(void);
+  std::vector<cuda_container<unsigned int>> &cell_atom_count(void);
+  std::vector<cuda_container<unsigned int>> &max_atoms_cell(void);
+
+  std::vector<cuda_container<double>> &sf_re(void);
+  std::vector<cuda_container<double>> &sf_im(void);
+  std::vector<cuda_container<double>> &rmt_sum_re(void);
+  std::vector<cuda_container<double>> &rmt_sum_im(void);
+
+public:
+  void init(const glst_plan &plan);
+  void clear(void);
+
+private:
+  std::size_t atom_capacity_;
+  std::size_t cell_capacity_;
+  std::size_t tile_node_capacity_;
+  std::size_t tile_buffer_capacity_;
+
+  // Atom arrays: Size atom_capacity_ (natom)
+  std::vector<cuda_container<double>> rx_;
+  std::vector<cuda_container<double>> ry_;
+  std::vector<cuda_container<double>> rz_;
+  std::vector<cuda_container<double>> qc_;
+
+  std::vector<cuda_container<double>> fx_;
+  std::vector<cuda_container<double>> fy_;
+  std::vector<cuda_container<double>> fz_;
+  std::vector<cuda_container<double>> en_;
+
+  // Cell arrays: Size cell_capacity_ (ncell)
+  std::vector<cuda_container<unsigned int>> cell_atom_point_;
+  std::vector<cuda_container<unsigned int>> cell_atom_count_;
+  std::vector<cuda_container<unsigned int>> max_atoms_cell_;
+
+  // Tile-sized GLST buffers: Size tile_buffer_capacity_ == (ncell *
+  // max_tile_nodes)
+  std::vector<cuda_container<double>> sf_re_;
+  std::vector<cuda_container<double>> sf_im_;
+  std::vector<cuda_container<double>> rmt_sum_re_;
+  std::vector<cuda_container<double>> rmt_sum_im_;
 };
 
 #endif

@@ -28,12 +28,12 @@ glst_force<CT>::glst_force(void)
       atom_cell_sorted_idx_(), ncell_x_(0), ncell_y_(0), ncell_z_(0), ncell_(0),
       cell_dim_x_(static_cast<CT>(0.0)), cell_dim_y_(static_cast<CT>(0.0)),
       cell_dim_z_(static_cast<CT>(0.0)), ngroup_(0), grp_r_in_(), grp_r_out_(),
-      plan_(nullptr), dev_cub_counts_(), dev_cub_points_(), cell_atom_point_(),
-      cell_atom_count_(), max_atoms_cell_(), sf_re_(), sf_im_(), rmt_sum_re_(),
-      rmt_sum_im_(), cub_work_buffer_(), cub_work_buffer_size_(),
-      cuda_count_(-1), cell_dev_idx_(), dev_cell_idx_(), comp_streams_(),
-      comm_streams_(), comp_events_(), comm_events_(), nccl_devs_(),
-      nccl_comms_() {
+      plan_(nullptr), workspace_(nullptr), dev_cub_counts_(), dev_cub_points_(),
+      cell_atom_point_(), cell_atom_count_(), max_atoms_cell_(), sf_re_(),
+      sf_im_(), rmt_sum_re_(), rmt_sum_im_(), cub_work_buffer_(),
+      cub_work_buffer_size_(), cuda_count_(-1), cell_dev_idx_(),
+      dev_cell_idx_(), comp_streams_(), comm_streams_(), comp_events_(),
+      comm_events_(), nccl_devs_(), nccl_comms_() {
   // Ensure that CT is of a correct type
   static_assert(std::is_floating_point_v<CT>,
                 "CT must be a floating-point type (float or double)");
@@ -224,6 +224,10 @@ void glst_force<CT>::init(const unsigned int natom, const double tol,
   this->plan_->init_alpha_groups(tol);
   this->plan_->init_cubature(tol);
   this->plan_->init_tile_schedule();
+
+  cudaCheck(
+      cudaSetDevice(0)); // JEG260714: Tiled workspace is allocated on device 0
+  this->workspace_ = std::make_unique<glst_workspace>(*(this->plan_));
 
   this->natom_ = this->plan_->natom();
 
