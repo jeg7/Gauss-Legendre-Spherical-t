@@ -10,7 +10,6 @@
 
 #include "glst_force.hcu"
 
-#include "cell_decomp.hpp"
 #include "cuda_utils.hcu"
 #include "device_comm.hcu"
 #include "reduce.hcu"
@@ -29,10 +28,11 @@ glst_force::glst_force(void)
     : plan_(nullptr), workspace_(nullptr),
       execution_mode_(GLST_EXECUTION_MODE::SINGLE_GPU_TILED),
       cell_partition_count_(1), tile_partition_count_(1), dev_cell_partition_(),
-      dev_tile_partition_(), cuda_count_(-1), cell_dev_idx_(), dev_cell_idx_(),
-      comp_streams_(), comm_streams_(), comp_events_(), comm_events_(),
-      nccl_devs_(), nccl_comms_(), gpu_layout_user_set_(false),
-      cuda_initialized_(false) {}
+      dev_tile_partition_(), cuda_count_(-1), cell_partition_idx_(),
+      cell_partition_x_point_(), cell_partition_x_count_(),
+      partition_cell_idx_(), dev_cell_idx_(), comp_streams_(), comm_streams_(),
+      comp_events_(), comm_events_(), nccl_devs_(), nccl_comms_(),
+      gpu_layout_user_set_(false), cuda_initialized_(false) {}
 
 glst_force::glst_force(const unsigned int natom, const double tol,
                        const double box_dim_x, const double box_dim_y,
@@ -168,8 +168,6 @@ void glst_force::init(const unsigned int natom, const double tol,
     this->workspace_->idx()[dev].transfer_to_device();
   }
 
-  this->cells2dev();
-
   // Layout validation
   if (this->cell_partition_count_ == 0) {
     throw std::runtime_error(
@@ -206,6 +204,8 @@ void glst_force::init(const unsigned int natom, const double tol,
                                "partition is out of range");
     }
   }
+
+  this->cells2dev();
 
   std::cout << std::endl;
   std::cout << "          Number of atoms: " << this->plan_->natom()
@@ -254,7 +254,16 @@ void glst_force::init(const unsigned int natom, const double tol,
   for (int dev = 0; dev < this->cuda_count_; dev++) {
     std::cout << "                GPU " << dev << " -> cell partition "
               << this->dev_cell_partition_[dev] << ", tile partition "
-              << this->dev_tile_partition_[dev] << std::endl;
+              << this->dev_tile_partition_[dev] << ", owned cells "
+              << this->dev_cell_idx_[dev].size() << std::endl;
+  }
+  std::cout << " Cell partition x-ranges: " << std::endl;
+  for (unsigned int part = 0; part < this->cell_partition_count_; part++) {
+    const unsigned int x_point = this->cell_partition_x_point_[part];
+    const unsigned int x_count = this->cell_partition_x_count_[part];
+    std::cout << "        cell partition " << part << ": x[" << x_point << ", "
+              << x_point + x_count << "), cells "
+              << this->partition_cell_idx_[part].size() << std::endl;
   }
 
   std::cout << std::endl;
@@ -792,13 +801,17 @@ void glst_force::calc_sr_ef(void) {
   for (int dev = 0; dev < this->cuda_count_; dev++) {
     cudaCheck(cudaSetDevice(dev));
 
+    const unsigned int owned_cell_count =
+        static_cast<unsigned int>(this->dev_cell_idx_[dev].size());
+
+    if (owned_cell_count == 0)
+      continue;
+
     constexpr dim3 num_threads(64, 1, 1);
     const dim3 num_blocks(
         (this->workspace_->max_atoms_cell()[dev] + num_threads.x - 1) /
             num_threads.x,
-        std::min(65535u,
-                 static_cast<unsigned int>(this->dev_cell_idx_[dev].size())),
-        1);
+        std::min(65535u, owned_cell_count), 1);
 
     calc_sr_ef_intra_kernel<num_threads.x>
         <<<num_blocks, num_threads, 0, this->comp_streams_[dev]>>>(
@@ -1731,88 +1744,96 @@ void glst_force::init_gpu_layout(const int device_count) {
 }
 
 void glst_force::cells2dev(void) {
+  const unsigned int ncell_x = this->plan_->ncell_x();
+  const unsigned int ncell_y = this->plan_->ncell_y();
+  const unsigned int ncell_z = this->plan_->ncell_z();
   const unsigned int ncell = this->plan_->ncell();
 
-  if (this->execution_mode_ == GLST_EXECUTION_MODE::SINGLE_GPU_TILED) {
-    this->cell_dev_idx_.assign(ncell, 0);
-
-    this->dev_cell_idx_.resize(1);
-    cudaCheck(cudaSetDevice(0));
-
-    std::vector<unsigned int> cells(ncell);
-    for (unsigned int cell = 0; cell < ncell; cell++)
-      cells[cell] = cell;
-
-    this->dev_cell_idx_[0] = cells;
-
-    return;
+  if ((ncell_x == 0) || (ncell_y == 0) || (ncell_z == 0)) {
+    throw std::runtime_error(
+        "FATAL ERROR: glst_force::cells2dev: Cell dimensions are invalid");
   }
 
-  /* */
-  { // Assign each cell to a CUDA device
-    this->cell_dev_idx_.resize(ncell);
-    int dev = 0;
-    for (unsigned int cell = 0; cell < ncell; cell++) {
-      if (dev >= this->cuda_count_)
-        dev = 0;
-      this->cell_dev_idx_[cell] = dev++;
-    }
+  if (this->cell_partition_count_ == 0) {
+    throw std::runtime_error(
+        "FATAL ERROR: glst_force::cells2dev: cell_partition_count_ == 0");
   }
 
-  { // Store a list of the cells each device is responsible for
-    this->dev_cell_idx_.resize(this->cuda_count_);
-    for (int dev = 0; dev < this->cuda_count_; dev++) {
-      cudaCheck(cudaSetDevice(dev));
-      std::vector<unsigned int> tmp;
-      for (unsigned int cell = 0; cell < ncell; cell++) {
-        if (this->cell_dev_idx_[cell] == dev)
-          tmp.push_back(cell);
-      }
-      this->dev_cell_idx_[dev] = tmp;
-    }
+  if (this->dev_cell_partition_.size() !=
+      static_cast<std::size_t>(this->cuda_count_)) {
+    throw std::runtime_error("FATAL ERROR: glst_force::cells2dev: "
+                             "dev_cell_partition size does not match");
   }
-  /* */
 
-  /* *
-  { // Assign each cell to a CUDA device
-    // Each device owns a continguous range of x-cell indices
-    this->cell_dev_idx_.resize(this->ncell_);
-    const unsigned int nx = this->ncell_x_ / this->cuda_count_;
-    const unsigned int rem = this->ncell_x_ % this->cuda_count_;
-    std::vector<unsigned int> xpoint(this->cuda_count_, 0);
-    std::vector<unsigned int> xcount(this->cuda_count_, 0);
-    for (int dev = 0; dev < this->cuda_count_; dev++) {
-      if (dev > 0)
-        xpoint[dev] = xpoint[dev - 1] + xcount[dev - 1];
-      xcount[dev] = (dev < static_cast<int>(rem)) ? nx + 1 : nx;
-    }
-    for (int dev = 0; dev < this->cuda_count_; dev++) {
-      for (unsigned int x0 = 0; x0 < xcount[dev]; x0++) {
-        const unsigned int x = xpoint[dev] + x0;
-        for (unsigned int y = 0; y < this->ncell_y_; y++) {
-          for (unsigned int z = 0; z < this->ncell_z_; z++) {
-            const unsigned int cell =
-                (x * this->ncell_y_ + y) * this->ncell_z_ + z;
-            this->cell_dev_idx_[cell] = dev;
+  this->cell_partition_idx_.assign(ncell, 0);
+  this->cell_partition_x_point_.assign(this->cell_partition_count_, 0);
+  this->cell_partition_x_count_.assign(this->cell_partition_count_, 0);
+
+  this->partition_cell_idx_.clear();
+  this->partition_cell_idx_.resize(this->cell_partition_count_);
+
+  std::vector<unsigned int> cell_visit_count(ncell, 0);
+
+  const unsigned int base_x_count = ncell_x / this->cell_partition_count_;
+  const unsigned int rem_x_count = ncell_x % this->cell_partition_count_;
+
+  for (unsigned int part = 0; part < this->cell_partition_count_; part++) {
+    const unsigned int x_count =
+        base_x_count + ((part < rem_x_count) ? 1u : 0u);
+    const unsigned int x_point =
+        part * base_x_count + ((part < rem_x_count) ? part : rem_x_count);
+
+    this->cell_partition_x_point_[part] = x_point;
+    this->cell_partition_x_count_[part] = x_count;
+
+    std::vector<unsigned int> &cells = this->partition_cell_idx_[part];
+
+    const std::size_t reserve_count = static_cast<std::size_t>(x_count) *
+                                      static_cast<std::size_t>(ncell_y) *
+                                      static_cast<std::size_t>(ncell_z);
+    cells.reserve(reserve_count);
+
+    for (unsigned int x0 = 0; x0 < x_count; x0++) {
+      const unsigned int x = x_point + x0;
+
+      for (unsigned int y = 0; y < ncell_y; y++) {
+        for (unsigned int z = 0; z < ncell_z; z++) {
+          const unsigned int cell = (x * ncell_y + y) * ncell_z + z;
+
+          if (cell >= ncell) {
+            throw std::runtime_error("FATAL ERROR: glst_force::cells2dev: "
+                                     "Computed cell index is out of range");
           }
+
+          this->cell_partition_idx_[cell] = part;
+          cell_visit_count[cell]++;
+          cells.push_back(cell);
         }
       }
     }
   }
 
-  { // Store a list of the cells each device is responsible for
-    this->dev_cell_idx_.resize(this->cuda_count_);
-    for (int dev = 0; dev < this->cuda_count_; dev++) {
-      cudaCheck(cudaSetDevice(dev));
-      std::vector<unsigned int> tmp;
-      for (unsigned int cell = 0; cell < this->ncell_; cell++) {
-        if (this->cell_dev_idx_[cell] == dev)
-          tmp.push_back(cell);
-      }
-      this->dev_cell_idx_[dev] = tmp;
+  for (unsigned int cell = 0; cell < ncell; cell++) {
+    if (cell_visit_count[cell] != 1) {
+      throw std::runtime_error(
+          "FATAL ERROR: glst_force::cells2dev: Every global cell must be "
+          "assigned to exactly one cell partition");
     }
   }
-  * */
+
+  this->dev_cell_idx_.resize(this->cuda_count_);
+
+  for (int dev = 0; dev < this->cuda_count_; dev++) {
+    const unsigned int partition = this->dev_cell_partition_[dev];
+
+    if (partition >= this->cell_partition_count_) {
+      throw std::runtime_error("FATAL ERROR: glst_force::cells2dev: Device "
+                               "cell partition is out of range");
+    }
+
+    cudaCheck(cudaSetDevice(dev));
+    this->dev_cell_idx_[dev] = this->partition_cell_idx_[partition];
+  }
 
   return;
 }

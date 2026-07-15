@@ -95,7 +95,10 @@ private:
   std::vector<unsigned int> dev_tile_partition_;
 
   int cuda_count_;
-  std::vector<int> cell_dev_idx_;
+  std::vector<unsigned int> cell_partition_idx_;
+  std::vector<unsigned int> cell_partition_x_point_;
+  std::vector<unsigned int> cell_partition_x_count_;
+  std::vector<std::vector<unsigned int>> partition_cell_idx_;
   std::vector<cuda_container<unsigned int>> dev_cell_idx_;
   std::vector<cudaStream_t> comp_streams_;
   std::vector<cudaStream_t> comm_streams_;
