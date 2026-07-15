@@ -32,6 +32,7 @@ glst_force::glst_force(void)
       cell_partition_x_point_(), cell_partition_x_count_(),
       partition_cell_idx_(), dev_cell_idx_(), comp_streams_(), comm_streams_(),
       comp_events_(), comm_events_(), nccl_devs_(), nccl_comms_(),
+      cell_comm_devs_(), tile_comm_devs_(), cell_comms_(), tile_comms_(),
       gpu_layout_user_set_(false), cuda_initialized_(false) {}
 
 glst_force::glst_force(const unsigned int natom, const double tol,
@@ -267,6 +268,8 @@ void glst_force::init(const unsigned int natom, const double tol,
               << this->partition_cell_idx_[part].size() << std::endl;
   }
 
+  this->print_nccl_topology(std::cout);
+
   std::cout << std::endl;
   std::cout << "  Number of alpha groups: " << this->plan_->ngroup()
             << std::endl;
@@ -281,7 +284,7 @@ void glst_force::init(const unsigned int natom, const double tol,
 
   this->plan_->print_tile_diagnostics(std::cout);
 
-  if (this->execution_mode_ != GLST_EXECUTION_MODE::SINGLE_GPU_TILED) {
+  if (!this->nccl_comms_.empty()) {
     // Call NCCL collective once to avoid initialization penalty
     nccl_all_reduce_sum_ip(this->workspace_->fx(), this->plan_->natom(),
                            this->nccl_comms_, this->comm_streams_,
@@ -1531,13 +1534,8 @@ void glst_force::deallocate(void) {
   if (!this->cuda_initialized_)
     return;
 
-  if (this->execution_mode_ != GLST_EXECUTION_MODE::SINGLE_GPU_TILED) {
-    // Finalize NCCL
-    for (int dev = 0; dev < this->cuda_count_; dev++) {
-      cudaCheck(cudaSetDevice(dev));
-      ncclCheck(ncclCommDestroy(this->nccl_comms_[dev]));
-    }
-  }
+  if (this->execution_mode_ != GLST_EXECUTION_MODE::SINGLE_GPU_TILED)
+    this->destroy_nccl_topology();
 
   // Destroy CUDA streams and events
   for (int dev = 0; dev < this->cuda_count_; dev++) {
@@ -1566,71 +1564,6 @@ void glst_force::deallocate(void) {
   return;
 }
 
-/*
-void glst_force::init_gpu_layout(const int device_count) {
-  bool cell_env_set = false;
-  bool tile_env_set = false;
-
-  unsigned int cell_partitions =
-      parse_positive_uint_env(cell_env_set, "GLST_CELL_PARTITIONS");
-  unsigned int tile_partitions =
-      parse_positive_uint_env(tile_env_set, "GLST_TILE_PARTITIONS");
-
-  if (cell_env_set != tile_env_set) {
-    throw std::runtime_error(
-        "FATAL ERROR: glst_force::init_gpu_layout: GLST_CELL_PARTITIONS and "
-        "GLST_TILE_PARTITIONS must be set together");
-  }
-
-  if (cell_env_set) {
-    const unsigned long long int product =
-        static_cast<unsigned long long int>(cell_partitions) *
-        static_cast<unsigned long long int>(tile_partitions);
-
-    if (product != static_cast<unsigned long long int>(device_count)) {
-      throw std::runtime_error("FATAL ERROR: glst_force::init_gpu_layout: "
-                               "GLST_CELL_PARTITION * GLST_TILE_PARTITION must "
-                               "equal the visible CUDA device count; observed" +
-                               std::to_string(cell_partitions) + " * " +
-                               std::to_string(tile_partitions) +
-                               " != " + std::to_string(device_count));
-    }
-  } else {
-    if (device_count == 1) {
-      cell_partitions = 1;
-      tile_partitions = 1;
-    } else {
-      cell_partitions = static_cast<unsigned int>(device_count);
-      tile_partitions = 1;
-    }
-  }
-
-  this->cuda_count_ = device_count;
-  this->cell_partition_count_ = cell_partitions;
-  this->tile_partition_count_ = tile_partitions;
-
-  if (this->cuda_count_ == 1)
-    this->execution_mode_ = GLST_EXECUTION_MODE::SINGLE_GPU_TILED;
-  else if (this->tile_partition_count_ == 1)
-    this->execution_mode_ = GLST_EXECUTION_MODE::MULTI_GPU_CELL;
-  else if (this->cell_partition_count_ == 1)
-    this->execution_mode_ = GLST_EXECUTION_MODE::MULTI_GPU_TILE;
-  else
-    this->execution_mode_ = GLST_EXECUTION_MODE::MULTI_GPU_CELL_TILE;
-
-  this->dev_cell_partition_.resize(this->cuda_count_);
-  this->dev_tile_partition_.resize(this->cuda_count_);
-
-  for (int dev = 0; dev < this->cuda_count_; dev++) {
-    const unsigned int udev = static_cast<unsigned int>(dev);
-    this->dev_cell_partition_[dev] = udev / this->tile_partition_count_;
-    this->dev_tile_partition_[dev] = udev % this->tile_partition_count_;
-  }
-
-  return;
-}
-*/
-
 void glst_force::init_cuda_resources(void) {
   if (this->cuda_initialized_)
     return;
@@ -1647,6 +1580,10 @@ void glst_force::init_cuda_resources(void) {
     this->comm_events_.clear();
     this->nccl_devs_.clear();
     this->nccl_comms_.clear();
+    this->cell_comm_devs_.clear();
+    this->tile_comm_devs_.clear();
+    this->cell_comms_.clear();
+    this->tile_comms_.clear();
 
     cudaCheck(cudaSetDevice(0));
     cudaCheck(cudaStreamCreate(&this->comp_streams_[0]));
@@ -1673,16 +1610,181 @@ void glst_force::init_cuda_resources(void) {
                                        cudaEventDisableTiming));
   }
 
-  // Initialize NCCL
+  this->init_nccl_topology();
+
+  this->cuda_initialized_ = true;
+
+  return;
+}
+
+void glst_force::init_nccl_topology(void) {
+  this->nccl_devs_.clear();
+  this->nccl_comms_.clear();
+  this->cell_comm_devs_.clear();
+  this->tile_comm_devs_.clear();
+  this->cell_comms_.clear();
+  this->tile_comms_.clear();
+
+  if (this->execution_mode_ == GLST_EXECUTION_MODE::SINGLE_GPU_TILED)
+    return;
+
   this->nccl_devs_.resize(this->cuda_count_);
   for (int dev = 0; dev < this->cuda_count_; dev++)
     this->nccl_devs_[dev] = dev;
 
-  this->nccl_comms_.resize(this->cuda_count_);
-  ncclCheck(ncclCommInitAll(this->nccl_comms_.data(), this->cuda_count_,
-                            this->nccl_devs_.data()));
+  this->cell_comm_devs_.resize(this->tile_partition_count_);
+  this->cell_comms_.resize(this->tile_partition_count_);
 
-  this->cuda_initialized_ = true;
+  for (unsigned int tile_part = 0; tile_part < this->tile_partition_count_;
+       tile_part++) {
+    std::vector<int> &devs = this->cell_comm_devs_[tile_part];
+    std::vector<ncclComm_t> &comms = this->cell_comms_[tile_part];
+
+    devs.resize(this->cell_partition_count_);
+    comms.resize(this->cell_partition_count_);
+
+    for (unsigned int cell_part = 0; cell_part < this->cell_partition_count_;
+         cell_part++) {
+      const unsigned int udev =
+          cell_part * this->tile_partition_count_ + tile_part;
+
+      if (udev >= static_cast<unsigned int>(this->cuda_count_)) {
+        throw std::runtime_error("FATAL ERROR: glst_force::init_nccl_topology: "
+                                 "Cell communicator device is out of range");
+      }
+
+      if ((this->dev_cell_partition_[udev] != cell_part) ||
+          (this->dev_tile_partition_[udev] != tile_part)) {
+        throw std::runtime_error("FATAL ERROR: glst_force::init_nccl_topology: "
+                                 "Cell communicator layout mismatch");
+      }
+
+      devs[cell_part] = static_cast<int>(udev);
+    }
+
+    ncclCheck(ncclCommInitAll(comms.data(),
+                              static_cast<int>(this->cell_partition_count_),
+                              devs.data()));
+  }
+
+  this->tile_comm_devs_.resize(this->cell_partition_count_);
+  this->tile_comms_.resize(this->cell_partition_count_);
+
+  for (unsigned int cell_part = 0; cell_part < this->cell_partition_count_;
+       cell_part++) {
+    std::vector<int> &devs = this->tile_comm_devs_[cell_part];
+    std::vector<ncclComm_t> &comms = this->tile_comms_[cell_part];
+
+    devs.resize(this->tile_partition_count_);
+    comms.resize(this->tile_partition_count_);
+
+    for (unsigned int tile_part = 0; tile_part < this->tile_partition_count_;
+         tile_part++) {
+      const unsigned int udev =
+          cell_part * this->tile_partition_count_ + tile_part;
+
+      if (udev >= static_cast<unsigned int>(this->cuda_count_)) {
+        throw std::runtime_error("FATAL ERROR: glst_force::init_nccl_topology: "
+                                 "Tile communicator device is out of range");
+      }
+
+      if ((this->dev_cell_partition_[udev] != cell_part) ||
+          (this->dev_tile_partition_[udev] != tile_part)) {
+        throw std::runtime_error("FATAL ERROR: glst_force::init_nccl_topology: "
+                                 "Tile communicator layout mismatch");
+      }
+
+      devs[tile_part] = static_cast<int>(udev);
+    }
+
+    ncclCheck(ncclCommInitAll(comms.data(),
+                              static_cast<int>(this->tile_partition_count_),
+                              devs.data()));
+  }
+
+  // Keep the old global communicator only for the existing MULTI_GPU_CELL
+  // fallback. Do not initialize it for MULTI_GPU_TILE or MULTI_GPU_CELL_TILE.
+  if (this->execution_mode_ == GLST_EXECUTION_MODE::MULTI_GPU_CELL) {
+    this->nccl_comms_.resize(this->cuda_count_);
+    ncclCheck(ncclCommInitAll(this->nccl_comms_.data(), this->cuda_count_,
+                              this->nccl_devs_.data()));
+  }
+
+  return;
+}
+
+void glst_force::destroy_nccl_topology(void) {
+  for (std::size_t tile_part = 0; tile_part < this->cell_comms_.size();
+       tile_part++) {
+    for (std::size_t rank = 0; rank < this->cell_comms_[tile_part].size();
+         rank++) {
+      const int dev = this->cell_comm_devs_[tile_part][rank];
+      cudaCheck(cudaSetDevice(dev));
+      ncclCheck(ncclCommDestroy(this->cell_comms_[tile_part][rank]));
+    }
+  }
+
+  for (std::size_t cell_part = 0; cell_part < this->tile_comms_.size();
+       cell_part++) {
+    for (std::size_t rank = 0; rank < this->tile_comms_[cell_part].size();
+         rank++) {
+      const int dev = this->tile_comm_devs_[cell_part][rank];
+      cudaCheck(cudaSetDevice(dev));
+      ncclCheck(ncclCommDestroy(this->tile_comms_[cell_part][rank]));
+    }
+  }
+
+  for (std::size_t i = 0; i < this->nccl_comms_.size(); i++) {
+    const int dev = this->nccl_devs_[i];
+    cudaCheck(cudaSetDevice(dev));
+    ncclCheck(ncclCommDestroy(this->nccl_comms_[i]));
+  }
+
+  this->cell_comm_devs_.clear();
+  this->tile_comm_devs_.clear();
+  this->cell_comms_.clear();
+  this->tile_comms_.clear();
+  this->nccl_devs_.clear();
+  this->nccl_comms_.clear();
+
+  return;
+}
+
+void glst_force::print_nccl_topology(std::ostream &os) const {
+  if (this->execution_mode_ == GLST_EXECUTION_MODE::SINGLE_GPU_TILED) {
+    os << "           NCCL topology: disabled for single-GPU tiled mode"
+       << std::endl;
+    return;
+  }
+
+  os << "           NCCL cell communicators:" << std::endl;
+  for (std::size_t tile_part = 0; tile_part < this->cell_comm_devs_.size();
+       tile_part++) {
+    os << "               tile partition " << tile_part << ": devices ";
+    for (std::size_t rank = 0; rank < this->cell_comm_devs_[tile_part].size();
+         rank++) {
+      if (rank > 0)
+        os << ", ";
+      os << this->cell_comm_devs_[tile_part][rank];
+    }
+    os << std::endl;
+  }
+
+  os << "           NCCL tile communicators:" << std::endl;
+  for (std::size_t cell_part = 0; cell_part < this->tile_comm_devs_.size();
+       cell_part++) {
+    os << "               cell partition " << cell_part << ": devices ";
+    for (std::size_t rank = 0; rank < this->tile_comm_devs_[cell_part].size();
+         rank++) {
+      if (rank > 0)
+        os << ", ";
+      os << this->tile_comm_devs_[cell_part][rank];
+    }
+    os << std::endl;
+  }
+
+  os << "           NCCL global fallback communicator: "
+     << (this->nccl_comms_.empty() ? "disabled" : "enabled") << std::endl;
 
   return;
 }
@@ -1713,7 +1815,7 @@ void glst_force::init_gpu_layout(const int device_count) {
   if (product != static_cast<unsigned long long int>(device_count)) {
     throw std::runtime_error("FATAL ERROR: glst_force::init_gpu_layout: "
                              "GLST_CELL_PARTITION * GLST_TILE_PARTITION must "
-                             "equal the visible CUDA device count; observed" +
+                             "equal the visible CUDA device count; observed " +
                              std::to_string(cell_partition_count) + " * " +
                              std::to_string(tile_partition_count) +
                              " != " + std::to_string(device_count));

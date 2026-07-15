@@ -373,6 +373,11 @@ int main(void) {
       if (device_count == 4)
         run_force_setup_smoke(test_cases[i], 2u, 2u);
 
+      if (device_count == 8) {
+        run_force_setup_smoke(test_cases[i], 4u, 2u);
+        run_force_setup_smoke(test_cases[i], 2u, 4u);
+      }
+
       run_invalid_layout_check(test_cases[i],
                                static_cast<unsigned int>(device_count + 1), 1u);
 

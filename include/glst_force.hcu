@@ -17,6 +17,7 @@
 
 #include <nccl.h>
 
+#include <iosfwd>
 #include <memory>
 #include <string>
 #include <vector>
@@ -79,6 +80,11 @@ private:
   void deallocate(void);
   // void init_gpu_layout(const int device_count);
   void init_cuda_resources(void);
+
+  void init_nccl_topology(void);
+  void destroy_nccl_topology(void);
+  void print_nccl_topology(std::ostream &os) const;
+
   void init_gpu_layout(const int device_count);
   void cells2dev(void);
 
@@ -104,8 +110,25 @@ private:
   std::vector<cudaStream_t> comm_streams_;
   std::vector<cudaEvent_t> comp_events_;
   std::vector<cudaEvent_t> comm_events_;
+
+  // Old fallback/global communicator. Keep only for legacy MULTI_GPU_CELL
+  // behavior until the runtime is converted to hybrid collectives
   std::vector<int> nccl_devs_;
   std::vector<ncclComm_t> nccl_comms_;
+
+  // Hybrid Cell/Node communicator topology
+  //
+  // cell_comms_[tile_partition][cell_partition]:
+  //    communicator over all cell partitions with the same tile partition.
+  //    rank within the communicator is the cell partition.
+  //
+  // tile_comms_[cell_partition][tile_partition]
+  //    communicator over all tile partitions with the same cell partition.
+  //    rank within the communicator is the tile partition.
+  std::vector<std::vector<int>> cell_comm_devs_;
+  std::vector<std::vector<int>> tile_comm_devs_;
+  std::vector<std::vector<ncclComm_t>> cell_comms_;
+  std::vector<std::vector<ncclComm_t>> tile_comms_;
 
   bool gpu_layout_user_set_;
   bool cuda_initialized_;
