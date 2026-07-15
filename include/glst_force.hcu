@@ -55,6 +55,9 @@ public: // Initialization
   void init(const unsigned int natom, const double tol, const double box_dim_x,
             const double box_dim_y, const double box_dim_z, const double rcut);
 
+  void set_gpu_layout(const unsigned int cell_partition_count,
+                      const unsigned int tile_partition_count);
+
 public: // Energy and force calculation
   void assign_atoms(const double *d_rx, const double *d_ry, const double *d_rz,
                     const double *d_qc);
@@ -74,6 +77,9 @@ private:
 
 private:
   void deallocate(void);
+  // void init_gpu_layout(const int device_count);
+  void init_cuda_resources(void);
+  void init_gpu_layout(const int device_count);
   void cells2dev(void);
 
 private:
@@ -97,6 +103,9 @@ private:
   std::vector<cudaEvent_t> comm_events_;
   std::vector<int> nccl_devs_;
   std::vector<ncclComm_t> nccl_comms_;
+
+  bool gpu_layout_user_set_;
+  bool cuda_initialized_;
 };
 
 #endif

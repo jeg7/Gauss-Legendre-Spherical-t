@@ -139,44 +139,44 @@ int main(int argc, char **argv) {
     glst->assign_atoms(rx.d_array().data(), ry.d_array().data(),
                        rz.d_array().data(), qc.d_array().data());
     for (int dev = 0; dev < cuda_count; dev++) {
-      cudaSetDevice(dev);
-      cudaDeviceSynchronize();
+      cudaCheck(cudaSetDevice(dev));
+      cudaCheck(cudaDeviceSynchronize());
     }
     auto end_assign = std::chrono::high_resolution_clock::now();
     auto start_sf = std::chrono::high_resolution_clock::now();
     glst->calc_sf();
     for (int dev = 0; dev < cuda_count; dev++) {
-      cudaSetDevice(dev);
-      cudaDeviceSynchronize();
+      cudaCheck(cudaSetDevice(dev));
+      cudaCheck(cudaDeviceSynchronize());
     }
     auto end_sf = std::chrono::high_resolution_clock::now();
     auto start_sum = std::chrono::high_resolution_clock::now();
     glst->sum_rmt_sf();
     for (int dev = 0; dev < cuda_count; dev++) {
-      cudaSetDevice(dev);
-      cudaDeviceSynchronize();
+      cudaCheck(cudaSetDevice(dev));
+      cudaCheck(cudaDeviceSynchronize());
     }
     auto end_sum = std::chrono::high_resolution_clock::now();
     auto start_lr = std::chrono::high_resolution_clock::now();
     glst->calc_lr_ef();
     for (int dev = 0; dev < cuda_count; dev++) {
-      cudaSetDevice(dev);
-      cudaDeviceSynchronize();
+      cudaCheck(cudaSetDevice(dev));
+      cudaCheck(cudaDeviceSynchronize());
     }
     auto end_lr = std::chrono::high_resolution_clock::now();
     auto end_glst_lr = std::chrono::high_resolution_clock::now();
     auto start_sr = std::chrono::high_resolution_clock::now();
     glst->calc_sr_ef();
     for (int dev = 0; dev < cuda_count; dev++) {
-      cudaSetDevice(dev);
-      cudaDeviceSynchronize();
+      cudaCheck(cudaSetDevice(dev));
+      cudaCheck(cudaDeviceSynchronize());
     }
     auto end_sr = std::chrono::high_resolution_clock::now();
     auto start_comm = std::chrono::high_resolution_clock::now();
     glst->comm_ef();
     for (int dev = 0; dev < cuda_count; dev++) {
-      cudaSetDevice(dev);
-      cudaDeviceSynchronize();
+      cudaCheck(cudaSetDevice(dev));
+      cudaCheck(cudaDeviceSynchronize());
     }
     auto end_comm = std::chrono::high_resolution_clock::now();
     auto end_glst = std::chrono::high_resolution_clock::now();
@@ -198,7 +198,7 @@ int main(int argc, char **argv) {
     times[7][ITER] = 1000.0 * time_glst.count();
     if (ITER < MAX_ITER - 1) {
       for (int dev = 0; dev < cuda_count; dev++) {
-        cudaSetDevice(dev);
+        cudaCheck(cudaSetDevice(dev));
         glst->fx()[dev].set(0.0);
         glst->fy()[dev].set(0.0);
         glst->fz()[dev].set(0.0);

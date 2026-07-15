@@ -22,6 +22,7 @@
 #include <cuda_runtime_api.h>
 #include <iostream>
 #include <stdexcept>
+#include <string>
 #include <string_view>
 
 glst_force::glst_force(void)
@@ -30,70 +31,8 @@ glst_force::glst_force(void)
       cell_partition_count_(1), tile_partition_count_(1), dev_cell_partition_(),
       dev_tile_partition_(), cuda_count_(-1), cell_dev_idx_(), dev_cell_idx_(),
       comp_streams_(), comm_streams_(), comp_events_(), comm_events_(),
-      nccl_devs_(), nccl_comms_() {
-  int device_count = 0;
-  cudaCheck(cudaGetDeviceCount(&device_count));
-  if (device_count < 1) {
-    throw std::runtime_error(
-        "glst_force::init: Could not find any CUDA capable devices");
-  }
-
-  if (this->execution_mode_ == GLST_EXECUTION_MODE::SINGLE_GPU_TILED) {
-    this->cuda_count_ = 1;
-
-    this->cell_partition_count_ = 1;
-    this->tile_partition_count_ = 1;
-    this->dev_cell_partition_.assign(1, 0);
-    this->dev_tile_partition_.assign(1, 0);
-
-    this->comp_streams_.resize(1);
-    this->comm_streams_.clear();
-    this->comp_events_.clear();
-    this->comm_events_.clear();
-    this->nccl_devs_.clear();
-    this->nccl_comms_.clear();
-
-    cudaCheck(cudaSetDevice(0));
-    cudaCheck(cudaStreamCreate(&this->comp_streams_[0]));
-
-    return;
-  }
-
-  this->cuda_count_ = device_count;
-  enable_p2p(this->cuda_count_);
-
-  this->cell_partition_count_ = static_cast<unsigned int>(this->cuda_count_);
-  this->tile_partition_count_ = 1;
-  this->dev_cell_partition_.resize(this->cuda_count_);
-  this->dev_tile_partition_.resize(this->cuda_count_);
-  for (int dev = 0; dev < this->cuda_count_; dev++) {
-    this->dev_cell_partition_[dev] = static_cast<unsigned int>(dev);
-    this->dev_tile_partition_[dev] = 0;
-  }
-
-  // Initialize streams and events
-  this->comp_streams_.resize(this->cuda_count_);
-  this->comm_streams_.resize(this->cuda_count_);
-  this->comp_events_.resize(this->cuda_count_);
-  this->comm_events_.resize(this->cuda_count_);
-  for (int dev = 0; dev < this->cuda_count_; dev++) {
-    cudaCheck(cudaSetDevice(dev));
-    cudaCheck(cudaStreamCreate(&this->comp_streams_[dev]));
-    cudaCheck(cudaStreamCreate(&this->comm_streams_[dev]));
-    cudaCheck(cudaEventCreateWithFlags(&this->comp_events_[dev],
-                                       cudaEventDisableTiming));
-    cudaCheck(cudaEventCreateWithFlags(&this->comm_events_[dev],
-                                       cudaEventDisableTiming));
-  }
-
-  // Initialize NCCL
-  this->nccl_devs_.resize(this->cuda_count_);
-  for (int dev = 0; dev < this->cuda_count_; dev++)
-    this->nccl_devs_[dev] = dev;
-  this->nccl_comms_.resize(this->cuda_count_);
-  ncclCheck(ncclCommInitAll(this->nccl_comms_.data(), this->cuda_count_,
-                            this->nccl_devs_.data()));
-}
+      nccl_devs_(), nccl_comms_(), gpu_layout_user_set_(false),
+      cuda_initialized_(false) {}
 
 glst_force::glst_force(const unsigned int natom, const double tol,
                        const double box_dim_x, const double box_dim_y,
@@ -117,11 +56,7 @@ glst_force::glst_force(const unsigned int natom, const double tol,
   this->init(natom, tol, box_dim_x, box_dim_y, box_dim_z, rcut);
 }
 
-glst_force::~glst_force(void) {
-  this->deallocate();
-  if (this->execution_mode_ != GLST_EXECUTION_MODE::SINGLE_GPU_TILED)
-    disable_p2p(this->cuda_count_);
-}
+glst_force::~glst_force(void) { this->deallocate(); }
 
 const std::vector<cuda_container<double>> &glst_force::fx(void) const {
   return this->workspace_->fx();
@@ -210,6 +145,8 @@ void glst_force::get_ef(cuda_container<double> &fx, cuda_container<double> &fy,
 void glst_force::init(const unsigned int natom, const double tol,
                       const double box_dim_x, const double box_dim_y,
                       const double box_dim_z, const double rcut) {
+  this->init_cuda_resources();
+
   this->plan_ = std::make_unique<glst_plan>();
   this->plan_->init_cells(natom, box_dim_x, box_dim_y, box_dim_z, rcut);
   this->plan_->init_alpha_groups(tol);
@@ -221,7 +158,8 @@ void glst_force::init(const unsigned int natom, const double tol,
 
   cudaCheck(
       cudaSetDevice(0)); // JEG260714: Tiled workspace is allocated on device 0
-  this->workspace_ = std::make_unique<glst_workspace>(*(this->plan_));
+  this->workspace_ =
+      std::make_unique<glst_workspace>(*(this->plan_), this->cuda_count_);
 
   for (int dev = 0; dev < this->cuda_count_; dev++) {
     cudaCheck(cudaSetDevice(dev));
@@ -345,6 +283,25 @@ void glst_force::init(const unsigned int natom, const double tol,
       cudaCheck(cudaStreamSynchronize(this->comm_streams_[dev]));
     }
   }
+
+  return;
+}
+
+void glst_force::set_gpu_layout(const unsigned int cell_partition_count,
+                                const unsigned int tile_partition_count) {
+  if (this->cuda_initialized_) {
+    throw std::runtime_error("FATAL ERROR: glst_force::set_gpu_layout: GPU "
+                             "layout must be set before init");
+  }
+
+  if ((cell_partition_count == 0) || (tile_partition_count == 0)) {
+    throw std::runtime_error("FATAL ERROR: glst_force::set_gpu_layout: "
+                             "Partition counts must be positive");
+  }
+
+  this->cell_partition_count_ = cell_partition_count;
+  this->tile_partition_count_ = tile_partition_count;
+  this->gpu_layout_user_set_ = true;
 
   return;
 }
@@ -593,14 +550,38 @@ void glst_force::assign_atoms(const double *d_rx, const double *d_ry,
   return;
 }
 
-void glst_force::calc_sf(void) { return; }
+void glst_force::calc_sf(void) {
+  if ((this->execution_mode_ == GLST_EXECUTION_MODE::MULTI_GPU_TILE) ||
+      (this->execution_mode_ == GLST_EXECUTION_MODE::MULTI_GPU_CELL_TILE)) {
+    throw std::runtime_error(
+        "FATAL ERROR: glst_force::calc_sf: Tile-partitioned multi-GPU "
+        "runtime is not implemented yet");
+  }
+  return;
+}
 
-void glst_force::sum_rmt_sf(void) { return; }
+void glst_force::sum_rmt_sf(void) {
+  if ((this->execution_mode_ == GLST_EXECUTION_MODE::MULTI_GPU_TILE) ||
+      (this->execution_mode_ == GLST_EXECUTION_MODE::MULTI_GPU_CELL_TILE)) {
+    throw std::runtime_error(
+        "FATAL ERROR: glst_force::sum_rmt_sf: Tile-partitioned multi-GPU "
+        "runtime is not implemented yet");
+  }
+
+  return;
+}
 
 void glst_force::calc_lr_ef(void) {
   if (this->plan_ == nullptr) {
     throw std::runtime_error(
         "FATAL ERROR: glst_force::calc_lr_ef: Plan is not initialized");
+  }
+
+  if ((this->execution_mode_ == GLST_EXECUTION_MODE::MULTI_GPU_TILE) ||
+      (this->execution_mode_ == GLST_EXECUTION_MODE::MULTI_GPU_CELL_TILE)) {
+    throw std::runtime_error(
+        "FATAL ERROR: glst_force::calc_lr_ef: Tile-partitioned multi-GPU "
+        "runtime is not implemented yet");
   }
 
   this->zero_ef();
@@ -801,6 +782,13 @@ __global__ static void calc_sr_ef_inter_kernel(
 }
 
 void glst_force::calc_sr_ef(void) {
+  if ((this->execution_mode_ == GLST_EXECUTION_MODE::MULTI_GPU_TILE) ||
+      (this->execution_mode_ == GLST_EXECUTION_MODE::MULTI_GPU_CELL_TILE)) {
+    throw std::runtime_error(
+        "FATAL ERROR: glst_force::calc_sr_ef: Tile-partitioned multi-GPU "
+        "runtime is not implemented yet");
+  }
+
   for (int dev = 0; dev < this->cuda_count_; dev++) {
     cudaCheck(cudaSetDevice(dev));
 
@@ -853,6 +841,13 @@ void glst_force::calc_sr_ef(void) {
 }
 
 void glst_force::comm_ef(void) {
+  if ((this->execution_mode_ == GLST_EXECUTION_MODE::MULTI_GPU_TILE) ||
+      (this->execution_mode_ == GLST_EXECUTION_MODE::MULTI_GPU_CELL_TILE)) {
+    throw std::runtime_error(
+        "FATAL ERROR: glst_force::comm_ef: Tile-partitioned multi-GPU "
+        "runtime is not implemented yet");
+  }
+
   if (this->execution_mode_ == GLST_EXECUTION_MODE::SINGLE_GPU_TILED) {
     cudaCheck(cudaSetDevice(0));
     cudaCheck(cudaStreamSynchronize(this->comp_streams_[0]));
@@ -884,6 +879,13 @@ void glst_force::calc_ener_force(const double *d_rx, const double *d_ry,
   if (this->plan_ == nullptr) {
     throw std::runtime_error("FATAL ERROR: glst_force::calc_ener_force: "
                              "Plan is not initialized");
+  }
+
+  if ((this->execution_mode_ == GLST_EXECUTION_MODE::MULTI_GPU_TILE) ||
+      (this->execution_mode_ == GLST_EXECUTION_MODE::MULTI_GPU_CELL_TILE)) {
+    throw std::runtime_error(
+        "FATAL ERROR: glst_force::calc_ener_force: Tile-partitioned multi-GPU "
+        "runtime is not implemented yet");
   }
 
   this->assign_atoms(d_rx, d_ry, d_rz, d_qc);
@@ -1512,6 +1514,9 @@ void glst_force::zero_ef(void) {
 }
 
 void glst_force::deallocate(void) {
+  if (!this->cuda_initialized_)
+    return;
+
   if (this->execution_mode_ != GLST_EXECUTION_MODE::SINGLE_GPU_TILED) {
     // Finalize NCCL
     for (int dev = 0; dev < this->cuda_count_; dev++) {
@@ -1524,11 +1529,202 @@ void glst_force::deallocate(void) {
   for (int dev = 0; dev < this->cuda_count_; dev++) {
     cudaCheck(cudaSetDevice(dev));
     cudaCheck(cudaStreamDestroy(this->comp_streams_[dev]));
+
     if (this->execution_mode_ != GLST_EXECUTION_MODE::SINGLE_GPU_TILED) {
       cudaCheck(cudaStreamDestroy(this->comm_streams_[dev]));
       cudaCheck(cudaEventDestroy(this->comp_events_[dev]));
       cudaCheck(cudaEventDestroy(this->comm_events_[dev]));
     }
+  }
+
+  if (this->execution_mode_ != GLST_EXECUTION_MODE::SINGLE_GPU_TILED)
+    disable_p2p(this->cuda_count_);
+
+  this->comp_streams_.clear();
+  this->comm_streams_.clear();
+  this->comp_events_.clear();
+  this->comm_events_.clear();
+  this->nccl_devs_.clear();
+  this->nccl_comms_.clear();
+
+  this->cuda_initialized_ = false;
+
+  return;
+}
+
+/*
+void glst_force::init_gpu_layout(const int device_count) {
+  bool cell_env_set = false;
+  bool tile_env_set = false;
+
+  unsigned int cell_partitions =
+      parse_positive_uint_env(cell_env_set, "GLST_CELL_PARTITIONS");
+  unsigned int tile_partitions =
+      parse_positive_uint_env(tile_env_set, "GLST_TILE_PARTITIONS");
+
+  if (cell_env_set != tile_env_set) {
+    throw std::runtime_error(
+        "FATAL ERROR: glst_force::init_gpu_layout: GLST_CELL_PARTITIONS and "
+        "GLST_TILE_PARTITIONS must be set together");
+  }
+
+  if (cell_env_set) {
+    const unsigned long long int product =
+        static_cast<unsigned long long int>(cell_partitions) *
+        static_cast<unsigned long long int>(tile_partitions);
+
+    if (product != static_cast<unsigned long long int>(device_count)) {
+      throw std::runtime_error("FATAL ERROR: glst_force::init_gpu_layout: "
+                               "GLST_CELL_PARTITION * GLST_TILE_PARTITION must "
+                               "equal the visible CUDA device count; observed" +
+                               std::to_string(cell_partitions) + " * " +
+                               std::to_string(tile_partitions) +
+                               " != " + std::to_string(device_count));
+    }
+  } else {
+    if (device_count == 1) {
+      cell_partitions = 1;
+      tile_partitions = 1;
+    } else {
+      cell_partitions = static_cast<unsigned int>(device_count);
+      tile_partitions = 1;
+    }
+  }
+
+  this->cuda_count_ = device_count;
+  this->cell_partition_count_ = cell_partitions;
+  this->tile_partition_count_ = tile_partitions;
+
+  if (this->cuda_count_ == 1)
+    this->execution_mode_ = GLST_EXECUTION_MODE::SINGLE_GPU_TILED;
+  else if (this->tile_partition_count_ == 1)
+    this->execution_mode_ = GLST_EXECUTION_MODE::MULTI_GPU_CELL;
+  else if (this->cell_partition_count_ == 1)
+    this->execution_mode_ = GLST_EXECUTION_MODE::MULTI_GPU_TILE;
+  else
+    this->execution_mode_ = GLST_EXECUTION_MODE::MULTI_GPU_CELL_TILE;
+
+  this->dev_cell_partition_.resize(this->cuda_count_);
+  this->dev_tile_partition_.resize(this->cuda_count_);
+
+  for (int dev = 0; dev < this->cuda_count_; dev++) {
+    const unsigned int udev = static_cast<unsigned int>(dev);
+    this->dev_cell_partition_[dev] = udev / this->tile_partition_count_;
+    this->dev_tile_partition_[dev] = udev % this->tile_partition_count_;
+  }
+
+  return;
+}
+*/
+
+void glst_force::init_cuda_resources(void) {
+  if (this->cuda_initialized_)
+    return;
+
+  int device_count = 0;
+  cudaCheck(cudaGetDeviceCount(&device_count));
+
+  this->init_gpu_layout(device_count);
+
+  if (this->execution_mode_ == GLST_EXECUTION_MODE::SINGLE_GPU_TILED) {
+    this->comp_streams_.resize(1);
+    this->comm_streams_.clear();
+    this->comp_events_.clear();
+    this->comm_events_.clear();
+    this->nccl_devs_.clear();
+    this->nccl_comms_.clear();
+
+    cudaCheck(cudaSetDevice(0));
+    cudaCheck(cudaStreamCreate(&this->comp_streams_[0]));
+
+    this->cuda_initialized_ = true;
+
+    return;
+  }
+
+  enable_p2p(this->cuda_count_);
+
+  // Initialize streams and events
+  this->comp_streams_.resize(this->cuda_count_);
+  this->comm_streams_.resize(this->cuda_count_);
+  this->comp_events_.resize(this->cuda_count_);
+  this->comm_events_.resize(this->cuda_count_);
+  for (int dev = 0; dev < this->cuda_count_; dev++) {
+    cudaCheck(cudaSetDevice(dev));
+    cudaCheck(cudaStreamCreate(&this->comp_streams_[dev]));
+    cudaCheck(cudaStreamCreate(&this->comm_streams_[dev]));
+    cudaCheck(cudaEventCreateWithFlags(&this->comp_events_[dev],
+                                       cudaEventDisableTiming));
+    cudaCheck(cudaEventCreateWithFlags(&this->comm_events_[dev],
+                                       cudaEventDisableTiming));
+  }
+
+  // Initialize NCCL
+  this->nccl_devs_.resize(this->cuda_count_);
+  for (int dev = 0; dev < this->cuda_count_; dev++)
+    this->nccl_devs_[dev] = dev;
+
+  this->nccl_comms_.resize(this->cuda_count_);
+  ncclCheck(ncclCommInitAll(this->nccl_comms_.data(), this->cuda_count_,
+                            this->nccl_devs_.data()));
+
+  this->cuda_initialized_ = true;
+
+  return;
+}
+
+void glst_force::init_gpu_layout(const int device_count) {
+  if (device_count < 1) {
+    throw std::runtime_error("FATAL ERROR: glst_force::init_gpu_layout: Could "
+                             "not find any CUDA capable devices");
+  }
+
+  unsigned int cell_partition_count = this->cell_partition_count_;
+  unsigned int tile_partition_count = this->tile_partition_count_;
+
+  if (!this->gpu_layout_user_set_) {
+    if (device_count == 1) {
+      cell_partition_count = 1;
+      tile_partition_count = 1;
+    } else {
+      cell_partition_count = static_cast<unsigned int>(device_count);
+      tile_partition_count = 1;
+    }
+  }
+
+  const unsigned long long int product =
+      static_cast<unsigned long long int>(cell_partition_count) *
+      static_cast<unsigned long long int>(tile_partition_count);
+
+  if (product != static_cast<unsigned long long int>(device_count)) {
+    throw std::runtime_error("FATAL ERROR: glst_force::init_gpu_layout: "
+                             "GLST_CELL_PARTITION * GLST_TILE_PARTITION must "
+                             "equal the visible CUDA device count; observed" +
+                             std::to_string(cell_partition_count) + " * " +
+                             std::to_string(tile_partition_count) +
+                             " != " + std::to_string(device_count));
+  }
+
+  this->cuda_count_ = device_count;
+  this->cell_partition_count_ = cell_partition_count;
+  this->tile_partition_count_ = tile_partition_count;
+
+  if (this->cuda_count_ == 1)
+    this->execution_mode_ = GLST_EXECUTION_MODE::SINGLE_GPU_TILED;
+  else if (this->tile_partition_count_ == 1)
+    this->execution_mode_ = GLST_EXECUTION_MODE::MULTI_GPU_CELL;
+  else if (this->cell_partition_count_ == 1)
+    this->execution_mode_ = GLST_EXECUTION_MODE::MULTI_GPU_TILE;
+  else
+    this->execution_mode_ = GLST_EXECUTION_MODE::MULTI_GPU_CELL_TILE;
+
+  this->dev_cell_partition_.resize(this->cuda_count_);
+  this->dev_tile_partition_.resize(this->cuda_count_);
+
+  for (int dev = 0; dev < this->cuda_count_; dev++) {
+    const unsigned int udev = static_cast<unsigned int>(dev);
+    this->dev_cell_partition_[dev] = udev / this->tile_partition_count_;
+    this->dev_tile_partition_[dev] = udev % this->tile_partition_count_;
   }
 
   return;

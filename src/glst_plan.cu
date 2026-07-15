@@ -10,6 +10,8 @@
 
 #include "glst_plan.hcu"
 
+#include "cuda_utils.hcu"
+
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
@@ -284,22 +286,32 @@ void glst_plan::init_alpha_groups(const double tol) {
 
   this->ngroup_ = static_cast<unsigned int>(this->ncell_alpha_group_.size());
 
-  this->grp_r_in_.resize(1);
-  this->grp_r_out_.resize(1);
-
-  this->grp_r_in_[0].resize((this->ngroup_ > 0) ? this->ngroup_ : 1);
-  this->grp_r_out_[0].resize((this->ngroup_ > 0) ? this->ngroup_ : 1);
-
-  this->grp_r_in_[0][0] = 1;
-  for (unsigned int group = 0; group < this->ngroup_; group++) {
-    if (group > 0)
-      this->grp_r_in_[0][group] = this->grp_r_out_[0][group - 1];
-    this->grp_r_out_[0][group] =
-        this->grp_r_in_[0][group] + this->ncell_alpha_group_[group];
+  int device_count = 0;
+  cudaCheck(cudaGetDeviceCount(&device_count));
+  if (device_count < 1) {
+    throw std::runtime_error("FATAL ERROR: glst_plan::init_alpha_groups: Could "
+                             "not find and CUDA capable devices");
   }
 
-  this->grp_r_in_[0].transfer_to_device();
-  this->grp_r_out_[0].transfer_to_device();
+  std::vector<unsigned int> grp_r_in((this->ngroup_ > 0) ? this->ngroup_ : 1);
+  std::vector<unsigned int> grp_r_out((this->ngroup_ > 0) ? this->ngroup_ : 1);
+
+  grp_r_in[0] = 1;
+  for (unsigned int group = 0; group < this->ngroup_; group++) {
+    if (group > 0)
+      grp_r_in[group] = grp_r_out[group - 1];
+
+    grp_r_out[group] = grp_r_in[group] + this->ncell_alpha_group_[group];
+  }
+
+  this->grp_r_in_.resize(device_count);
+  this->grp_r_out_.resize(device_count);
+
+  for (int dev = 0; dev < device_count; dev++) {
+    cudaCheck(cudaSetDevice(dev));
+    this->grp_r_in_[dev] = grp_r_in;
+    this->grp_r_out_[dev] = grp_r_out;
+  }
 
   return;
 }
@@ -398,17 +410,6 @@ void glst_plan::validate(void) const {
                              "not match cubature num_cubatures");
   }
 
-  if ((this->grp_r_in_[0].size() != static_cast<std::size_t>(this->ngroup_)) ||
-      (this->grp_r_out_[0].size() != static_cast<std::size_t>(this->ngroup_)) ||
-      (this->ncell_alpha_group_.size() !=
-       static_cast<std::size_t>(this->ngroup_)) ||
-      (this->rmax_.size() != static_cast<std::size_t>(this->ngroup_)) ||
-      (this->alpha_.size() != static_cast<std::size_t>(this->ngroup_)) ||
-      (this->zcut_.size() != static_cast<std::size_t>(this->ngroup_))) {
-    throw std::runtime_error("FATAL ERROR: glst_plan::validate: Alpha-group "
-                             "metadata sizes do not match ngroup");
-  }
-
   const auto &points = this->cubature_->points();
   const auto &num_nodes = this->cubature_->num_nodes();
   const auto &x = this->cubature_->x();
@@ -416,6 +417,37 @@ void glst_plan::validate(void) const {
   const auto &z = this->cubature_->z();
   const auto &w = this->cubature_->w();
   const auto &group_array = this->cubature_->group();
+
+  if (this->grp_r_in_.empty() || this->grp_r_out_.empty()) {
+    throw std::runtime_error("FATAL ERROR: glst_plan::validate: Alpha-group "
+                             "radius metadata is empty");
+  }
+
+  if ((this->grp_r_in_.size() != points.size()) ||
+      (this->grp_r_out_.size() != points.size())) {
+    throw std::runtime_error(
+        "FATAL ERROR: glst_plan::validate: Alpha-group radius metadata device "
+        "count does not match cubature device count");
+  }
+
+  for (std::size_t dev = 0; dev < this->grp_r_in_.size(); dev++) {
+    if ((this->grp_r_in_[dev].size() !=
+         static_cast<std::size_t>(this->ngroup_)) ||
+        (this->grp_r_out_[dev].size() !=
+         static_cast<std::size_t>(this->ngroup_))) {
+      throw std::runtime_error("FATAL ERROR: glst_plan::validate: Alpha-group "
+                               "radius metadata sizes do not match ngroup");
+    }
+  }
+
+  if ((this->ncell_alpha_group_.size() !=
+       static_cast<std::size_t>(this->ngroup_)) ||
+      (this->rmax_.size() != static_cast<std::size_t>(this->ngroup_)) ||
+      (this->alpha_.size() != static_cast<std::size_t>(this->ngroup_)) ||
+      (this->zcut_.size() != static_cast<std::size_t>(this->ngroup_))) {
+    throw std::runtime_error("FATAL ERROR: glst_plan::validate: Alpha-group "
+                             "host metadata sizes do not match ngroup");
+  }
 
   if (points.empty() || num_nodes.empty() || x.empty() || y.empty() ||
       z.empty() || w.empty() || group_array.empty()) {

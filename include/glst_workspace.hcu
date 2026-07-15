@@ -22,7 +22,7 @@
 class glst_workspace {
 public:
   glst_workspace(void);
-  glst_workspace(const glst_plan &plan);
+  glst_workspace(const glst_plan &plan, const int device_count = 1);
   ~glst_workspace(void);
 
 public:
@@ -89,11 +89,11 @@ public:
   std::vector<std::size_t> &cub_work_buffer_size(void);
 
 public:
-  void init(const glst_plan &plan);
+  void init(const glst_plan &plan, const int device_count = 1);
   void clear(void);
 
 private:
-  void allocate_cub(const std::size_t natom);
+  void allocate_cub(const std::size_t natom, const int device_count);
   void deallocate_cub(void);
 
 private:

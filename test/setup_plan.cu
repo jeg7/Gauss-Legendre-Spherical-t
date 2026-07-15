@@ -8,6 +8,7 @@
 //
 // ENDLICENSE
 
+#include <cuda_utils.hcu>
 #include <glst_force.hcu>
 #include <glst_plan.hcu>
 #include <glst_workspace.hcu>
@@ -231,7 +232,44 @@ void run_force_setup_smoke(const setup_case &test_case) {
   return;
 }
 
+void run_force_setup_smoke(const setup_case &test_case,
+                           const unsigned int cell_partitions,
+                           const unsigned int tile_partitions) {
+  glst_force force;
+  force.set_gpu_layout(cell_partitions, tile_partitions);
+  force.init(test_case.natom, test_case.tol, test_case.box_dim_x,
+             test_case.box_dim_y, test_case.box_dim_z, test_case.rcut);
+
+  std::cout << "PASS glst_force setup: " << test_case.name << " layout "
+            << cell_partitions << " x " << tile_partitions << std::endl;
+
+  return;
+}
+
+void run_invalid_layout_check(const setup_case &test_case,
+                              const unsigned int cell_partitions,
+                              const unsigned int tile_partitions) {
+  bool caught = false;
+
+  try {
+    glst_force force;
+    force.set_gpu_layout(cell_partitions, tile_partitions);
+    force.init(test_case.natom, test_case.tol, test_case.box_dim_x,
+               test_case.box_dim_y, test_case.box_dim_z, test_case.rcut);
+  } catch (const std::runtime_error &) {
+    caught = true;
+  }
+
+  check(caught,
+        std::string(test_case.name) + ": invalid GPU layout did not throw");
+
+  return;
+}
+
 int main(void) {
+  int device_count = 0;
+  cudaCheck(cudaGetDeviceCount(&device_count));
+
   try {
     const std::vector<setup_case> test_cases = {
         {"small_2959", 2959u, 1.0e-6, 32.0, 32.0, 32.0, 12.0, 3u, 3u, 3u, 1u,
@@ -243,6 +281,20 @@ int main(void) {
     for (std::size_t i = 0; i < test_cases.size(); i++) {
       run_plan_workspace_checks(test_cases[i]);
       run_force_setup_smoke(test_cases[i]);
+
+      if (device_count > 1) {
+        run_force_setup_smoke(test_cases[i],
+                              static_cast<unsigned int>(device_count), 1u);
+
+        run_force_setup_smoke(test_cases[i], 1u,
+                              static_cast<unsigned int>(device_count));
+      }
+
+      if (device_count == 4)
+        run_force_setup_smoke(test_cases[i], 2u, 2u);
+
+      run_invalid_layout_check(test_cases[i],
+                               static_cast<unsigned int>(device_count + 1), 1u);
     }
   } catch (const std::exception &e) {
     std::cerr << "FAIL setup_plan: " << e.what() << std::endl;

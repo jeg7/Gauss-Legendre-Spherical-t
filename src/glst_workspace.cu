@@ -36,8 +36,9 @@ glst_workspace::glst_workspace(void)
       cell_atom_count_(), max_atoms_cell_(), sf_re_(), sf_im_(), rmt_sum_re_(),
       rmt_sum_im_() {}
 
-glst_workspace::glst_workspace(const glst_plan &plan) : glst_workspace() {
-  this->init(plan);
+glst_workspace::glst_workspace(const glst_plan &plan, const int device_count)
+    : glst_workspace() {
+  this->init(plan, device_count);
 }
 
 glst_workspace::~glst_workspace(void) { this->deallocate_cub(); }
@@ -256,7 +257,7 @@ std::vector<std::size_t> &glst_workspace::cub_work_buffer_size(void) {
   return this->cub_work_buffer_size_;
 }
 
-void glst_workspace::init(const glst_plan &plan) {
+void glst_workspace::init(const glst_plan &plan, const int device_count) {
   this->clear();
 
   const std::size_t natom = static_cast<std::size_t>(plan.natom());
@@ -275,6 +276,11 @@ void glst_workspace::init(const glst_plan &plan) {
         "FATAL ERROR: glst_workspace::init: max_tile_nodes is 0");
   }
 
+  if (device_count == 0) {
+    throw std::runtime_error(
+        "FATAL ERROR: glst_workspace::init: device_count == 0");
+  }
+
   const std::size_t tile_buffer_nodes =
       checked_mul(ncell, max_tile_nodes, "tile buffer node count");
 
@@ -283,57 +289,60 @@ void glst_workspace::init(const glst_plan &plan) {
   this->tile_node_capacity_ = max_tile_nodes;
   this->tile_buffer_capacity_ = tile_buffer_nodes;
 
-  // JEG260714: Use vector-of-one storage for the initial single-GPU tiled path
-  this->idx_.resize(1);
-  this->sorted_idx_.resize(1);
-  this->rx_.resize(1);
-  this->ry_.resize(1);
-  this->rz_.resize(1);
-  this->qc_.resize(1);
-  this->packets_.resize(1);
-  this->sorted_packets_.resize(1);
-  this->atom_cell_idx_.resize(1);
-  this->atom_cell_sorted_idx_.resize(1);
+  this->idx_.resize(device_count);
+  this->sorted_idx_.resize(device_count);
+  this->rx_.resize(device_count);
+  this->ry_.resize(device_count);
+  this->rz_.resize(device_count);
+  this->qc_.resize(device_count);
+  this->packets_.resize(device_count);
+  this->sorted_packets_.resize(device_count);
+  this->atom_cell_idx_.resize(device_count);
+  this->atom_cell_sorted_idx_.resize(device_count);
 
-  this->fx_.resize(1);
-  this->fy_.resize(1);
-  this->fz_.resize(1);
-  this->en_.resize(1);
+  this->fx_.resize(device_count);
+  this->fy_.resize(device_count);
+  this->fz_.resize(device_count);
+  this->en_.resize(device_count);
 
-  this->cell_atom_point_.resize(1);
-  this->cell_atom_count_.resize(1);
-  this->max_atoms_cell_.resize(1);
+  this->cell_atom_point_.resize(device_count);
+  this->cell_atom_count_.resize(device_count);
+  this->max_atoms_cell_.resize(device_count);
 
-  this->sf_re_.resize(1);
-  this->sf_im_.resize(1);
-  this->rmt_sum_re_.resize(1);
-  this->rmt_sum_im_.resize(1);
+  this->sf_re_.resize(device_count);
+  this->sf_im_.resize(device_count);
+  this->rmt_sum_re_.resize(device_count);
+  this->rmt_sum_im_.resize(device_count);
 
-  this->idx_[0].resize(this->atom_capacity_);
-  this->sorted_idx_[0].resize(this->atom_capacity_);
-  this->rx_[0].resize(this->atom_capacity_);
-  this->ry_[0].resize(this->atom_capacity_);
-  this->rz_[0].resize(this->atom_capacity_);
-  this->qc_[0].resize(this->atom_capacity_);
-  this->packets_[0].resize(this->atom_capacity_);
-  this->sorted_packets_[0].resize(this->atom_capacity_);
-  this->atom_cell_idx_[0].resize(this->atom_capacity_);
-  this->atom_cell_sorted_idx_[0].resize(this->atom_capacity_);
+  for (int dev = 0; dev < device_count; dev++) {
+    cudaCheck(cudaSetDevice(dev));
 
-  this->fx_[0].resize(this->atom_capacity_);
-  this->fy_[0].resize(this->atom_capacity_);
-  this->fz_[0].resize(this->atom_capacity_);
-  this->en_[0].resize(this->atom_capacity_);
+    this->idx_[dev].resize(this->atom_capacity_);
+    this->sorted_idx_[dev].resize(this->atom_capacity_);
+    this->rx_[dev].resize(this->atom_capacity_);
+    this->ry_[dev].resize(this->atom_capacity_);
+    this->rz_[dev].resize(this->atom_capacity_);
+    this->qc_[dev].resize(this->atom_capacity_);
+    this->packets_[dev].resize(this->atom_capacity_);
+    this->sorted_packets_[dev].resize(this->atom_capacity_);
+    this->atom_cell_idx_[dev].resize(this->atom_capacity_);
+    this->atom_cell_sorted_idx_[dev].resize(this->atom_capacity_);
 
-  this->cell_atom_point_[0].resize(this->cell_capacity_);
-  this->cell_atom_count_[0].resize(this->cell_capacity_);
+    this->fx_[dev].resize(this->atom_capacity_);
+    this->fy_[dev].resize(this->atom_capacity_);
+    this->fz_[dev].resize(this->atom_capacity_);
+    this->en_[dev].resize(this->atom_capacity_);
 
-  this->sf_re_[0].resize(this->tile_buffer_capacity_);
-  this->sf_im_[0].resize(this->tile_buffer_capacity_);
-  this->rmt_sum_re_[0].resize(this->tile_buffer_capacity_);
-  this->rmt_sum_im_[0].resize(this->tile_buffer_capacity_);
+    this->cell_atom_point_[dev].resize(this->cell_capacity_);
+    this->cell_atom_count_[dev].resize(this->cell_capacity_);
 
-  this->allocate_cub(natom);
+    this->sf_re_[dev].resize(this->tile_buffer_capacity_);
+    this->sf_im_[dev].resize(this->tile_buffer_capacity_);
+    this->rmt_sum_re_[dev].resize(this->tile_buffer_capacity_);
+    this->rmt_sum_im_[dev].resize(this->tile_buffer_capacity_);
+  }
+
+  this->allocate_cub(natom, device_count);
 
   return;
 }
@@ -376,56 +385,63 @@ void glst_workspace::clear(void) {
   return;
 }
 
-void glst_workspace::allocate_cub(const std::size_t natom) {
-  this->cub_work_buffer_.resize(1);
-  this->cub_work_buffer_size_.resize(1);
+void glst_workspace::allocate_cub(const std::size_t natom,
+                                  const int device_count) {
+  this->cub_work_buffer_.resize(device_count);
+  this->cub_work_buffer_size_.resize(device_count);
 
-  this->cub_work_buffer_[0] = nullptr;
-  this->cub_work_buffer_size_[0] = 0;
+  for (int dev = 0; dev < device_count; dev++) {
+    cudaCheck(cudaSetDevice(dev));
 
-  // Determine storage requirements for CUB functions
-  std::size_t size0 = 0, size1 = 0, size2 = 0;
-  cub::DeviceRadixSort::SortPairs(
-      this->cub_work_buffer_[0], size0,
-      this->atom_cell_idx_[0].d_array().data(),
-      this->atom_cell_sorted_idx_[0].d_array().data(),
-      this->idx_[0].d_array().data(), this->sorted_idx_[0].d_array().data(),
-      natom);
-  cub::DeviceRadixSort::SortPairs(
-      this->cub_work_buffer_[0], size1,
-      this->atom_cell_idx_[0].d_array().data(),
-      this->atom_cell_sorted_idx_[0].d_array().data(),
-      this->fx_[0].d_array().data(), this->fx_[0].d_array().data(), natom);
-  cub::DeviceRadixSort::SortPairs(
-      this->cub_work_buffer_[0], size2,
-      this->atom_cell_idx_[0].d_array().data(),
-      this->atom_cell_sorted_idx_[0].d_array().data(),
-      this->packets_[0].d_array().data(),
-      this->sorted_packets_[0].d_array().data(), natom);
+    this->cub_work_buffer_[dev] = nullptr;
+    this->cub_work_buffer_size_[dev] = 0;
 
-  this->cub_work_buffer_size_[0] = size0;
-  if (size1 > this->cub_work_buffer_size_[0])
-    this->cub_work_buffer_size_[0] = size1;
-  if (size2 > this->cub_work_buffer_size_[0])
-    this->cub_work_buffer_size_[0] = size2;
+    // Determine storage requirements for CUB functions
+    std::size_t size0 = 0, size1 = 0, size2 = 0;
 
-  cudaCheck(
-      cudaMalloc(&(this->cub_work_buffer_[0]), this->cub_work_buffer_size_[0]));
+    cub::DeviceRadixSort::SortPairs(
+        this->cub_work_buffer_[dev], size0,
+        this->atom_cell_idx_[dev].d_array().data(),
+        this->atom_cell_sorted_idx_[dev].d_array().data(),
+        this->idx_[dev].d_array().data(),
+        this->sorted_idx_[dev].d_array().data(), natom);
+
+    cub::DeviceRadixSort::SortPairs(
+        this->cub_work_buffer_[dev], size1,
+        this->atom_cell_idx_[dev].d_array().data(),
+        this->atom_cell_sorted_idx_[dev].d_array().data(),
+        this->fx_[dev].d_array().data(), this->fx_[dev].d_array().data(),
+        natom);
+
+    cub::DeviceRadixSort::SortPairs(
+        this->cub_work_buffer_[dev], size2,
+        this->atom_cell_idx_[dev].d_array().data(),
+        this->atom_cell_sorted_idx_[dev].d_array().data(),
+        this->packets_[dev].d_array().data(),
+        this->sorted_packets_[dev].d_array().data(), natom);
+
+    this->cub_work_buffer_size_[dev] = size0;
+    if (size1 > this->cub_work_buffer_size_[dev])
+      this->cub_work_buffer_size_[dev] = size1;
+    if (size2 > this->cub_work_buffer_size_[dev])
+      this->cub_work_buffer_size_[dev] = size2;
+
+    cudaCheck(cudaMalloc(&(this->cub_work_buffer_[dev]),
+                         this->cub_work_buffer_size_[dev]));
+  }
 
   return;
 }
 
 void glst_workspace::deallocate_cub(void) {
-  cudaCheck(cudaSetDevice(0));
-
-  if ((!this->cub_work_buffer_.empty()) &&
-      (this->cub_work_buffer_[0] != nullptr)) {
-    cudaCheck(cudaFree(this->cub_work_buffer_[0]));
-    this->cub_work_buffer_[0] = nullptr;
+  for (std::size_t dev = 0; dev < this->cub_work_buffer_.size(); dev++) {
+    cudaCheck(cudaSetDevice(static_cast<int>(dev)));
+    if (this->cub_work_buffer_[dev] != nullptr) {
+      cudaCheck(cudaFree(this->cub_work_buffer_[dev]));
+      this->cub_work_buffer_[dev] = nullptr;
+    }
+    this->cub_work_buffer_size_[dev] = 0;
   }
-
-  if (!this->cub_work_buffer_size_.empty())
-    this->cub_work_buffer_size_[0] = 0;
 
   return;
 }
