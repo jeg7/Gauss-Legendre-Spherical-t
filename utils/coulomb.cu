@@ -9,6 +9,8 @@
 // ENDLICENSE
 
 #include "coulomb.hcu"
+
+#include <iostream>
 #include <vector>
 
 template <unsigned int BLOCK>
@@ -86,6 +88,10 @@ void compute_coulomb_cuda(double *fx, double *fy, double *fz, double *en,
                           const double *qc, const std::size_t natom) {
   int cuda_count = 0;
   cudaGetDeviceCount(&cuda_count);
+
+  std::cout << std::endl;
+  std::cout << "# of CUDA devices used for Coulomb: " << cuda_count
+            << std::endl;
 
   const std::size_t base = natom / static_cast<std::size_t>(cuda_count);
   const std::size_t rem = natom % static_cast<std::size_t>(cuda_count);
@@ -230,6 +236,10 @@ void compute_coulomb_cuda(double4 *fxyzen, const double4 *xyzq,
                           const std::size_t natom) {
   int cuda_count = 0;
   cudaGetDeviceCount(&cuda_count);
+
+  std::cout << std::endl;
+  std::cout << "# of CUDA devices used for Coulomb: " << cuda_count
+            << std::endl;
 
   const std::size_t base = natom / static_cast<std::size_t>(cuda_count);
   const std::size_t rem = natom % static_cast<std::size_t>(cuda_count);

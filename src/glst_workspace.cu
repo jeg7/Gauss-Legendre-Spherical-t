@@ -369,6 +369,10 @@ void glst_workspace::clear(void) {
   this->rmt_sum_re_.clear();
   this->rmt_sum_im_.clear();
 
+  this->deallocate_cub();
+  this->cub_work_buffer_.clear();
+  this->cub_work_buffer_size_.clear();
+
   return;
 }
 
@@ -414,11 +418,14 @@ void glst_workspace::allocate_cub(const std::size_t natom) {
 void glst_workspace::deallocate_cub(void) {
   cudaCheck(cudaSetDevice(0));
 
-  if (this->cub_work_buffer_[0] != nullptr) {
+  if ((!this->cub_work_buffer_.empty()) &&
+      (this->cub_work_buffer_[0] != nullptr)) {
     cudaCheck(cudaFree(this->cub_work_buffer_[0]));
     this->cub_work_buffer_[0] = nullptr;
-    this->cub_work_buffer_size_[0] = 0;
   }
+
+  if (!this->cub_work_buffer_size_.empty())
+    this->cub_work_buffer_size_[0] = 0;
 
   return;
 }

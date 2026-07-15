@@ -22,12 +22,15 @@
 #include <cuda_runtime_api.h>
 #include <iostream>
 #include <stdexcept>
+#include <string_view>
 
 glst_force::glst_force(void)
-    : plan_(nullptr), workspace_(nullptr), tiled_single_gpu_(true),
-      cuda_count_(-1), cell_dev_idx_(), dev_cell_idx_(), comp_streams_(),
-      comm_streams_(), comp_events_(), comm_events_(), nccl_devs_(),
-      nccl_comms_() {
+    : plan_(nullptr), workspace_(nullptr),
+      execution_mode_(GLST_EXECUTION_MODE::SINGLE_GPU_TILED),
+      cell_partition_count_(1), tile_partition_count_(1), dev_cell_partition_(),
+      dev_tile_partition_(), cuda_count_(-1), cell_dev_idx_(), dev_cell_idx_(),
+      comp_streams_(), comm_streams_(), comp_events_(), comm_events_(),
+      nccl_devs_(), nccl_comms_() {
   int device_count = 0;
   cudaCheck(cudaGetDeviceCount(&device_count));
   if (device_count < 1) {
@@ -35,8 +38,13 @@ glst_force::glst_force(void)
         "glst_force::init: Could not find any CUDA capable devices");
   }
 
-  if (this->tiled_single_gpu_) {
+  if (this->execution_mode_ == GLST_EXECUTION_MODE::SINGLE_GPU_TILED) {
     this->cuda_count_ = 1;
+
+    this->cell_partition_count_ = 1;
+    this->tile_partition_count_ = 1;
+    this->dev_cell_partition_.assign(1, 0);
+    this->dev_tile_partition_.assign(1, 0);
 
     this->comp_streams_.resize(1);
     this->comm_streams_.clear();
@@ -53,6 +61,15 @@ glst_force::glst_force(void)
 
   this->cuda_count_ = device_count;
   enable_p2p(this->cuda_count_);
+
+  this->cell_partition_count_ = static_cast<unsigned int>(this->cuda_count_);
+  this->tile_partition_count_ = 1;
+  this->dev_cell_partition_.resize(this->cuda_count_);
+  this->dev_tile_partition_.resize(this->cuda_count_);
+  for (int dev = 0; dev < this->cuda_count_; dev++) {
+    this->dev_cell_partition_[dev] = static_cast<unsigned int>(dev);
+    this->dev_tile_partition_[dev] = 0;
+  }
 
   // Initialize streams and events
   this->comp_streams_.resize(this->cuda_count_);
@@ -102,7 +119,7 @@ glst_force::glst_force(const unsigned int natom, const double tol,
 
 glst_force::~glst_force(void) {
   this->deallocate();
-  if (!this->tiled_single_gpu_)
+  if (this->execution_mode_ != GLST_EXECUTION_MODE::SINGLE_GPU_TILED)
     disable_p2p(this->cuda_count_);
 }
 
@@ -197,7 +214,10 @@ void glst_force::init(const unsigned int natom, const double tol,
   this->plan_->init_cells(natom, box_dim_x, box_dim_y, box_dim_z, rcut);
   this->plan_->init_alpha_groups(tol);
   this->plan_->init_cubature(tol);
-  this->plan_->init_tile_schedule();
+  // this->plan_->init_tile_schedule(1024);
+  this->plan_->init_tile_schedule(2048);
+  // this->plan_->init_tile_schedule(3072);
+  // this->plan_->init_tile_schedule(4096);
 
   cudaCheck(
       cudaSetDevice(0)); // JEG260714: Tiled workspace is allocated on device 0
@@ -211,6 +231,43 @@ void glst_force::init(const unsigned int natom, const double tol,
   }
 
   this->cells2dev();
+
+  // Layout validation
+  if (this->cell_partition_count_ == 0) {
+    throw std::runtime_error(
+        "FATAL ERROR: glst_force::init: cell_partition_count == 0");
+  }
+
+  if (this->tile_partition_count_ == 0) {
+    throw std::runtime_error(
+        "FATAL ERROR: glst_force::init: tile_partition_count == 0");
+  }
+
+  if (this->dev_cell_partition_.size() !=
+      static_cast<std::size_t>(this->cuda_count_)) {
+    throw std::runtime_error(
+        "FATAL ERROR: glst_force::init: dev_cell_partition size does not match "
+        "cuda_count");
+  }
+
+  if (this->dev_tile_partition_.size() !=
+      static_cast<std::size_t>(this->cuda_count_)) {
+    throw std::runtime_error(
+        "FATAL ERROR: glst_force::init: dev_tile_partition size does not match "
+        "cuda_count");
+  }
+
+  for (int dev = 0; dev < this->cuda_count_; dev++) {
+    if (this->dev_cell_partition_[dev] >= this->cell_partition_count_) {
+      throw std::runtime_error("FATAL ERROR: glst_force::init: Device cell "
+                               "partition is out of range");
+    }
+
+    if (this->dev_tile_partition_[dev] >= this->tile_partition_count_) {
+      throw std::runtime_error("FATAL ERROR: glst_force::init: Device tile "
+                               "partition is out of range");
+    }
+  }
 
   std::cout << std::endl;
   std::cout << "          Number of atoms: " << this->plan_->natom()
@@ -232,7 +289,35 @@ void glst_force::init(const unsigned int natom, const double tol,
       << " x "
       << static_cast<double>(this->plan_->ncell_z()) * this->plan_->cell_dim_z()
       << std::endl;
+  std::cout << std::endl;
+
+  std::string_view mode_name = "UNKNOWN";
+  switch (this->execution_mode_) {
+  case GLST_EXECUTION_MODE::SINGLE_GPU_TILED:
+    mode_name = "SINGLE_GPU_TILED";
+    break;
+  case GLST_EXECUTION_MODE::MULTI_GPU_CELL:
+    mode_name = "MULTI_GPU_CELL";
+    break;
+  case GLST_EXECUTION_MODE::MULTI_GPU_TILE:
+    mode_name = "MULTI_GPU_TILE";
+    break;
+  case GLST_EXECUTION_MODE::MULTI_GPU_CELL_TILE:
+    mode_name = "MULTI_GPU_CELL_TILE";
+    break;
+  }
   std::cout << "           Number of GPUs: " << this->cuda_count_ << std::endl;
+  std::cout << "          Execution mode: " << mode_name << std::endl;
+  std::cout << "         Cell partitions: " << this->cell_partition_count_
+            << std::endl;
+  std::cout << "         Tile partitions: " << this->tile_partition_count_
+            << std::endl;
+  std::cout << "              GPU layout: " << std::endl;
+  for (int dev = 0; dev < this->cuda_count_; dev++) {
+    std::cout << "                GPU " << dev << " -> cell partition "
+              << this->dev_cell_partition_[dev] << ", tile partition "
+              << this->dev_tile_partition_[dev] << std::endl;
+  }
 
   std::cout << std::endl;
   std::cout << "  Number of alpha groups: " << this->plan_->ngroup()
@@ -248,7 +333,7 @@ void glst_force::init(const unsigned int natom, const double tol,
 
   this->plan_->print_tile_diagnostics(std::cout);
 
-  if (!this->tiled_single_gpu_) {
+  if (this->execution_mode_ != GLST_EXECUTION_MODE::SINGLE_GPU_TILED) {
     // Call NCCL collective once to avoid initialization penalty
     nccl_all_reduce_sum_ip(this->workspace_->fx(), this->plan_->natom(),
                            this->nccl_comms_, this->comm_streams_,
@@ -768,7 +853,7 @@ void glst_force::calc_sr_ef(void) {
 }
 
 void glst_force::comm_ef(void) {
-  if (this->tiled_single_gpu_) {
+  if (this->execution_mode_ == GLST_EXECUTION_MODE::SINGLE_GPU_TILED) {
     cudaCheck(cudaSetDevice(0));
     cudaCheck(cudaStreamSynchronize(this->comp_streams_[0]));
     return;
@@ -1427,7 +1512,7 @@ void glst_force::zero_ef(void) {
 }
 
 void glst_force::deallocate(void) {
-  if (!this->tiled_single_gpu_) {
+  if (this->execution_mode_ != GLST_EXECUTION_MODE::SINGLE_GPU_TILED) {
     // Finalize NCCL
     for (int dev = 0; dev < this->cuda_count_; dev++) {
       cudaCheck(cudaSetDevice(dev));
@@ -1439,7 +1524,7 @@ void glst_force::deallocate(void) {
   for (int dev = 0; dev < this->cuda_count_; dev++) {
     cudaCheck(cudaSetDevice(dev));
     cudaCheck(cudaStreamDestroy(this->comp_streams_[dev]));
-    if (!this->tiled_single_gpu_) {
+    if (this->execution_mode_ != GLST_EXECUTION_MODE::SINGLE_GPU_TILED) {
       cudaCheck(cudaStreamDestroy(this->comm_streams_[dev]));
       cudaCheck(cudaEventDestroy(this->comp_events_[dev]));
       cudaCheck(cudaEventDestroy(this->comm_events_[dev]));
@@ -1452,7 +1537,7 @@ void glst_force::deallocate(void) {
 void glst_force::cells2dev(void) {
   const unsigned int ncell = this->plan_->ncell();
 
-  if (this->tiled_single_gpu_) {
+  if (this->execution_mode_ == GLST_EXECUTION_MODE::SINGLE_GPU_TILED) {
     this->cell_dev_idx_.assign(ncell, 0);
 
     this->dev_cell_idx_.resize(1);

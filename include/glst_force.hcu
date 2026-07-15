@@ -21,6 +21,13 @@
 #include <string>
 #include <vector>
 
+enum class GLST_EXECUTION_MODE {
+  SINGLE_GPU_TILED,
+  MULTI_GPU_CELL,
+  MULTI_GPU_TILE,
+  MULTI_GPU_CELL_TILE
+};
+
 class glst_force {
 public: // Constructors and destructors
   glst_force(void);
@@ -73,7 +80,13 @@ private:
   std::unique_ptr<glst_plan> plan_;
   std::unique_ptr<glst_workspace> workspace_;
 
-  bool tiled_single_gpu_;
+  GLST_EXECUTION_MODE execution_mode_;
+
+  unsigned int cell_partition_count_;
+  unsigned int tile_partition_count_;
+
+  std::vector<unsigned int> dev_cell_partition_;
+  std::vector<unsigned int> dev_tile_partition_;
 
   int cuda_count_;
   std::vector<int> cell_dev_idx_;
