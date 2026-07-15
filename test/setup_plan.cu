@@ -266,6 +266,86 @@ void run_invalid_layout_check(const setup_case &test_case,
   return;
 }
 
+void run_tile_partition_checks(const setup_case &test_case,
+                               const unsigned int tile_partitions) {
+  glst_plan plan;
+  plan.init_cells(test_case.natom, test_case.box_dim_x, test_case.box_dim_y,
+                  test_case.box_dim_z, test_case.rcut);
+  plan.init_alpha_groups(test_case.tol);
+  plan.init_cubature(test_case.tol);
+  plan.init_tile_schedule();
+  plan.init_tile_partitions(tile_partitions);
+  plan.validate();
+
+  check_equal(plan.tile_partition_count(), tile_partitions,
+              std::string(test_case.name) + ": tile partition count");
+
+  std::vector<unsigned int> tile_visit_count(plan.tile_count(), 0);
+  std::size_t total_partition_nodes = 0;
+
+  for (unsigned int partition = 0; partition < tile_partitions; partition++) {
+    const std::vector<unsigned int> &tiles = plan.partition_tile_idx(partition);
+
+    std::size_t observed_partition_nodes = 0;
+
+    for (std::size_t i = 0; i < tiles.size(); i++) {
+      const unsigned int tile = tiles[i];
+
+      check(tile < plan.tile_count(),
+            std::string(test_case.name) + ": partition tile is out of range");
+      check_equal(plan.tile_partition_idx(tile), partition,
+                  std::string(test_case.name) +
+                      ": tile partition index mismatch");
+      check_equal(tile % tile_partitions, partition,
+                  std::string(test_case.name) +
+                      ": tile modulo partition mismatch");
+
+      if (i > 0) {
+        check(tiles[i] > tiles[i - 1],
+              std::string(test_case.name) +
+                  ": partition tile order is not deterministic");
+      }
+
+      observed_partition_nodes +=
+          static_cast<std::size_t>(plan.tile_node_count(tile));
+      tile_visit_count[tile]++;
+    }
+
+    check_size_equal(
+        observed_partition_nodes,
+        static_cast<std::size_t>(plan.partition_tile_node_count(partition)),
+        std::string(test_case.name) + ": partition node count");
+    total_partition_nodes += observed_partition_nodes;
+  }
+
+  check_size_equal(
+      total_partition_nodes, static_cast<std::size_t>(plan.tot_num_nodes()),
+      std::string(test_case.name) + ": sum of tile partition node counts");
+
+  for (unsigned int tile = 0; tile < plan.tile_count(); tile++) {
+    check_equal(tile_visit_count[tile], 1u,
+                std::string(test_case.name) + ": tile ownership visit count");
+  }
+
+  if (tile_partitions == 1) {
+    const std::vector<unsigned int> &tiles = plan.partition_tile_idx(0);
+    check_size_equal(tiles.size(), static_cast<std::size_t>(plan.tile_count()),
+                     std::string(test_case.name) +
+                         ": G_tile=1 partition tile count");
+
+    for (unsigned int tile = 0; tile < plan.tile_count(); tile++) {
+      check_equal(tiles[tile], tile,
+                  std::string(test_case.name) +
+                      ": G_tile=1 tile order mismatch");
+    }
+  }
+
+  std::cout << "PASS tile partition metadata: " << test_case.name << " G_tile "
+            << tile_partitions << std::endl;
+
+  return;
+}
+
 int main(void) {
   int device_count = 0;
   cudaCheck(cudaGetDeviceCount(&device_count));
@@ -295,6 +375,10 @@ int main(void) {
 
       run_invalid_layout_check(test_cases[i],
                                static_cast<unsigned int>(device_count + 1), 1u);
+
+      run_tile_partition_checks(test_cases[i], 1u);
+      run_tile_partition_checks(test_cases[i], 2u);
+      run_tile_partition_checks(test_cases[i], 4u);
     }
   } catch (const std::exception &e) {
     std::cerr << "FAIL setup_plan: " << e.what() << std::endl;

@@ -53,7 +53,8 @@ glst_plan::glst_plan(void)
       cell_dim_z_(0.0), ngroup_(0), grp_r_in_(), grp_r_out_(),
       ncell_alpha_group_(), rmax_(), alpha_(), zcut_(), cubature_(nullptr),
       max_tile_nodes_(2048), tile_count_(0), tile_group_(), tile_node_point_(),
-      tile_node_count_() {}
+      tile_node_count_(), tile_partition_count_(1), tile_partition_idx_(),
+      partition_tile_idx_(), partition_tile_node_count_() {}
 
 glst_plan::~glst_plan(void) {}
 
@@ -191,6 +192,51 @@ unsigned int glst_plan::tile_node_count(const unsigned int tile) const {
 unsigned int glst_plan::tiles_in_group(const unsigned int group) const {
   return static_cast<unsigned int>(
       std::count(this->tile_group_.begin(), this->tile_group_.end(), group));
+}
+
+unsigned int glst_plan::tile_partition_count(void) const {
+  return this->tile_partition_count_;
+}
+
+const std::vector<unsigned int> &glst_plan::tile_partition_idx(void) const {
+  return this->tile_partition_idx_;
+}
+
+const std::vector<std::vector<unsigned int>> &
+glst_plan::partition_tile_idx(void) const {
+  return this->partition_tile_idx_;
+}
+
+const std::vector<unsigned int> &
+glst_plan::partition_tile_node_count(void) const {
+  return this->partition_tile_node_count_;
+}
+
+unsigned int glst_plan::tile_partition_idx(const unsigned int tile) const {
+  if (tile >= this->tile_count_) {
+    throw std::runtime_error(
+        "FATAL ERROR: glst_plan::tile_partition_idx: Tile index out of range");
+  }
+  return this->tile_partition_idx_[tile];
+}
+
+const std::vector<unsigned int> &
+glst_plan::partition_tile_idx(const unsigned int tile_partition) const {
+  if (tile_partition >= this->tile_partition_count_) {
+    throw std::runtime_error("FATAL ERROR: glst_plan::partition_tile_idx: Tile "
+                             "partition index out of range");
+  }
+  return this->partition_tile_idx_[tile_partition];
+}
+
+unsigned int
+glst_plan::partition_tile_node_count(const unsigned int tile_partition) const {
+  if (tile_partition >= this->tile_partition_count_) {
+    throw std::runtime_error(
+        "FATAL ERROR: glst_plan::partition_tile_node_count: Tile partition "
+        "index out of range");
+  }
+  return this->partition_tile_node_count_[tile_partition];
 }
 
 void glst_plan::init_cells(const unsigned int natom, const double box_dim_x,
@@ -378,6 +424,38 @@ void glst_plan::init_tile_schedule(const unsigned int max_tile_nodes) {
   }
 
   this->tile_count_ = static_cast<unsigned int>(this->tile_node_count_.size());
+
+  this->init_tile_partitions(1);
+
+  return;
+}
+
+void glst_plan::init_tile_partitions(const unsigned int tile_partition_count) {
+  if (tile_partition_count == 0) {
+    throw std::runtime_error("FATAL ERROR: glst_plan::init_tile_partitions: "
+                             "tile_partition_count must be > 0");
+  }
+
+  if (this->tile_count_ == 0) {
+    throw std::runtime_error("FATAL ERROR: glst_plan::init_tile_partitions: "
+                             "Tile schedule has not been initialized");
+  }
+
+  this->tile_partition_count_ = tile_partition_count;
+
+  this->tile_partition_idx_.assign(this->tile_count_, 0);
+  this->partition_tile_idx_.clear();
+  this->partition_tile_idx_.resize(tile_partition_count);
+  this->partition_tile_node_count_.assign(tile_partition_count, 0);
+
+  for (unsigned int tile = 0; tile < this->tile_count_; tile++) {
+    const unsigned int tile_partition = tile % tile_partition_count;
+
+    this->tile_partition_idx_[tile] = tile_partition;
+    this->partition_tile_idx_[tile_partition].push_back(tile);
+    this->partition_tile_node_count_[tile_partition] +=
+        this->tile_node_count_[tile];
+  }
 
   this->validate();
 
@@ -588,6 +666,105 @@ void glst_plan::validate(void) const {
     }
   }
 
+  if (this->tile_partition_count_ == 0) {
+    throw std::runtime_error(
+        "FATAL ERROR: glst_plan::validate: tile_partition_count == 0");
+  }
+
+  if (this->tile_partition_idx_.size() !=
+      static_cast<std::size_t>(this->tile_count_)) {
+    throw std::runtime_error(
+        "FATAL ERROR: glst_plan::validate: tile_partition_idx size does not "
+        "match tile_count");
+  }
+
+  if (this->partition_tile_idx_.size() !=
+      static_cast<std::size_t>(this->tile_partition_count_)) {
+    throw std::runtime_error(
+        "FATAL ERROR: glst_plan::validate: partition_tile_idx size does not "
+        "match tile_partition_count");
+  }
+
+  if (this->partition_tile_node_count_.size() !=
+      static_cast<std::size_t>(this->tile_partition_count_)) {
+    throw std::runtime_error(
+        "FATAL ERROR: glst_plan::validate: partition_tile_node_count size does "
+        "not match tile_partition_count");
+  }
+
+  std::vector<unsigned int> tile_visit_count(this->tile_count_, 0);
+  std::vector<unsigned int> observed_partition_node_count(
+      this->tile_partition_count_, 0);
+
+  for (unsigned int tile = 0; tile < this->tile_count_; tile++) {
+    const unsigned int partition = this->tile_partition_idx_[tile];
+
+    if (partition >= this->tile_partition_count_) {
+      throw std::runtime_error(
+          "FATAL ERROR: glst_plan::validate: Tile has invalid tile partition");
+    }
+
+    if (partition != tile % this->tile_partition_count_) {
+      throw std::runtime_error("FATAL ERROR: glst_plan::validate: Tile "
+                               "partition assignment is not deterministic");
+    }
+  }
+
+  for (unsigned int partition = 0; partition < this->tile_partition_count_;
+       partition++) {
+    const std::vector<unsigned int> &tiles =
+        this->partition_tile_idx_[partition];
+
+    for (std::size_t i = 0; i < tiles.size(); i++) {
+      const unsigned int tile = tiles[i];
+
+      if (tile >= this->tile_count_) {
+        throw std::runtime_error("FATAL ERROR: glst_plan::validate: Partition "
+                                 "tile list contains out-of-range tile");
+      }
+
+      if (this->tile_partition_idx_[tile] != partition) {
+        throw std::runtime_error("FATAL ERROR: glst_plan::validate: Partition "
+                                 "tile list disagrees with tile_partition_idx");
+      }
+
+      if ((i > 0) && (tiles[i] <= tiles[i - 1])) {
+        throw std::runtime_error("FATAL ERROR: glst_plan::validate: Partition "
+                                 "tile list is not in deterministic order");
+      }
+
+      tile_visit_count[tile]++;
+      observed_partition_node_count[partition] += this->tile_node_count_[tile];
+    }
+
+    if (observed_partition_node_count[partition] !=
+        this->partition_tile_node_count_[partition]) {
+      throw std::runtime_error("FATAL ERROR: glst_plan::validate: Partition "
+                               "node count is inconsistent");
+    }
+  }
+
+  std::size_t partition_node_sum = 0;
+  for (unsigned int partition = 0; partition < this->tile_partition_count_;
+       partition++) {
+    partition_node_sum +=
+        static_cast<std::size_t>(this->partition_tile_node_count_[partition]);
+  }
+
+  if (partition_node_sum != total_nodes) {
+    throw std::runtime_error(
+        "FATAL ERROR: glst_plan::validate: Sum of tile partition node counts "
+        "does not match total cubature node count");
+  }
+
+  for (unsigned int tile = 0; tile < this->tile_count_; tile++) {
+    if (tile_visit_count[tile] != 1) {
+      throw std::runtime_error(
+          "FATAL ERROR: glst_plan::validate: Every global tile must belong to "
+          "exactly one tile partition");
+    }
+  }
+
   return;
 }
 
@@ -604,13 +781,21 @@ void glst_plan::print_tile_diagnostics(std::ostream &os) const {
   const double tile_buffer_mib =
       static_cast<double>(tile_buffer_bytes) / (1024.0 * 1024.0);
 
-  os << "              Number of GLST tiles: " << tile_count_ << '\n';
-  os << "   Maximum cubature nodes per tile: " << max_tile_nodes_ << '\n';
+  os << "              Number of GLST tiles: " << this->tile_count_ << '\n';
+  os << "   Maximum cubature nodes per tile: " << this->max_tile_nodes_ << '\n';
   os << "       Tile-buffer memory estimate: " << tile_buffer_mib << " MiB ("
      << tile_buffer_bytes << " bytes)" << '\n';
   for (unsigned int group = 0; group < this->ngroup_; group++) {
     os << "        Number of tiles in group " << group << ": "
-       << tiles_in_group(group) << '\n';
+       << this->tiles_in_group(group) << '\n';
+  }
+  os << "         Number of tile partitions: " << this->tile_partition_count_
+     << '\n';
+  for (unsigned int partition = 0; partition < this->tile_partition_count_;
+       partition++) {
+    os << "             Number of tiles in tile partition " << partition << ": "
+       << this->partition_tile_idx_[partition].size() << " ("
+       << this->partition_tile_node_count_[partition] << " nodes)" << '\n';
   }
 
   return;

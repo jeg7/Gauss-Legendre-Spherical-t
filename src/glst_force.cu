@@ -155,6 +155,7 @@ void glst_force::init(const unsigned int natom, const double tol,
   this->plan_->init_tile_schedule(2048);
   // this->plan_->init_tile_schedule(3072);
   // this->plan_->init_tile_schedule(4096);
+  this->plan_->init_tile_partitions(this->tile_partition_count_);
 
   cudaCheck(
       cudaSetDevice(0)); // JEG260714: Tiled workspace is allocated on device 0
