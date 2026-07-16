@@ -39,6 +39,11 @@ public:
   std::size_t cell_capacity(const int dev) const;
   std::size_t sf_tile_buffer_capacity(const int dev) const;
   std::size_t rmt_tile_buffer_capacity(const int dev) const;
+  std::size_t owned_atom_count(const int dev) const;
+  std::size_t sr_source_cell_capacity(const int dev) const;
+
+  const std::vector<std::size_t> &owned_atom_count(void) const;
+  const std::vector<std::size_t> &sr_source_cell_capacity(void) const;
 
   const std::vector<cuda_container<unsigned int>> &idx(void) const;
   const std::vector<cuda_container<unsigned int>> &sorted_idx(void) const;
@@ -60,6 +65,10 @@ public:
   const std::vector<cuda_container<unsigned int>> &cell_atom_point(void) const;
   const std::vector<cuda_container<unsigned int>> &cell_atom_count(void) const;
   const std::vector<unsigned int> &max_atoms_cell(void) const;
+  const std::vector<cuda_container<unsigned int>> &
+  sr_source_cell_atom_point(void) const;
+  const std::vector<cuda_container<unsigned int>> &
+  sr_source_cell_atom_count(void) const;
 
   const std::vector<cuda_container<double>> &sf_re(void) const;
   const std::vector<cuda_container<double>> &sf_im(void) const;
@@ -88,6 +97,8 @@ public:
   std::vector<cuda_container<unsigned int>> &cell_atom_point(void);
   std::vector<cuda_container<unsigned int>> &cell_atom_count(void);
   std::vector<unsigned int> &max_atoms_cell(void);
+  std::vector<cuda_container<unsigned int>> &sr_source_cell_atom_point(void);
+  std::vector<cuda_container<unsigned int>> &sr_source_cell_atom_count(void);
 
   std::vector<cuda_container<double>> &sf_re(void);
   std::vector<cuda_container<double>> &sf_im(void);
@@ -103,6 +114,7 @@ public:
             const std::vector<unsigned int> &dev_cell_partition,
             const int device_count = 1);
   void resize_atom_storage(const int dev, const std::size_t atom_capacity);
+  void set_owned_atom_count(const int dev, const std::size_t owned_atom_count);
   void clear(void);
 
 private:
@@ -122,6 +134,8 @@ private:
   std::vector<std::size_t> cell_capacity_;
   std::vector<std::size_t> sf_tile_buffer_capacity_;
   std::vector<std::size_t> rmt_tile_buffer_capacity_;
+  std::vector<std::size_t> owned_atom_count_;
+  std::vector<std::size_t> sr_source_cell_capacity_;
 
   // Atom arrays: Size atom_capacity_ (natom)
   std::vector<cuda_container<unsigned int>> idx_;
@@ -145,6 +159,8 @@ private:
   std::vector<cuda_container<unsigned int>> cell_atom_point_;
   std::vector<cuda_container<unsigned int>> cell_atom_count_;
   std::vector<unsigned int> max_atoms_cell_;
+  std::vector<cuda_container<unsigned int>> sr_source_cell_atom_point_;
+  std::vector<cuda_container<unsigned int>> sr_source_cell_atom_count_;
 
   // Tile-sized GLST buffers.
   // sf_re/sf_im use global-cell indexing for the first baseline S_tile

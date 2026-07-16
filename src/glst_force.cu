@@ -21,6 +21,7 @@
 #include <cuda_runtime.h>
 #include <cuda_runtime_api.h>
 #include <iostream>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -402,14 +403,16 @@ __global__ static void calc_sr_ef_intra_kernel(
     const double *__restrict__ qc,
     const unsigned int *__restrict__ cell_atom_points,
     const unsigned int *__restrict__ cell_atom_counts,
-    const unsigned int *__restrict__ cells, const unsigned int cell_count) {
+    const unsigned int *__restrict__ cells, const unsigned int cell_count,
+    const unsigned int first_global_cell) {
   __shared__ double s_cache[BLOCK * 4];
   const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
   for (unsigned int c = blockIdx.y; c < cell_count; c += gridDim.y) {
-    const unsigned int cell = cells[c];
-    const unsigned int apnt = cell_atom_points[cell];
-    const unsigned int acnt = cell_atom_counts[cell];
+    const unsigned int global_cell = cells[c];
+    const unsigned int local_cell = global_cell - first_global_cell;
+    const unsigned int apnt = cell_atom_points[local_cell];
+    const unsigned int acnt = cell_atom_counts[local_cell];
     const bool active = (idx < acnt);
 
     double xi = 0.0, yi = 0.0, zi = 0.0, qi = 0.0;
@@ -477,21 +480,27 @@ __global__ static void calc_sr_ef_inter_kernel(
     double *__restrict__ en, const double *__restrict__ rx,
     const double *__restrict__ ry, const double *__restrict__ rz,
     const double *__restrict__ qc,
-    const unsigned int *__restrict__ cell_atom_points,
-    const unsigned int *__restrict__ cell_atom_counts,
+    const unsigned int *__restrict__ target_cell_atom_points,
+    const unsigned int *__restrict__ target_cell_atom_counts,
+    const unsigned int *__restrict__ source_cell_atom_points,
+    const unsigned int *__restrict__ source_cell_atom_counts,
     const unsigned int *__restrict__ cells, const unsigned int cell_count,
-    const unsigned int ncell_x, const unsigned int ncell_y,
-    const unsigned int ncell_z) {
+    const unsigned int first_global_cell, const unsigned int owned_cell_count,
+    const unsigned int x_point, const unsigned int x_count,
+    const unsigned int left_halo_cell_count, const unsigned int ncell_x,
+    const unsigned int ncell_y, const unsigned int ncell_z) {
   __shared__ double s_cache[BLOCK * 4];
   const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
   for (unsigned int c = blockIdx.y; c < cell_count; c += gridDim.y) {
-    const unsigned int cell = cells[c];
-    const unsigned int xcell = cell / (ncell_y * ncell_z);
-    const unsigned int ycell = (cell / ncell_z) % ncell_y;
-    const unsigned int zcell = cell % ncell_z;
-    const unsigned int apnt = cell_atom_points[cell];
-    const unsigned int acnt = cell_atom_counts[cell];
+    const unsigned int global_cell = cells[c];
+    const unsigned int xcell = global_cell / (ncell_y * ncell_z);
+    const unsigned int ycell = (global_cell / ncell_z) % ncell_y;
+    const unsigned int zcell = global_cell % ncell_z;
+
+    const unsigned int target_local_cell = global_cell - first_global_cell;
+    const unsigned int apnt = target_cell_atom_points[target_local_cell];
+    const unsigned int acnt = target_cell_atom_counts[target_local_cell];
     const bool active = (idx < acnt);
 
     double xi = 0.0, yi = 0.0, zi = 0.0, qi = 0.0;
@@ -527,8 +536,22 @@ __global__ static void calc_sr_ef_inter_kernel(
           if ((a == 0) && (b == 0) && (c == 0))
             continue;
           const unsigned int nbr = (nbrx * ncell_y + nbry) * ncell_z + nbrz;
-          const unsigned int bpnt = cell_atom_points[nbr];
-          const unsigned int bcnt = cell_atom_counts[nbr];
+
+          const unsigned int x_end = x_point + x_count;
+          unsigned int source_local_cell = 0;
+
+          if ((nbrx >= x_point) && (nbrx < x_end))
+            source_local_cell = nbr - first_global_cell;
+          else if ((x_point > 0) && (nbrx == x_point - 1))
+            source_local_cell = owned_cell_count + nbry * ncell_z + nbrz;
+          else if ((x_end < ncell_x) && (nbrx == x_end)) {
+            source_local_cell =
+                owned_cell_count + left_halo_cell_count + nbry * ncell_z + nbrz;
+          } else
+            continue;
+
+          const unsigned int bpnt = source_cell_atom_points[source_local_cell];
+          const unsigned int bcnt = source_cell_atom_counts[source_local_cell];
           for (unsigned int j = 0; j < bcnt; j += BLOCK) {
             // Read block of atom data into shared memory
             __syncthreads();
@@ -581,22 +604,53 @@ __global__ static void calc_sr_ef_inter_kernel(
 }
 
 void glst_force::calc_sr_ef(void) {
-  this->require_single_gpu_runtime("calc_sr_ef");
-
   for (int dev = 0; dev < this->cuda_count_; dev++) {
+    if ((this->execution_mode_ != GLST_EXECUTION_MODE::SINGLE_GPU_TILED) &&
+        (this->dev_tile_partition_[dev] != 0)) {
+      continue;
+    }
+
     cudaCheck(cudaSetDevice(dev));
 
+    const unsigned int cell_partition = this->dev_cell_partition_[dev];
+    const unsigned int first_global_cell =
+        this->plan_->first_global_cell(cell_partition);
     const unsigned int owned_cell_count =
         static_cast<unsigned int>(this->dev_cell_idx_[dev].size());
 
     if (owned_cell_count == 0)
       continue;
 
+    const unsigned int max_atoms_cell = this->workspace_->max_atoms_cell()[dev];
+
+    if (max_atoms_cell == 0)
+      continue;
+
+    const unsigned int x_point =
+        this->plan_->cell_partition_x_point()[cell_partition];
+    const unsigned int x_count =
+        this->plan_->cell_partition_x_count()[cell_partition];
+    const unsigned int left_halo_cell_count = static_cast<unsigned int>(
+        this->plan_->partition_left_halo_cell_idx(cell_partition).size());
+
+    const unsigned int *source_cell_atom_point = nullptr;
+    const unsigned int *source_cell_atom_count = nullptr;
+
+    if (this->execution_mode_ == GLST_EXECUTION_MODE::SINGLE_GPU_TILED) {
+      source_cell_atom_point =
+          this->workspace_->cell_atom_point()[dev].d_array().data();
+      source_cell_atom_count =
+          this->workspace_->cell_atom_count()[dev].d_array().data();
+    } else {
+      source_cell_atom_point =
+          this->workspace_->sr_source_cell_atom_point()[dev].d_array().data();
+      source_cell_atom_count =
+          this->workspace_->sr_source_cell_atom_count()[dev].d_array().data();
+    }
+
     constexpr dim3 num_threads(64, 1, 1);
-    const dim3 num_blocks(
-        (this->workspace_->max_atoms_cell()[dev] + num_threads.x - 1) /
-            num_threads.x,
-        std::min(65535u, owned_cell_count), 1);
+    const dim3 num_blocks((max_atoms_cell + num_threads.x - 1) / num_threads.x,
+                          std::min(65535u, owned_cell_count), 1);
 
     calc_sr_ef_intra_kernel<num_threads.x>
         <<<num_blocks, num_threads, 0, this->comp_streams_[dev]>>>(
@@ -611,7 +665,8 @@ void glst_force::calc_sr_ef(void) {
             this->workspace_->cell_atom_point()[dev].d_array().data(),
             this->workspace_->cell_atom_count()[dev].d_array().data(),
             this->dev_cell_idx_[dev].d_array().data(),
-            static_cast<unsigned int>(this->dev_cell_idx_[dev].size()));
+            static_cast<unsigned int>(this->dev_cell_idx_[dev].size()),
+            first_global_cell);
 
     cudaCheck(cudaGetLastError());
 
@@ -627,10 +682,12 @@ void glst_force::calc_sr_ef(void) {
             this->workspace_->qc()[dev].d_array().data(),
             this->workspace_->cell_atom_point()[dev].d_array().data(),
             this->workspace_->cell_atom_count()[dev].d_array().data(),
+            source_cell_atom_point, source_cell_atom_count,
             this->dev_cell_idx_[dev].d_array().data(),
             static_cast<unsigned int>(this->dev_cell_idx_[dev].size()),
-            this->plan_->ncell_x(), this->plan_->ncell_y(),
-            this->plan_->ncell_z());
+            first_global_cell, owned_cell_count, x_point, x_count,
+            left_halo_cell_count, this->plan_->ncell_x(),
+            this->plan_->ncell_y(), this->plan_->ncell_z());
 
     cudaCheck(cudaGetLastError());
   }
@@ -1017,6 +1074,15 @@ void glst_force::validate_atom_scatter(void) const {
     const std::vector<atom_packet> &packets =
         this->workspace_->sorted_packets()[dev].h_array();
 
+    const std::size_t owned_atom_count =
+        this->workspace_->owned_atom_count(dev);
+
+    if (owned_atom_count > packets.size()) {
+      throw std::runtime_error(
+          "FATAL ERROR: glst_force::validate_atom_scatter: Owned atom count "
+          "exceeds source atom count");
+    }
+
     for (std::size_t i = 0; i < packets.size(); i++) {
       const atom_packet &packet = packets[i];
 
@@ -1035,13 +1101,89 @@ void glst_force::validate_atom_scatter(void) const {
       const unsigned int observed_cell_partition =
           this->plan_->cell_partition_idx(packet.cell);
 
-      if (observed_cell_partition != expected_cell_partition) {
+      if (i < owned_atom_count) {
+        if (observed_cell_partition != expected_cell_partition) {
+          throw std::runtime_error(
+              "FATAL ERROR: glst_force::validate_atom_scatter: Owned atom is "
+              "stored on the wrong cell partition");
+        }
+
+        replica_count[packet.i]++;
+      } else {
+        if (observed_cell_partition == expected_cell_partition) {
+          throw std::runtime_error(
+              "FATAL ERROR: glst_force::validate_atom_scatter: Halo atom is "
+              "owned by the target partition");
+        }
+      }
+    }
+
+    const std::vector<unsigned int> &source_cells =
+        this->plan_->partition_sr_source_cell_idx(expected_cell_partition);
+
+    const std::size_t owned_cell_count = static_cast<std::size_t>(
+        this->plan_->local_cell_count(expected_cell_partition));
+    std::size_t observed_source_atom_count = 0;
+    std::size_t observed_owned_atom_count = 0;
+
+    if ((source_cells.size() !=
+         this->workspace_->sr_source_cell_atom_count()[dev].h_array().size()) ||
+        (source_cells.size() !=
+         this->workspace_->sr_source_cell_atom_point()[dev].h_array().size())) {
+      throw std::runtime_error(
+          "FATAL ERROR: glst_force::validate_atom_scatter: Source cell "
+          "metadata size mismatch");
+    }
+
+    for (std::size_t source_local_cell = 0;
+         source_local_cell < source_cells.size(); source_local_cell++) {
+      const unsigned int expected_cell = source_cells[source_local_cell];
+      const unsigned int point =
+          this->workspace_->sr_source_cell_atom_point()[dev][source_local_cell];
+      const unsigned int count =
+          this->workspace_->sr_source_cell_atom_count()[dev][source_local_cell];
+
+      observed_source_atom_count += static_cast<std::size_t>(count);
+      if (source_local_cell < owned_cell_count)
+        observed_owned_atom_count += static_cast<std::size_t>(count);
+
+      if (static_cast<std::size_t>(point) + static_cast<std::size_t>(count) >
+          packets.size()) {
         throw std::runtime_error(
-            "FATAL ERROR: glst_force::validate_atom_scatter: Atom is stored on "
-            "the wrong cell partition");
+            "FATAL ERROR: glst_force::validate_atom_scatter: Source cell atom "
+            "range is out of bounds");
       }
 
-      replica_count[packet.i]++;
+      unsigned int last_atom = 0;
+      for (unsigned int j = 0; j < count; j++) {
+        const atom_packet &packet = packets[point + j];
+
+        if (packet.cell != expected_cell) {
+          throw std::runtime_error(
+              "FATAL ERROR: glst_force::validate_atom_scatter: Source cell "
+              "range contains an atom from the wrong global cell");
+        }
+
+        if ((j > 0) && (packet.i <= last_atom)) {
+          throw std::runtime_error(
+              "FATAL ERROR: glst_force::validate_atom_scatter: Source cell "
+              "atom order is not deterministic");
+        }
+
+        last_atom = packet.i;
+      }
+    }
+
+    if (observed_source_atom_count != packets.size()) {
+      throw std::runtime_error(
+          "FATAL ERROR: glst_force::validate_atom_scatter: Source cell counts "
+          "do not sum to source atoms");
+    }
+
+    if (observed_owned_atom_count != owned_atom_count) {
+      throw std::runtime_error(
+          "FATAL ERROR: glst_force::validate_atom_scatter: Owned source cell "
+          "counts do not sum to owned atoms");
     }
   }
 
@@ -1120,7 +1262,10 @@ void glst_force::assign_atoms_multi_gpu(const double *d_rx, const double *d_ry,
   cudaCheck(cudaMemcpy(h_qc.data(), d_qc, natom * sizeof(double),
                        cudaMemcpyDeviceToHost));
 
-  std::vector<std::vector<atom_packet>> partition_packets(
+  std::vector<std::vector<atom_packet>> cell_packets(this->plan_->ncell());
+  std::vector<std::vector<atom_packet>> partition_owned_packets(
+      this->cell_partition_count_);
+  std::vector<std::vector<atom_packet>> partition_source_packets(
       this->cell_partition_count_);
 
   const double inv_cell_dim_x = 1.0 / this->plan_->cell_dim_x();
@@ -1145,84 +1290,160 @@ void glst_force::assign_atoms_multi_gpu(const double *d_rx, const double *d_ry,
                                   ncell_z +
                               static_cast<unsigned int>(cz);
 
-    const unsigned int cell_partition = this->plan_->cell_partition_idx(cell);
+    const atom_packet packet(atom, cell, h_rx[atom], h_ry[atom], h_rz[atom],
+                             h_qc[atom]);
 
-    partition_packets[cell_partition].push_back(atom_packet(
-        atom, cell, h_rx[atom], h_ry[atom], h_rz[atom], h_qc[atom]));
+    cell_packets[cell].push_back(packet);
+  }
+
+  for (unsigned int cell = 0; cell < this->plan_->ncell(); cell++) {
+    std::vector<atom_packet> &packets = cell_packets[cell];
+
+    std::sort(packets.begin(), packets.end(),
+              [](const atom_packet &lhs, const atom_packet &rhs) {
+                return lhs.i < rhs.i;
+              });
   }
 
   for (unsigned int partition = 0; partition < this->cell_partition_count_;
        partition++) {
-    std::vector<atom_packet> &packets = partition_packets[partition];
+    std::vector<atom_packet> &owned_packets =
+        partition_owned_packets[partition];
+    std::vector<atom_packet> &source_packets =
+        partition_source_packets[partition];
 
-    std::sort(packets.begin(), packets.end(),
-              [](const atom_packet &lhs, const atom_packet &rhs) {
-                if (lhs.cell != rhs.cell)
-                  return lhs.cell < rhs.cell;
-                return lhs.i < rhs.i;
-              });
+    const std::vector<unsigned int> &owned_cells =
+        this->plan_->partition_cell_idx(partition);
+    for (std::size_t i = 0; i < owned_cells.size(); i++) {
+      const unsigned int cell = owned_cells[i];
+      const std::vector<atom_packet> &cell_atoms = cell_packets[cell];
+      owned_packets.insert(owned_packets.end(), cell_atoms.begin(),
+                           cell_atoms.end());
+    }
+
+    const std::vector<unsigned int> &source_cells =
+        this->plan_->partition_sr_source_cell_idx(partition);
+    for (std::size_t i = 0; i < source_cells.size(); i++) {
+      const unsigned int cell = source_cells[i];
+      const std::vector<atom_packet> &cell_atoms = cell_packets[cell];
+      source_packets.insert(source_packets.end(), cell_atoms.begin(),
+                            cell_atoms.end());
+    }
   }
 
   for (int dev = 0; dev < this->cuda_count_; dev++) {
     cudaCheck(cudaSetDevice(dev));
 
     const unsigned int cell_partition = this->dev_cell_partition_[dev];
-    const std::vector<atom_packet> &packets = partition_packets[cell_partition];
 
-    const std::size_t local_atom_count = packets.size();
+    const std::vector<atom_packet> &owned_packets =
+        partition_owned_packets[cell_partition];
+    const std::vector<atom_packet> &source_packets =
+        partition_source_packets[cell_partition];
+
+    const std::size_t owned_atom_count = owned_packets.size();
+    const std::size_t source_atom_count = source_packets.size();
+
     const std::size_t local_cell_count =
         static_cast<std::size_t>(this->plan_->local_cell_count(cell_partition));
 
-    this->workspace_->resize_atom_storage(dev, local_atom_count);
+    const std::vector<unsigned int> &source_cells =
+        this->plan_->partition_sr_source_cell_idx(cell_partition);
+    const std::size_t source_cell_count = source_cells.size();
 
-    this->workspace_->packets()[dev].h_array() = packets;
-    this->workspace_->sorted_packets()[dev].h_array() = packets;
+    if (source_cell_count != this->workspace_->sr_source_cell_capacity(dev)) {
+      throw std::runtime_error(
+          "FATAL ERROR: glst_force::assign_atoms_multi_gpu: Source cell count "
+          "does not match workspace capacity");
+    }
+
+    this->workspace_->resize_atom_storage(dev, source_atom_count);
+    this->workspace_->set_owned_atom_count(dev, owned_atom_count);
 
     std::fill(this->workspace_->cell_atom_count()[dev].h_array().begin(),
               this->workspace_->cell_atom_count()[dev].h_array().end(), 0u);
     std::fill(this->workspace_->cell_atom_point()[dev].h_array().begin(),
               this->workspace_->cell_atom_point()[dev].h_array().end(), 0u);
+    std::fill(
+        this->workspace_->sr_source_cell_atom_count()[dev].h_array().begin(),
+        this->workspace_->sr_source_cell_atom_count()[dev].h_array().end(), 0u);
+    std::fill(
+        this->workspace_->sr_source_cell_atom_point()[dev].h_array().begin(),
+        this->workspace_->sr_source_cell_atom_point()[dev].h_array().end(), 0u);
 
-    for (std::size_t i = 0; i < local_atom_count; i++) {
-      const atom_packet &packet = packets[i];
-
-      const unsigned int local_cell =
-          this->plan_->local_cell_from_global_cell(cell_partition, packet.cell);
-
-      this->workspace_->idx()[dev][i] = packet.i;
-      this->workspace_->sorted_idx()[dev][i] = packet.i;
-      this->workspace_->rx()[dev][i] = packet.x;
-      this->workspace_->ry()[dev][i] = packet.y;
-      this->workspace_->rz()[dev][i] = packet.z;
-      this->workspace_->qc()[dev][i] = packet.q;
-
-      this->workspace_->atom_cell_idx()[dev][i] = local_cell;
-      this->workspace_->atom_cell_sorted_idx()[dev][i] = local_cell;
-
-      this->workspace_->cell_atom_count()[dev][local_cell]++;
-    }
-
-    unsigned int point = 0;
+    std::size_t atom_point = 0;
     this->workspace_->max_atoms_cell()[dev] = 0;
-    for (std::size_t local_cell = 0; local_cell < local_cell_count;
-         local_cell++) {
-      this->workspace_->cell_atom_point()[dev][local_cell] = point;
 
-      const unsigned int count =
-          this->workspace_->cell_atom_count()[dev][local_cell];
-      point += count;
+    for (std::size_t source_local_cell = 0;
+         source_local_cell < source_cell_count; source_local_cell++) {
+      const unsigned int global_cell = source_cells[source_local_cell];
+      const std::vector<atom_packet> &cell_atoms = cell_packets[global_cell];
 
-      if (count > this->workspace_->max_atoms_cell()[dev])
-        this->workspace_->max_atoms_cell()[dev] = count;
+      if (cell_atoms.size() >
+          static_cast<std::size_t>(std::numeric_limits<unsigned int>::max())) {
+        throw std::runtime_error(
+            "FATAL ERROR: glst_force::assign_atoms_multi_gpu: Cell atom count "
+            "exceeds unsigned int range");
+      }
+
+      const unsigned int point = static_cast<unsigned int>(atom_point);
+      const unsigned int count = static_cast<unsigned int>(cell_atoms.size());
+
+      this->workspace_->sr_source_cell_atom_point()[dev][source_local_cell] =
+          point;
+
+      this->workspace_->sr_source_cell_atom_count()[dev][source_local_cell] =
+          count;
+
+      if (source_local_cell < local_cell_count) {
+        this->workspace_->cell_atom_point()[dev][source_local_cell] = point;
+        this->workspace_->cell_atom_count()[dev][source_local_cell] = count;
+
+        if (count > this->workspace_->max_atoms_cell()[dev])
+          this->workspace_->max_atoms_cell()[dev] = count;
+      }
+
+      for (std::size_t i = 0; i < cell_atoms.size(); i++) {
+        const atom_packet &packet = cell_atoms[i];
+
+        this->workspace_->idx()[dev][atom_point] = packet.i;
+        this->workspace_->sorted_idx()[dev][atom_point] = packet.i;
+        this->workspace_->rx()[dev][atom_point] = packet.x;
+        this->workspace_->ry()[dev][atom_point] = packet.y;
+        this->workspace_->rz()[dev][atom_point] = packet.z;
+        this->workspace_->qc()[dev][atom_point] = packet.q;
+        this->workspace_->packets()[dev][atom_point] = packet;
+        this->workspace_->sorted_packets()[dev][atom_point] = packet;
+
+        this->workspace_->atom_cell_idx()[dev][atom_point] =
+            static_cast<unsigned int>(source_local_cell);
+        this->workspace_->atom_cell_sorted_idx()[dev][atom_point] =
+            static_cast<unsigned int>(source_local_cell);
+
+        atom_point++;
+      }
     }
 
-    if (static_cast<std::size_t>(point) != local_atom_count) {
+    if (atom_point != source_atom_count) {
       throw std::runtime_error(
-          "FATAL ERROR: glst_force::assign_atoms_multi_gpu: Local cell counts "
-          "do not sum to local atoms");
+          "FATAL ERROR: glst_force::assign_atoms_multi_gpu: Source cell counts "
+          "do not sum to source atoms");
     }
 
-    if (local_atom_count > 0) {
+    for (std::size_t i = 0; i < owned_atom_count; i++) {
+      if ((source_packets[i].i != owned_packets[i].i) ||
+          (source_packets[i].cell != owned_packets[i].cell) ||
+          (source_packets[i].x != owned_packets[i].x) ||
+          (source_packets[i].y != owned_packets[i].y) ||
+          (source_packets[i].z != owned_packets[i].z) ||
+          (source_packets[i].q != owned_packets[i].q)) {
+        throw std::runtime_error(
+            "FATAL ERROR: glst_force::assign_atoms_multi_gpu: Source packet "
+            "list does not start with owned packets");
+      }
+    }
+
+    if (source_atom_count > 0) {
       this->workspace_->idx()[dev].transfer_to_device();
       this->workspace_->sorted_idx()[dev].transfer_to_device();
       this->workspace_->rx()[dev].transfer_to_device();
@@ -1237,6 +1458,9 @@ void glst_force::assign_atoms_multi_gpu(const double *d_rx, const double *d_ry,
 
     this->workspace_->cell_atom_count()[dev].transfer_to_device();
     this->workspace_->cell_atom_point()[dev].transfer_to_device();
+
+    this->workspace_->sr_source_cell_atom_count()[dev].transfer_to_device();
+    this->workspace_->sr_source_cell_atom_point()[dev].transfer_to_device();
   }
 
 #ifdef __GLST_DEBUG__

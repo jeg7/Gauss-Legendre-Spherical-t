@@ -32,10 +32,12 @@ glst_workspace::glst_workspace(void)
     : max_atom_capacity_(0), max_cell_capacity_(0), tile_node_capacity_(0),
       max_sf_tile_buffer_capacity_(0), max_rmt_tile_buffer_capacity_(0),
       atom_capacity_(), cell_capacity_(), sf_tile_buffer_capacity_(),
-      rmt_tile_buffer_capacity_(), idx_(), sorted_idx_(), rx_(), ry_(), rz_(),
+      rmt_tile_buffer_capacity_(), owned_atom_count_(),
+      sr_source_cell_capacity_(), idx_(), sorted_idx_(), rx_(), ry_(), rz_(),
       qc_(), packets_(), sorted_packets_(), atom_cell_idx_(),
       atom_cell_sorted_idx_(), fx_(), fy_(), fz_(), en_(), cell_atom_point_(),
-      cell_atom_count_(), max_atoms_cell_(), sf_re_(), sf_im_(), rmt_sum_re_(),
+      cell_atom_count_(), max_atoms_cell_(), sr_source_cell_atom_point_(),
+      sr_source_cell_atom_count_(), sf_re_(), sf_im_(), rmt_sum_re_(),
       rmt_sum_im_() {}
 
 glst_workspace::glst_workspace(const glst_plan &plan, const int device_count)
@@ -104,6 +106,32 @@ std::size_t glst_workspace::rmt_tile_buffer_capacity(const int dev) const {
         "Device index out of range");
   }
   return this->rmt_tile_buffer_capacity_[dev];
+}
+
+std::size_t glst_workspace::owned_atom_count(const int dev) const {
+  if (static_cast<std::size_t>(dev) >= this->owned_atom_count_.size()) {
+    throw std::runtime_error("FATAL ERROR: glst_workspace::owned_atom_count: "
+                             "Device index out of range");
+  }
+  return this->owned_atom_count_[dev];
+}
+
+std::size_t glst_workspace::sr_source_cell_capacity(const int dev) const {
+  if (static_cast<std::size_t>(dev) >= this->sr_source_cell_capacity_.size()) {
+    throw std::runtime_error(
+        "FATAL ERROR: glst_workspace::sr_source_cell_capacity: "
+        "Device index out of range");
+  }
+  return this->sr_source_cell_capacity_[dev];
+}
+
+const std::vector<std::size_t> &glst_workspace::owned_atom_count(void) const {
+  return this->owned_atom_count_;
+}
+
+const std::vector<std::size_t> &
+glst_workspace::sr_source_cell_capacity(void) const {
+  return this->sr_source_cell_capacity_;
 }
 
 const std::vector<cuda_container<unsigned int>> &
@@ -180,6 +208,16 @@ glst_workspace::cell_atom_count(void) const {
 
 const std::vector<unsigned int> &glst_workspace::max_atoms_cell(void) const {
   return this->max_atoms_cell_;
+}
+
+const std::vector<cuda_container<unsigned int>> &
+glst_workspace::sr_source_cell_atom_point(void) const {
+  return this->sr_source_cell_atom_point_;
+}
+
+const std::vector<cuda_container<unsigned int>> &
+glst_workspace::sr_source_cell_atom_count(void) const {
+  return this->sr_source_cell_atom_count_;
 }
 
 const std::vector<cuda_container<double>> &glst_workspace::sf_re(void) const {
@@ -280,6 +318,16 @@ std::vector<unsigned int> &glst_workspace::max_atoms_cell(void) {
   return this->max_atoms_cell_;
 }
 
+std::vector<cuda_container<unsigned int>> &
+glst_workspace::sr_source_cell_atom_point(void) {
+  return this->sr_source_cell_atom_point_;
+}
+
+std::vector<cuda_container<unsigned int>> &
+glst_workspace::sr_source_cell_atom_count(void) {
+  return this->sr_source_cell_atom_count_;
+}
+
 std::vector<cuda_container<double>> &glst_workspace::sf_re(void) {
   return this->sf_re_;
 }
@@ -363,6 +411,8 @@ void glst_workspace::init(const glst_plan &plan,
   this->cell_capacity_.assign(device_count, 0);
   this->sf_tile_buffer_capacity_.assign(device_count, 0);
   this->rmt_tile_buffer_capacity_.assign(device_count, 0);
+  this->owned_atom_count_.assign(device_count, 0);
+  this->sr_source_cell_capacity_.assign(device_count, 0);
 
   for (int dev = 0; dev < device_count; dev++) {
     const unsigned int cell_partition = dev_cell_partition[dev];
@@ -376,6 +426,13 @@ void glst_workspace::init(const glst_plan &plan,
         (device_count == 1)
             ? global_ncell
             : static_cast<std::size_t>(plan.local_cell_count(cell_partition));
+
+    const std::size_t halo_cell_count =
+        (device_count == 1)
+            ? 0
+            : plan.partition_halo_cell_idx(cell_partition).size();
+
+    const std::size_t sr_source_cell_count = local_cell_count + halo_cell_count;
 
     std::size_t local_atom_capacity = global_natom;
     if (device_count > 1) {
@@ -402,6 +459,8 @@ void glst_workspace::init(const glst_plan &plan,
     this->cell_capacity_[dev] = local_cell_count;
     this->sf_tile_buffer_capacity_[dev] = sf_capacity;
     this->rmt_tile_buffer_capacity_[dev] = rmt_capacity;
+    this->owned_atom_count_[dev] = local_atom_capacity;
+    this->sr_source_cell_capacity_[dev] = sr_source_cell_count;
 
     if (local_atom_capacity > this->max_atom_capacity_)
       this->max_atom_capacity_ = local_atom_capacity;
@@ -432,6 +491,8 @@ void glst_workspace::init(const glst_plan &plan,
   this->cell_atom_point_.resize(device_count);
   this->cell_atom_count_.resize(device_count);
   this->max_atoms_cell_.resize(device_count);
+  this->sr_source_cell_atom_point_.resize(device_count);
+  this->sr_source_cell_atom_count_.resize(device_count);
 
   this->sf_re_.resize(device_count);
   this->sf_im_.resize(device_count);
@@ -459,6 +520,10 @@ void glst_workspace::init(const glst_plan &plan,
 
     this->cell_atom_point_[dev].resize(this->cell_capacity_[dev]);
     this->cell_atom_count_[dev].resize(this->cell_capacity_[dev]);
+    this->sr_source_cell_atom_point_[dev].resize(
+        this->sr_source_cell_capacity_[dev]);
+    this->sr_source_cell_atom_count_[dev].resize(
+        this->sr_source_cell_capacity_[dev]);
     this->max_atoms_cell_[dev] = 0;
 
     this->sf_re_[dev].resize(this->sf_tile_buffer_capacity_[dev]);
@@ -487,6 +552,8 @@ void glst_workspace::resize_atom_storage(const int dev,
 
   this->atom_capacity_[dev] = atom_capacity;
 
+  this->owned_atom_count_[dev] = atom_capacity;
+
   this->idx_[dev].resize(atom_capacity);
   this->sorted_idx_[dev].resize(atom_capacity);
   this->rx_[dev].resize(atom_capacity);
@@ -514,6 +581,25 @@ void glst_workspace::resize_atom_storage(const int dev,
   return;
 }
 
+void glst_workspace::set_owned_atom_count(const int dev,
+                                          const std::size_t owned_atom_count) {
+  if (static_cast<std::size_t>(dev) >= this->owned_atom_count_.size()) {
+    throw std::runtime_error(
+        "FATAL ERROR: glst_workspace::set_owned_atom_count: Device index out "
+        "of range");
+  }
+
+  if (owned_atom_count > this->atom_capacity_[dev]) {
+    throw std::runtime_error(
+        "FATAL ERROR: glst_workspace::set_owned_atom_count: owned_atom_count "
+        "exceeds atom capacity");
+  }
+
+  this->owned_atom_count_[dev] = owned_atom_count;
+
+  return;
+}
+
 void glst_workspace::clear(void) {
   this->deallocate_cub();
 
@@ -527,6 +613,8 @@ void glst_workspace::clear(void) {
   this->cell_capacity_.clear();
   this->sf_tile_buffer_capacity_.clear();
   this->rmt_tile_buffer_capacity_.clear();
+  this->owned_atom_count_.clear();
+  this->sr_source_cell_capacity_.clear();
 
   this->idx_.clear();
   this->sorted_idx_.clear();
@@ -546,6 +634,8 @@ void glst_workspace::clear(void) {
 
   this->cell_atom_point_.clear();
   this->cell_atom_count_.clear();
+  this->sr_source_cell_atom_point_.clear();
+  this->sr_source_cell_atom_count_.clear();
   this->max_atoms_cell_.clear();
 
   this->sf_re_.clear();

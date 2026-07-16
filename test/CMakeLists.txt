@@ -27,6 +27,13 @@ target_link_libraries(short_range_halo_plan
   GLST
 )
 
+add_executable(short_range_halo_exchange
+  ${GLST_SOURCE_DIR}/test/short_range_halo_exchange.cu
+)
+target_link_libraries(short_range_halo_exchange
+  GLST
+)
+
 # add_executable(setup_plan
 #   ${GLST_SOURCE_DIR}/test/setup_plan.cu
 # )
