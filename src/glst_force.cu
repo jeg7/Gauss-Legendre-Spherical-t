@@ -1164,25 +1164,11 @@ void glst_force::assign_atoms_multi_gpu(const double *d_rx, const double *d_ry,
     std::fill(this->workspace_->cell_atom_point()[dev].h_array().begin(),
               this->workspace_->cell_atom_point()[dev].h_array().end(), 0u);
 
-    const unsigned int x_point =
-        this->plan_->cell_partition_x_point()[cell_partition];
-    const unsigned int first_global_cell = x_point * ncell_y * ncell_z;
-
     for (std::size_t i = 0; i < local_atom_count; i++) {
       const atom_packet &packet = packets[i];
 
-      if (packet.cell < first_global_cell) {
-        throw std::runtime_error(
-            "FATAL ERROR: glst_force::assign_atoms_multi_gpu: Packet cell is "
-            "before partition cell range");
-      }
-
-      const unsigned int local_cell = packet.cell - first_global_cell;
-      if (static_cast<std::size_t>(local_cell) >= local_cell_count) {
-        throw std::runtime_error(
-            "FATAL ERROR: glst_force::assign_atoms_multi_gpu: Packet cell is "
-            "outside partition cell range");
-      }
+      const unsigned int local_cell =
+          this->plan_->local_cell_from_global_cell(cell_partition, packet.cell);
 
       this->workspace_->idx()[dev][i] = packet.i;
       this->workspace_->sorted_idx()[dev][i] = packet.i;

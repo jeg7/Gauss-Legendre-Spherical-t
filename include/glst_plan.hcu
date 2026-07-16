@@ -99,6 +99,19 @@ public:
   unsigned int local_cell_count(const unsigned int cell_partition) const;
 
 public:
+  unsigned int first_global_cell(const unsigned int cell_partition) const;
+  unsigned int
+  local_cell_from_global_cell(const unsigned int cell_partition,
+                              const unsigned int global_cell) const;
+  unsigned int global_cell_from_local_cell(const unsigned int cell_partition,
+                                           const unsigned int local_cell) const;
+  void global_cell_coords(unsigned int &x, unsigned int &y, unsigned int &z,
+                          const unsigned int global_cell) const;
+  void local_cell_coords(unsigned int &x, unsigned int &y, unsigned int &z,
+                         const unsigned int cell_partition,
+                         const unsigned int local_cell) const;
+
+public:
   void init_cells(const unsigned int natom, const double box_dim_x,
                   const double box_dim_y, const double box_dim_z,
                   const double rcut);

@@ -140,13 +140,17 @@ private:
   std::vector<cuda_container<double>> fz_;
   std::vector<cuda_container<double>> en_;
 
-  // Cell arrays: Size cell_capacity_ (ncell)
+  // Local cell arrays: Size cell_capacity_.
+  // In multi-GPU x-slab mode, these are indexed by local cell id.
   std::vector<cuda_container<unsigned int>> cell_atom_point_;
   std::vector<cuda_container<unsigned int>> cell_atom_count_;
   std::vector<unsigned int> max_atoms_cell_;
 
-  // Tile-sized GLST buffers: Size tile_buffer_capacity_ == (ncell *
-  // max_tile_nodes)
+  // Tile-sized GLST buffers.
+  // sf_re/sf_im use global-cell indexing for the first baseline S_tile
+  // communication path: ncell * max_tile_nodes.
+  // rmt_sum_re/rmt_sum_im use local target-cell indexing: local_cell_count *
+  // max_tile_nodes.
   std::vector<cuda_container<double>> sf_re_;
   std::vector<cuda_container<double>> sf_im_;
   std::vector<cuda_container<double>> rmt_sum_re_;

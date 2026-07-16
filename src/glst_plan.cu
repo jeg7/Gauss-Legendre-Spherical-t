@@ -286,6 +286,92 @@ glst_plan::local_cell_count(const unsigned int cell_partition) const {
       this->partition_cell_idx(cell_partition).size());
 }
 
+unsigned int
+glst_plan::first_global_cell(const unsigned int cell_partition) const {
+  if (cell_partition >= this->cell_partition_count_) {
+    throw std::runtime_error("FATAL ERROR: glst_plan::first_global_cell: Cell "
+                             "partition index out of range");
+  }
+  return this->cell_partition_x_point_[cell_partition] * this->ncell_y_ *
+         this->ncell_z_;
+}
+
+unsigned int
+glst_plan::local_cell_from_global_cell(const unsigned int cell_partition,
+                                       const unsigned int global_cell) const {
+  if (cell_partition >= this->cell_partition_count_) {
+    throw std::runtime_error(
+        "FATAL ERROR: glst_plan::local_cell_from_global_cell: Cell "
+        "partition index out of range");
+  }
+
+  if (global_cell >= this->ncell_) {
+    throw std::runtime_error(
+        "FATAL ERROR: glst_plan::local_cell_from_global_cell: Global cell "
+        "index out of range");
+  }
+
+  const unsigned int yz_count = this->ncell_y_ * this->ncell_z_;
+  const unsigned int x = global_cell / yz_count;
+  const unsigned int x_point = this->cell_partition_x_point_[cell_partition];
+  const unsigned int x_count = this->cell_partition_x_count_[cell_partition];
+
+  if ((x < x_point) || (x >= x_point + x_count)) {
+    throw std::runtime_error(
+        "FATAL ERROR: glst_plan::local_cell_from_global_cell: Global cell is "
+        "outside cell partition");
+  }
+
+  return global_cell - this->first_global_cell(cell_partition);
+}
+
+unsigned int
+glst_plan::global_cell_from_local_cell(const unsigned int cell_partition,
+                                       const unsigned int local_cell) const {
+  if (cell_partition >= this->cell_partition_count_) {
+    throw std::runtime_error(
+        "FATAL ERROR: glst_plan::global_cell_from_local_cell: Cell "
+        "partition index out of range");
+  }
+
+  if (local_cell >= this->local_cell_count(cell_partition)) {
+    throw std::runtime_error(
+        "FATAL ERROR: glst_plan::global_cell_from_local_cell: Local cell index "
+        "out of range");
+  }
+
+  return this->first_global_cell(cell_partition) + local_cell;
+}
+
+void glst_plan::global_cell_coords(unsigned int &x, unsigned int &y,
+                                   unsigned int &z,
+                                   const unsigned int global_cell) const {
+  if (global_cell >= this->ncell_) {
+    throw std::runtime_error("FATAL ERROR: glst_plan::global_cell_coords: "
+                             "Global cell index out of range");
+  }
+
+  const unsigned int yz_count = this->ncell_y_ * this->ncell_z_;
+
+  x = global_cell / yz_count;
+  y = (global_cell / this->ncell_z_) % this->ncell_y_;
+  z = global_cell % this->ncell_z_;
+
+  return;
+}
+
+void glst_plan::local_cell_coords(unsigned int &x, unsigned int &y,
+                                  unsigned int &z,
+                                  const unsigned int cell_partition,
+                                  const unsigned int local_cell) const {
+  const unsigned int global_cell =
+      this->global_cell_from_local_cell(cell_partition, local_cell);
+
+  this->global_cell_coords(x, y, z, global_cell);
+
+  return;
+}
+
 void glst_plan::init_cells(const unsigned int natom, const double box_dim_x,
                            const double box_dim_y, const double box_dim_z,
                            const double rcut) {
@@ -929,6 +1015,15 @@ void glst_plan::validate(void) const {
     const unsigned int x_point = this->cell_partition_x_point_[part];
     const unsigned int x_count = this->cell_partition_x_count_[part];
 
+    const unsigned int yz_count = this->ncell_y_ * this->ncell_z_;
+    const std::size_t expected_cell_count =
+        static_cast<std::size_t>(x_count) * static_cast<std::size_t>(yz_count);
+
+    if (this->partition_cell_idx_[part].size() != expected_cell_count) {
+      throw std::runtime_error("FATAL ERROR: glst_plan::validate: Partition "
+                               "cell list size does not match x-range size");
+    }
+
     if ((x_point > this->ncell_x_) || (x_count > this->ncell_x_ - x_point)) {
       throw std::runtime_error("FATAL ERROR: glst_plan::validate: Cell "
                                "partition x-range is out of bounds");
@@ -954,6 +1049,33 @@ void glst_plan::validate(void) const {
       if ((x < x_point) || (x >= x_point + x_count)) {
         throw std::runtime_error("FATAL ERROR: glst_plan::validate: Partition "
                                  "cell is outside its x-range");
+      }
+
+      const unsigned int local_cell =
+          this->local_cell_from_global_cell(part, cell);
+
+      if (local_cell != static_cast<unsigned int>(i)) {
+        throw std::runtime_error("FATAL ERROR: glst_plan::validate: Local cell "
+                                 "index is not deterministic");
+      }
+
+      const unsigned int round_trip_cell =
+          this->global_cell_from_local_cell(part, local_cell);
+
+      if (round_trip_cell != cell) {
+        throw std::runtime_error("FATAL ERROR: glst_plan::validate: "
+                                 "Local/global cell round-trip failed");
+      }
+
+      unsigned int cx = 0, cy = 0, cz = 0;
+      this->global_cell_coords(cx, cy, cz, cell);
+
+      const unsigned int rebuilt_cell =
+          (cx * this->ncell_y_ + cy) * this->ncell_z_ + cz;
+
+      if (rebuilt_cell != cell) {
+        throw std::runtime_error("FATAL ERROR: glst_plan::validate: Global "
+                                 "cell coordinate conversion failed");
       }
 
       cell_visit_count[cell]++;

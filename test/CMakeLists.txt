@@ -13,6 +13,13 @@ target_link_libraries(assign_atoms_hybrid
   GLST
 )
 
+add_executable(cell_mapping_hybrid
+  ${GLST_SOURCE_DIR}/test/cell_mapping_hybrid.cu
+)
+target_link_libraries(cell_mapping_hybrid
+  GLST
+)
+
 # add_executable(setup_plan
 #   ${GLST_SOURCE_DIR}/test/setup_plan.cu
 # )
