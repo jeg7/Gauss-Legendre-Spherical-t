@@ -758,7 +758,8 @@ calc_sf_kernel(double *__restrict__ sf_re, double *__restrict__ sf_im,
                const double *__restrict__ rz, const double *__restrict__ qc,
                const unsigned int *__restrict__ cell_atom_points,
                const unsigned int *__restrict__ cell_atom_counts,
-               const unsigned int ncell) {
+               const unsigned int local_cell_count,
+               const unsigned int first_global_cell) {
   __shared__ double s_cache[ATOM_TILE * 4];
 
   const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -771,9 +772,11 @@ calc_sf_kernel(double *__restrict__ sf_re, double *__restrict__ sf_im,
     zc = cz[idx];
   }
 
-  for (unsigned int cell = blockIdx.y; cell < ncell; cell += gridDim.y) {
-    const unsigned int apnt = cell_atom_points[cell];
-    const unsigned int acnt = cell_atom_counts[cell];
+  for (unsigned int local_cell = blockIdx.y; local_cell < local_cell_count;
+       local_cell += gridDim.y) {
+    const unsigned int global_cell = first_global_cell + local_cell;
+    const unsigned int apnt = cell_atom_points[local_cell];
+    const unsigned int acnt = cell_atom_counts[local_cell];
 
     double sf_re0 = 0.0, sf_im0 = 0.0;
     for (unsigned int i = 0; i < acnt; i += ATOM_TILE) {
@@ -805,8 +808,8 @@ calc_sf_kernel(double *__restrict__ sf_re, double *__restrict__ sf_im,
     }
 
     if (active) {
-      sf_re[cell * nc + idx] = sf_re0;
-      sf_im[cell * nc + idx] = sf_im0;
+      sf_re[global_cell * nc + idx] = sf_re0;
+      sf_im[global_cell * nc + idx] = sf_im0;
     }
   }
 
@@ -1500,22 +1503,47 @@ void glst_force::calc_sf_tile(const unsigned int tile) {
         "FATAL ERROR: glst_force::calc_sf_tile: Tile exceeds buffer size");
   }
 
+  const unsigned int tile_partition = this->plan_->tile_partition_idx(tile);
+
+  const unsigned int nc = tile_node_count;
+  const unsigned int off = tile_node_point;
+
+  const std::size_t sf_entry_count =
+      static_cast<std::size_t>(this->plan_->ncell()) *
+      static_cast<std::size_t>(nc);
+
+  const std::size_t sf_bytes = sf_entry_count * sizeof(double);
+
   for (int dev = 0; dev < this->cuda_count_; dev++) {
+    if (this->dev_tile_partition_[dev] != tile_partition)
+      continue;
+
     cudaCheck(cudaSetDevice(dev));
 
-    const unsigned int nc = tile_node_count;
-    const unsigned int off = tile_node_point;
+    const unsigned int cell_partition = this->dev_cell_partition_[dev];
+    const unsigned int local_cell_count =
+        this->plan_->local_cell_count(cell_partition);
+    const unsigned int first_global_cell =
+        this->plan_->first_global_cell(cell_partition);
+
+    if (sf_entry_count > this->workspace_->sf_tile_buffer_capacity(dev)) {
+      throw std::runtime_error("FATAL ERROR: glst_force::calc_sf_tile: Active "
+                               "SF tile exceeds workspace capacity");
+    }
 
     cudaCheck(cudaMemsetAsync(
         static_cast<void *>(this->workspace_->sf_re()[dev].d_array().data()), 0,
-        this->plan_->ncell() * nc * sizeof(double), this->comp_streams_[dev]));
+        sf_bytes, this->comp_streams_[dev]));
     cudaCheck(cudaMemsetAsync(
         static_cast<void *>(this->workspace_->sf_im()[dev].d_array().data()), 0,
-        this->plan_->ncell() * nc * sizeof(double), this->comp_streams_[dev]));
+        sf_bytes, this->comp_streams_[dev]));
+
+    if (local_cell_count == 0)
+      continue;
 
     constexpr dim3 num_threads(128, 1, 1);
     const dim3 num_blocks((nc + num_threads.x - 1) / num_threads.x,
-                          std::min(65535u, this->plan_->ncell()), 1);
+                          std::min(65535u, local_cell_count), 1);
     calc_sf_kernel<96>
         <<<num_blocks, num_threads, 0, this->comp_streams_[dev]>>>(
             this->workspace_->sf_re()[dev].d_array().data(),
@@ -1529,7 +1557,7 @@ void glst_force::calc_sf_tile(const unsigned int tile) {
             this->workspace_->qc()[dev].d_array().data(),
             this->workspace_->cell_atom_point()[dev].d_array().data(),
             this->workspace_->cell_atom_count()[dev].d_array().data(),
-            this->plan_->ncell());
+            local_cell_count, first_global_cell);
 
     cudaCheck(cudaGetLastError());
   }

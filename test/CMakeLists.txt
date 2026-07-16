@@ -34,6 +34,13 @@ target_link_libraries(short_range_halo_exchange
   GLST
 )
 
+add_executable(calc_sf_hybrid
+  ${GLST_SOURCE_DIR}/test/calc_sf_hybrid.cu
+)
+target_link_libraries(calc_sf_hybrid
+  GLST
+)
+
 # add_executable(setup_plan
 #   ${GLST_SOURCE_DIR}/test/setup_plan.cu
 # )

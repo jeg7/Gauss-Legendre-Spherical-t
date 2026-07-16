@@ -30,6 +30,8 @@ enum class GLST_EXECUTION_MODE {
   MULTI_GPU_CELL_TILE
 };
 
+class glst_force_test_access;
+
 class glst_force {
 public: // Constructors and destructors
   glst_force(void);
@@ -70,6 +72,9 @@ public: // Energy and force calculation
   void comm_ef(void);
   void calc_ener_force(const double *d_rx, const double *d_ry,
                        const double *d_rz, const double *d_qc);
+
+public:
+  friend class glst_force_test_access;
 
 private:
   void assign_atoms_single_gpu(const double *d_rx, const double *d_ry,
