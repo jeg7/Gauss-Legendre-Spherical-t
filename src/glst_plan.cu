@@ -54,7 +54,10 @@ glst_plan::glst_plan(void)
       ncell_alpha_group_(), rmax_(), alpha_(), zcut_(), cubature_(nullptr),
       max_tile_nodes_(2048), tile_count_(0), tile_group_(), tile_node_point_(),
       tile_node_count_(), tile_partition_count_(1), tile_partition_idx_(),
-      partition_tile_idx_(), partition_tile_node_count_() {}
+      partition_tile_idx_(), partition_tile_node_count_(),
+      cell_partition_count_(1), cell_partition_idx_(),
+      cell_partition_x_point_(), cell_partition_x_count_(),
+      partition_cell_idx_() {}
 
 glst_plan::~glst_plan(void) {}
 
@@ -239,6 +242,50 @@ glst_plan::partition_tile_node_count(const unsigned int tile_partition) const {
   return this->partition_tile_node_count_[tile_partition];
 }
 
+unsigned int glst_plan::cell_partition_count(void) const {
+  return this->cell_partition_count_;
+}
+
+const std::vector<unsigned int> &glst_plan::cell_partition_idx(void) const {
+  return this->cell_partition_idx_;
+}
+
+const std::vector<unsigned int> &glst_plan::cell_partition_x_point(void) const {
+  return this->cell_partition_x_point_;
+}
+
+const std::vector<unsigned int> &glst_plan::cell_partition_x_count(void) const {
+  return this->cell_partition_x_count_;
+}
+
+const std::vector<std::vector<unsigned int>> &
+glst_plan::partition_cell_idx(void) const {
+  return this->partition_cell_idx_;
+}
+
+unsigned int glst_plan::cell_partition_idx(const unsigned int cell) const {
+  if (cell >= this->ncell_) {
+    throw std::runtime_error(
+        "FATAL ERROR: glst_plan::cell_partition_idx: Cell index out of range");
+  }
+  return this->cell_partition_idx_[cell];
+}
+
+const std::vector<unsigned int> &
+glst_plan::partition_cell_idx(const unsigned int cell_partition) const {
+  if (cell_partition >= this->cell_partition_count_) {
+    throw std::runtime_error("FATAL ERROR: glst_plan::partition_cell_idx: Cell "
+                             "partition index out of range");
+  }
+  return this->partition_cell_idx_[cell_partition];
+}
+
+unsigned int
+glst_plan::local_cell_count(const unsigned int cell_partition) const {
+  return static_cast<unsigned int>(
+      this->partition_cell_idx(cell_partition).size());
+}
+
 void glst_plan::init_cells(const unsigned int natom, const double box_dim_x,
                            const double box_dim_y, const double box_dim_z,
                            const double rcut) {
@@ -264,6 +311,8 @@ void glst_plan::init_cells(const unsigned int natom, const double box_dim_x,
     this->ncell_z_++;
 
   this->ncell_ = this->ncell_x_ * this->ncell_y_ * this->ncell_z_;
+
+  this->init_cell_partitions(1);
 
   return;
 }
@@ -458,6 +507,83 @@ void glst_plan::init_tile_partitions(const unsigned int tile_partition_count) {
   }
 
   this->validate();
+
+  return;
+}
+
+void glst_plan::init_cell_partitions(const unsigned int cell_partition_count) {
+  if (cell_partition_count == 0) {
+    throw std::runtime_error("FATAL ERROR: glst_plan::init_cell_partitions: "
+                             "cell_partition_count must be > 0");
+  }
+
+  const unsigned int ncell_x = this->ncell_x_;
+  const unsigned int ncell_y = this->ncell_y_;
+  const unsigned int ncell_z = this->ncell_z_;
+  const unsigned int ncell = this->ncell_;
+
+  if ((ncell_x == 0) || (ncell_y == 0) || (ncell_z == 0)) {
+    throw std::runtime_error("FATAL ERROR: glst_plan::init_cell_partitions: "
+                             "Cell dimensions are invalid");
+  }
+
+  this->cell_partition_count_ = cell_partition_count;
+  this->cell_partition_idx_.assign(ncell, 0);
+  this->cell_partition_x_point_.assign(cell_partition_count, 0);
+  this->cell_partition_x_count_.assign(cell_partition_count, 0);
+
+  this->partition_cell_idx_.clear();
+  this->partition_cell_idx_.resize(cell_partition_count);
+
+  std::vector<unsigned int> cell_visit_count(ncell, 0);
+
+  const unsigned int base_x_count = ncell_x / cell_partition_count;
+  const unsigned int rem_x_count = ncell_x % cell_partition_count;
+
+  for (unsigned int part = 0; part < cell_partition_count; part++) {
+    const unsigned int x_count =
+        base_x_count + ((part < rem_x_count) ? 1u : 0u);
+    const unsigned int x_point =
+        part * base_x_count + ((part < rem_x_count) ? part : rem_x_count);
+
+    this->cell_partition_x_point_[part] = x_point;
+    this->cell_partition_x_count_[part] = x_count;
+
+    std::vector<unsigned int> &cells = this->partition_cell_idx_[part];
+
+    const std::size_t reserve_count = static_cast<std::size_t>(x_count) *
+                                      static_cast<std::size_t>(ncell_y) *
+                                      static_cast<std::size_t>(ncell_z);
+    cells.reserve(reserve_count);
+
+    for (unsigned int x0 = 0; x0 < x_count; x0++) {
+      const unsigned int x = x_point + x0;
+
+      for (unsigned int y = 0; y < ncell_y; y++) {
+        for (unsigned int z = 0; z < ncell_z; z++) {
+          const unsigned int cell = (x * ncell_y + y) * ncell_z + z;
+
+          if (cell >= ncell) {
+            throw std::runtime_error(
+                "FATAL ERROR: glst_plan::init_cell_partitions: "
+                "Computed cell index is out of range");
+          }
+
+          this->cell_partition_idx_[cell] = part;
+          cell_visit_count[cell]++;
+          cells.push_back(cell);
+        }
+      }
+    }
+  }
+
+  for (unsigned int cell = 0; cell < ncell; cell++) {
+    if (cell_visit_count[cell] != 1) {
+      throw std::runtime_error("FATAL ERROR: glst_plan::init_cell_partitions: "
+                               "Every global cell must be "
+                               "assigned to exactly one cell partition");
+    }
+  }
 
   return;
 }
@@ -765,37 +891,105 @@ void glst_plan::validate(void) const {
     }
   }
 
+  if (this->cell_partition_count_ == 0) {
+    throw std::runtime_error(
+        "FATAL ERROR: glst_plan::validate: cell_partition_count_ == 0");
+  }
+
+  if (this->cell_partition_idx_.size() !=
+      static_cast<std::size_t>(this->ncell_)) {
+    throw std::runtime_error("FATAL ERROR: glst_plan::validate: "
+                             "cell_partition_idx size does not match ncell");
+  }
+
+  if (this->cell_partition_x_point_.size() !=
+      static_cast<std::size_t>(this->cell_partition_count_)) {
+    throw std::runtime_error(
+        "FATAL ERROR: glst_plan::validate: cell_partition_x_point size does "
+        "not match cell_partition_count");
+  }
+
+  if (this->cell_partition_x_count_.size() !=
+      static_cast<std::size_t>(this->cell_partition_count_)) {
+    throw std::runtime_error(
+        "FATAL ERROR: glst_plan::validate: cell_partition_x_count size does "
+        "not match cell_partition_count");
+  }
+
+  if (this->partition_cell_idx_.size() !=
+      static_cast<std::size_t>(this->cell_partition_count_)) {
+    throw std::runtime_error(
+        "FATAL ERROR: glst_plan::validate: partition_cell_idx size does not "
+        "match cell_partition_count");
+  }
+
+  std::vector<unsigned int> cell_visit_count(this->ncell_, 0);
+
+  for (unsigned int part = 0; part < this->cell_partition_count_; part++) {
+    const unsigned int x_point = this->cell_partition_x_point_[part];
+    const unsigned int x_count = this->cell_partition_x_count_[part];
+
+    if ((x_point > this->ncell_x_) || (x_count > this->ncell_x_ - x_point)) {
+      throw std::runtime_error("FATAL ERROR: glst_plan::validate: Cell "
+                               "partition x-range is out of bounds");
+    }
+
+    const std::vector<unsigned int> &cells = this->partition_cell_idx_[part];
+
+    for (std::size_t i = 0; i < cells.size(); i++) {
+      const unsigned int cell = cells[i];
+
+      if (cell >= this->ncell_) {
+        throw std::runtime_error("FATAL ERROR: glst_plan::validate: Partition "
+                                 "cell list contains out-of-range cell");
+      }
+
+      if (this->cell_partition_idx_[cell] != part) {
+        throw std::runtime_error(
+            "FATAL ERROR: glst_plan::validate: partition_cell_idx disagrees "
+            "with cell_partition_idx");
+      }
+
+      const unsigned int x = cell / (this->ncell_y_ * this->ncell_z_);
+      if ((x < x_point) || (x >= x_point + x_count)) {
+        throw std::runtime_error("FATAL ERROR: glst_plan::validate: Partition "
+                                 "cell is outside its x-range");
+      }
+
+      cell_visit_count[cell]++;
+    }
+  }
+
+  for (unsigned int cell = 0; cell < this->ncell_; cell++) {
+    if (cell_visit_count[cell] != 1) {
+      throw std::runtime_error(
+          "FATAL ERROR: glst_plan::validate: Every global cell must belong to "
+          "exactly one cell partition");
+    }
+  }
+
   return;
 }
 
 void glst_plan::print_tile_diagnostics(std::ostream &os) const {
-  const std::size_t tile_buffer_count =
-      static_cast<std::size_t>(this->ncell_) *
-      static_cast<std::size_t>(this->max_tile_nodes_);
+  os << "              Number of GLST tiles: " << this->tile_count_
+     << std::endl;
+  os << "   Maximum cubature nodes per tile: " << this->max_tile_nodes_
+     << std::endl;
 
-  // Initial tiled workspace stores four tile-sized double buffers: sf_re,
-  // sf_im, rmt_sum_re, rmt_sum_im
-  const std::size_t tile_buffer_bytes =
-      static_cast<std::size_t>(4) * tile_buffer_count * sizeof(double);
-
-  const double tile_buffer_mib =
-      static_cast<double>(tile_buffer_bytes) / (1024.0 * 1024.0);
-
-  os << "              Number of GLST tiles: " << this->tile_count_ << '\n';
-  os << "   Maximum cubature nodes per tile: " << this->max_tile_nodes_ << '\n';
-  os << "       Tile-buffer memory estimate: " << tile_buffer_mib << " MiB ("
-     << tile_buffer_bytes << " bytes)" << '\n';
   for (unsigned int group = 0; group < this->ngroup_; group++) {
     os << "        Number of tiles in group " << group << ": "
-       << this->tiles_in_group(group) << '\n';
+       << this->tiles_in_group(group) << std::endl;
   }
-  os << "         Number of tile partitions: " << this->tile_partition_count_
-     << '\n';
+
+  os << "        Number of tile partitions: " << this->tile_partition_count_
+     << std::endl;
+
   for (unsigned int partition = 0; partition < this->tile_partition_count_;
        partition++) {
-    os << "             Number of tiles in tile partition " << partition << ": "
+    os << "        Number of tiles in tile partition " << partition << ": "
        << this->partition_tile_idx_[partition].size() << " ("
-       << this->partition_tile_node_count_[partition] << " nodes)" << '\n';
+       << this->partition_tile_node_count_[partition] << " nodes)" << std::endl;
   }
 
   return;

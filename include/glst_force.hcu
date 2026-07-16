@@ -20,6 +20,7 @@
 #include <iosfwd>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <vector>
 
 enum class GLST_EXECUTION_MODE {
@@ -78,7 +79,6 @@ private:
 
 private:
   void deallocate(void);
-  // void init_gpu_layout(const int device_count);
   void init_cuda_resources(void);
 
   void init_nccl_topology(void);
@@ -87,6 +87,8 @@ private:
 
   void init_gpu_layout(const int device_count);
   void cells2dev(void);
+
+  void require_single_gpu_runtime(const std::string_view method) const;
 
 private:
   std::unique_ptr<glst_plan> plan_;
@@ -101,10 +103,6 @@ private:
   std::vector<unsigned int> dev_tile_partition_;
 
   int cuda_count_;
-  std::vector<unsigned int> cell_partition_idx_;
-  std::vector<unsigned int> cell_partition_x_point_;
-  std::vector<unsigned int> cell_partition_x_count_;
-  std::vector<std::vector<unsigned int>> partition_cell_idx_;
   std::vector<cuda_container<unsigned int>> dev_cell_idx_;
   std::vector<cudaStream_t> comp_streams_;
   std::vector<cudaStream_t> comm_streams_;

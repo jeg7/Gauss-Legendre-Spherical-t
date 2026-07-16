@@ -86,18 +86,27 @@ public:
   unsigned int
   partition_tile_node_count(const unsigned int tile_partition) const;
 
+  unsigned int cell_partition_count(void) const;
+
+  const std::vector<unsigned int> &cell_partition_idx(void) const;
+  const std::vector<unsigned int> &cell_partition_x_point(void) const;
+  const std::vector<unsigned int> &cell_partition_x_count(void) const;
+  const std::vector<std::vector<unsigned int>> &partition_cell_idx(void) const;
+
+  unsigned int cell_partition_idx(const unsigned int cell) const;
+  const std::vector<unsigned int> &
+  partition_cell_idx(const unsigned int cell_partition) const;
+  unsigned int local_cell_count(const unsigned int cell_partition) const;
+
 public:
   void init_cells(const unsigned int natom, const double box_dim_x,
                   const double box_dim_y, const double box_dim_z,
                   const double rcut);
-
   void init_alpha_groups(const double tol);
-
   void init_cubature(const double tol);
-
   void init_tile_schedule(const unsigned int max_tile_nodes = 2048);
-
   void init_tile_partitions(const unsigned int tile_partition_count);
+  void init_cell_partitions(const unsigned int cell_partition_count);
 
   void validate(void) const;
 
@@ -141,6 +150,12 @@ private:
   std::vector<unsigned int> tile_partition_idx_;
   std::vector<std::vector<unsigned int>> partition_tile_idx_;
   std::vector<unsigned int> partition_tile_node_count_;
+
+  unsigned int cell_partition_count_;
+  std::vector<unsigned int> cell_partition_idx_;
+  std::vector<unsigned int> cell_partition_x_point_;
+  std::vector<unsigned int> cell_partition_x_count_;
+  std::vector<std::vector<unsigned int>> partition_cell_idx_;
 };
 
 #endif

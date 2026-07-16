@@ -23,13 +23,22 @@ class glst_workspace {
 public:
   glst_workspace(void);
   glst_workspace(const glst_plan &plan, const int device_count = 1);
+  glst_workspace(const glst_plan &plan,
+                 const std::vector<unsigned int> &dev_cell_partition,
+                 const int device_count = 1);
   ~glst_workspace(void);
 
 public:
-  std::size_t atom_capacity(void) const;
-  std::size_t cell_capacity(void) const;
+  std::size_t max_atom_capacity(void) const;
+  std::size_t max_cell_capacity(void) const;
   std::size_t tile_node_capacity(void) const;
-  std::size_t tile_buffer_capacity(void) const;
+  std::size_t max_sf_tile_buffer_capacity(void) const;
+  std::size_t max_rmt_tile_buffer_capacity(void) const;
+
+  std::size_t atom_capacity(const int dev) const;
+  std::size_t cell_capacity(const int dev) const;
+  std::size_t sf_tile_buffer_capacity(const int dev) const;
+  std::size_t rmt_tile_buffer_capacity(const int dev) const;
 
   const std::vector<cuda_container<unsigned int>> &idx(void) const;
   const std::vector<cuda_container<unsigned int>> &sorted_idx(void) const;
@@ -90,17 +99,26 @@ public:
 
 public:
   void init(const glst_plan &plan, const int device_count = 1);
+  void init(const glst_plan &plan,
+            const std::vector<unsigned int> &dev_cell_partition,
+            const int device_count = 1);
   void clear(void);
 
 private:
-  void allocate_cub(const std::size_t natom, const int device_count);
+  void allocate_cub(const int device_count);
   void deallocate_cub(void);
 
 private:
-  std::size_t atom_capacity_;
-  std::size_t cell_capacity_;
+  std::size_t max_atom_capacity_;
+  std::size_t max_cell_capacity_;
   std::size_t tile_node_capacity_;
-  std::size_t tile_buffer_capacity_;
+  std::size_t max_sf_tile_buffer_capacity_;
+  std::size_t max_rmt_tile_buffer_capacity_;
+
+  std::vector<std::size_t> atom_capacity_;
+  std::vector<std::size_t> cell_capacity_;
+  std::vector<std::size_t> sf_tile_buffer_capacity_;
+  std::vector<std::size_t> rmt_tile_buffer_capacity_;
 
   // Atom arrays: Size atom_capacity_ (natom)
   std::vector<cuda_container<unsigned int>> idx_;
