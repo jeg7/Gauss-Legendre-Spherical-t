@@ -57,7 +57,9 @@ glst_plan::glst_plan(void)
       partition_tile_idx_(), partition_tile_node_count_(),
       cell_partition_count_(1), cell_partition_idx_(),
       cell_partition_x_point_(), cell_partition_x_count_(),
-      partition_cell_idx_() {}
+      partition_cell_idx_(), partition_left_halo_cell_idx_(),
+      partition_right_halo_cell_idx_(), partition_halo_cell_idx_(),
+      partition_sr_source_cell_idx_() {}
 
 glst_plan::~glst_plan(void) {}
 
@@ -284,6 +286,66 @@ unsigned int
 glst_plan::local_cell_count(const unsigned int cell_partition) const {
   return static_cast<unsigned int>(
       this->partition_cell_idx(cell_partition).size());
+}
+
+const std::vector<std::vector<unsigned int>> &
+glst_plan::partition_left_halo_cell_idx(void) const {
+  return this->partition_left_halo_cell_idx_;
+}
+
+const std::vector<std::vector<unsigned int>> &
+glst_plan::partition_right_halo_cell_idx(void) const {
+  return this->partition_right_halo_cell_idx_;
+}
+
+const std::vector<std::vector<unsigned int>> &
+glst_plan::partition_halo_cell_idx(void) const {
+  return this->partition_halo_cell_idx_;
+}
+
+const std::vector<std::vector<unsigned int>> &
+glst_plan::partition_sr_source_cell_idx(void) const {
+  return this->partition_sr_source_cell_idx_;
+}
+
+const std::vector<unsigned int> &glst_plan::partition_left_halo_cell_idx(
+    const unsigned int cell_partition) const {
+  if (cell_partition >= this->cell_partition_count_) {
+    throw std::runtime_error(
+        "FATAL ERROR: glst_plan::partition_left_halo_cell_idx: Cell partition "
+        "index out of range");
+  }
+  return this->partition_left_halo_cell_idx_[cell_partition];
+}
+
+const std::vector<unsigned int> &glst_plan::partition_right_halo_cell_idx(
+    const unsigned int cell_partition) const {
+  if (cell_partition >= this->cell_partition_count_) {
+    throw std::runtime_error(
+        "FATAL ERROR: glst_plan::partition_right_halo_cell_idx: Cell partition "
+        "index out of range");
+  }
+  return this->partition_right_halo_cell_idx_[cell_partition];
+}
+
+const std::vector<unsigned int> &
+glst_plan::partition_halo_cell_idx(const unsigned int cell_partition) const {
+  if (cell_partition >= this->cell_partition_count_) {
+    throw std::runtime_error(
+        "FATAL ERROR: glst_plan::partition_halo_cell_idx: Cell partition "
+        "index out of range");
+  }
+  return this->partition_halo_cell_idx_[cell_partition];
+}
+
+const std::vector<unsigned int> &glst_plan::partition_sr_source_cell_idx(
+    const unsigned int cell_partition) const {
+  if (cell_partition >= this->cell_partition_count_) {
+    throw std::runtime_error(
+        "FATAL ERROR: glst_plan::partition_sr_source_cell_idx: Cell partition "
+        "index out of range");
+  }
+  return this->partition_sr_source_cell_idx_[cell_partition];
 }
 
 unsigned int
@@ -670,6 +732,8 @@ void glst_plan::init_cell_partitions(const unsigned int cell_partition_count) {
                                "assigned to exactly one cell partition");
     }
   }
+
+  this->init_short_range_halo_plan();
 
   return;
 }
@@ -1090,6 +1154,131 @@ void glst_plan::validate(void) const {
     }
   }
 
+  if (this->partition_left_halo_cell_idx_.size() !=
+      static_cast<std::size_t>(this->cell_partition_count_)) {
+    throw std::runtime_error("FATAL ERROR: glst_plan::validate: left halo "
+                             "metadata size does not match cell partitions");
+  }
+
+  if (this->partition_right_halo_cell_idx_.size() !=
+      static_cast<std::size_t>(this->cell_partition_count_)) {
+    throw std::runtime_error("FATAL ERROR: glst_plan::validate: right halo "
+                             "metadata size does not match cell partitions");
+  }
+
+  if (this->partition_halo_cell_idx_.size() !=
+      static_cast<std::size_t>(this->cell_partition_count_)) {
+    throw std::runtime_error("FATAL ERROR: glst_plan::validate: halo metadata "
+                             "size does not match cell partitions");
+  }
+
+  if (this->partition_sr_source_cell_idx_.size() !=
+      static_cast<std::size_t>(this->cell_partition_count_)) {
+    throw std::runtime_error(
+        "FATAL ERROR: glst_plan::validate: short-range source metadata size "
+        "does not match cell partitions");
+  }
+
+  const unsigned int yz_count = this->ncell_y_ * this->ncell_z_;
+
+  for (unsigned int part = 0; part < this->cell_partition_count_; part++) {
+    const unsigned int x_point = this->cell_partition_x_point_[part];
+    const unsigned int x_count = this->cell_partition_x_count_[part];
+    const unsigned int x_end = x_point + x_count;
+
+    const std::vector<unsigned int> &owned_cells =
+        this->partition_cell_idx_[part];
+    const std::vector<unsigned int> &left_cells =
+        this->partition_left_halo_cell_idx_[part];
+    const std::vector<unsigned int> &right_cells =
+        this->partition_right_halo_cell_idx_[part];
+    const std::vector<unsigned int> &halo_cells =
+        this->partition_halo_cell_idx_[part];
+    const std::vector<unsigned int> &source_cells =
+        this->partition_sr_source_cell_idx_[part];
+
+    const std::size_t expected_left_count =
+        ((x_count > 0) && (x_point > 0)) ? static_cast<std::size_t>(yz_count)
+                                         : 0;
+    const std::size_t expected_right_count =
+        ((x_count > 0) && (x_end < this->ncell_x_))
+            ? static_cast<std::size_t>(yz_count)
+            : 0;
+
+    if (left_cells.size() != expected_left_count) {
+      throw std::runtime_error("FATAL ERROR: glst_plan::validate: left halo "
+                               "plane size is incorrect");
+    }
+
+    if (right_cells.size() != expected_right_count) {
+      throw std::runtime_error("FATAL ERROR: glst_plan::validate: right halo "
+                               "plane size is incorrect");
+    }
+
+    if (halo_cells.size() != left_cells.size() + right_cells.size()) {
+      throw std::runtime_error("FATAL ERROR: glst_plan::validate: combined "
+                               "halo size is inconsistent");
+    }
+
+    if (source_cells.size() != owned_cells.size() + halo_cells.size()) {
+      throw std::runtime_error("FATAL ERROR: glst_plan::validate: short-range "
+                               "source size is inconsistent");
+    }
+
+    for (std::size_t i = 0; i < owned_cells.size(); i++) {
+      if (source_cells[i] != owned_cells[i]) {
+        throw std::runtime_error(
+            "FATAL ERROR: glst_plan::validate: short-range source list does "
+            "not start with owned cells");
+      }
+    }
+
+    for (std::size_t i = 0; i < halo_cells.size(); i++) {
+      if (source_cells[owned_cells.size() + i] != halo_cells[i]) {
+        throw std::runtime_error(
+            "FATAL ERROR: glst_plan::validate: short-range source list does "
+            "not append halo cells");
+      }
+    }
+
+    for (std::size_t i = 0; i < left_cells.size(); i++) {
+      unsigned int x = 0, y = 0, z = 0;
+      this->global_cell_coords(x, y, z, left_cells[i]);
+
+      if (x != x_point - 1) {
+        throw std::runtime_error("FATAL ERROR: glst_plan::validate: left halo "
+                                 "cell is not on the adjacent x plane");
+      }
+
+      if (this->cell_partition_idx_[left_cells[i]] == part) {
+        throw std::runtime_error("FATAL ERROR: glst_plan::validate: left halo "
+                                 "cell is owned by the target partition");
+      }
+    }
+
+    for (std::size_t i = 0; i < right_cells.size(); i++) {
+      unsigned int x = 0, y = 0, z = 0;
+      this->global_cell_coords(x, y, z, right_cells[i]);
+
+      if (x != x_end) {
+        throw std::runtime_error("FATAL ERROR: glst_plan::validate: right halo "
+                                 "cell is not on the adjacent x plane");
+      }
+
+      if (this->cell_partition_idx_[right_cells[i]] == part) {
+        throw std::runtime_error("FATAL ERROR: glst_plan::validate: right halo "
+                                 "cell is owned by the target partition");
+      }
+    }
+
+    if (this->cell_partition_count_ == 1) {
+      if (!halo_cells.empty()) {
+        throw std::runtime_error("FATAL ERROR: glst_plan::validate: single-GPU "
+                                 "partition has halo cells");
+      }
+    }
+  }
+
   return;
 }
 
@@ -1112,6 +1301,73 @@ void glst_plan::print_tile_diagnostics(std::ostream &os) const {
     os << "        Number of tiles in tile partition " << partition << ": "
        << this->partition_tile_idx_[partition].size() << " ("
        << this->partition_tile_node_count_[partition] << " nodes)" << std::endl;
+  }
+
+  return;
+}
+
+void glst_plan::init_short_range_halo_plan(void) {
+  const unsigned int yz_count = this->ncell_y_ * this->ncell_z_;
+
+  this->partition_left_halo_cell_idx_.clear();
+  this->partition_right_halo_cell_idx_.clear();
+  this->partition_halo_cell_idx_.clear();
+  this->partition_sr_source_cell_idx_.clear();
+
+  this->partition_left_halo_cell_idx_.resize(this->cell_partition_count_);
+  this->partition_right_halo_cell_idx_.resize(this->cell_partition_count_);
+  this->partition_halo_cell_idx_.resize(this->cell_partition_count_);
+  this->partition_sr_source_cell_idx_.resize(this->cell_partition_count_);
+
+  for (unsigned int partition = 0; partition < this->cell_partition_count_;
+       partition++) {
+    const unsigned int x_point = this->cell_partition_x_point_[partition];
+    const unsigned int x_count = this->cell_partition_x_count_[partition];
+    const unsigned int x_end = x_point + x_count;
+
+    std::vector<unsigned int> &left_cells =
+        this->partition_left_halo_cell_idx_[partition];
+    std::vector<unsigned int> &right_cells =
+        this->partition_right_halo_cell_idx_[partition];
+    std::vector<unsigned int> &halo_cells =
+        this->partition_halo_cell_idx_[partition];
+    std::vector<unsigned int> &source_cells =
+        this->partition_sr_source_cell_idx_[partition];
+
+    if (x_count == 0)
+      continue;
+
+    left_cells.reserve(yz_count);
+    right_cells.reserve(yz_count);
+
+    if (x_point > 0) {
+      const unsigned int x = x_point - 1;
+      for (unsigned int y = 0; y < this->ncell_y_; y++) {
+        for (unsigned int z = 0; z < this->ncell_z_; z++)
+          left_cells.push_back((x * this->ncell_y_ + y) * this->ncell_z_ + z);
+      }
+    }
+
+    if (x_end < this->ncell_x_) {
+      const unsigned int x = x_end;
+      for (unsigned int y = 0; y < this->ncell_y_; y++) {
+        for (unsigned int z = 0; z < this->ncell_z_; z++)
+          right_cells.push_back((x * this->ncell_y_ + y) * this->ncell_z_ + z);
+      }
+    }
+
+    halo_cells.reserve(left_cells.size() + right_cells.size());
+    halo_cells.insert(halo_cells.end(), left_cells.begin(), left_cells.end());
+    halo_cells.insert(halo_cells.end(), right_cells.begin(), right_cells.end());
+
+    const std::vector<unsigned int> &owned_cells =
+        this->partition_cell_idx_[partition];
+
+    source_cells.reserve(owned_cells.size() + halo_cells.size());
+    source_cells.insert(source_cells.end(), owned_cells.begin(),
+                        owned_cells.end());
+    source_cells.insert(source_cells.end(), halo_cells.begin(),
+                        halo_cells.end());
   }
 
   return;

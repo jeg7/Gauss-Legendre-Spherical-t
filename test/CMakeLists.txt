@@ -20,6 +20,13 @@ target_link_libraries(cell_mapping_hybrid
   GLST
 )
 
+add_executable(short_range_halo_plan
+  ${GLST_SOURCE_DIR}/test/short_range_halo_plan.cu
+)
+target_link_libraries(short_range_halo_plan
+  GLST
+)
+
 # add_executable(setup_plan
 #   ${GLST_SOURCE_DIR}/test/setup_plan.cu
 # )

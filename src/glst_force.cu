@@ -270,6 +270,25 @@ void glst_force::init(const unsigned int natom, const double tol,
               << ", " << x_point + x_count << "), cells "
               << this->plan_->partition_cell_idx(partition).size() << std::endl;
   }
+  std::cout << " Short-range halo planning: " << std::endl;
+  for (unsigned int partition = 0;
+       partition < this->plan_->cell_partition_count(); partition++) {
+    const std::size_t owned_count =
+        this->plan_->partition_cell_idx(partition).size();
+    const std::size_t left_count =
+        this->plan_->partition_left_halo_cell_idx(partition).size();
+    const std::size_t right_count =
+        this->plan_->partition_right_halo_cell_idx(partition).size();
+    const std::size_t halo_count =
+        this->plan_->partition_halo_cell_idx(partition).size();
+    const std::size_t source_count =
+        this->plan_->partition_sr_source_cell_idx(partition).size();
+
+    std::cout << "        cell partition " << partition << ": owned targets "
+              << owned_count << ", halo cells " << halo_count << " (left "
+              << left_count << ", right " << right_count
+              << "), short-range source cells " << source_count << std::endl;
+  }
   std::cout << std::endl;
 
   this->print_nccl_topology(std::cout);
