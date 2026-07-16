@@ -72,6 +72,11 @@ public: // Energy and force calculation
                        const double *d_rz, const double *d_qc);
 
 private:
+  void assign_atoms_single_gpu(const double *d_rx, const double *d_ry,
+                               const double *d_rz, const double *d_qc);
+  void validate_atom_scatter(void) const;
+  void assign_atoms_multi_gpu(const double *d_rx, const double *d_ry,
+                              const double *d_rz, const double *d_qc);
   void calc_sf_tile(const unsigned int tile);
   void sum_rmt_sf_tile(const unsigned int tile);
   void calc_lr_ef_tile(const unsigned int tile);

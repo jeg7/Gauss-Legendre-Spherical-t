@@ -102,10 +102,13 @@ public:
   void init(const glst_plan &plan,
             const std::vector<unsigned int> &dev_cell_partition,
             const int device_count = 1);
+  void resize_atom_storage(const int dev, const std::size_t atom_capacity);
   void clear(void);
 
 private:
+  void allocate_cub_for_device(const int dev);
   void allocate_cub(const int device_count);
+  void deallocate_cub_for_device(const int dev);
   void deallocate_cub(void);
 
 private:

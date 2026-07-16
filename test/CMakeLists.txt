@@ -6,6 +6,13 @@ target_link_libraries(full_example
   utils
 )
 
+add_executable(assign_atoms_hybrid
+  ${GLST_SOURCE_DIR}/test/assign_atoms_hybrid.cu
+)
+target_link_libraries(assign_atoms_hybrid
+  GLST
+)
+
 # add_executable(setup_plan
 #   ${GLST_SOURCE_DIR}/test/setup_plan.cu
 # )

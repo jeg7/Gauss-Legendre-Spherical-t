@@ -473,6 +473,47 @@ void glst_workspace::init(const glst_plan &plan,
   return;
 }
 
+void glst_workspace::resize_atom_storage(const int dev,
+                                         const std::size_t atom_capacity) {
+  if (static_cast<std::size_t>(dev) >= this->atom_capacity_.size()) {
+    throw std::runtime_error(
+        "FATAL ERROR: glst_workspace::resize_atom_storage: Device index out of "
+        "range");
+  }
+
+  cudaCheck(cudaSetDevice(dev));
+
+  this->deallocate_cub_for_device(dev);
+
+  this->atom_capacity_[dev] = atom_capacity;
+
+  this->idx_[dev].resize(atom_capacity);
+  this->sorted_idx_[dev].resize(atom_capacity);
+  this->rx_[dev].resize(atom_capacity);
+  this->ry_[dev].resize(atom_capacity);
+  this->rz_[dev].resize(atom_capacity);
+  this->qc_[dev].resize(atom_capacity);
+  this->packets_[dev].resize(atom_capacity);
+  this->sorted_packets_[dev].resize(atom_capacity);
+  this->atom_cell_idx_[dev].resize(atom_capacity);
+  this->atom_cell_sorted_idx_[dev].resize(atom_capacity);
+
+  this->fx_[dev].resize(atom_capacity);
+  this->fy_[dev].resize(atom_capacity);
+  this->fz_[dev].resize(atom_capacity);
+  this->en_[dev].resize(atom_capacity);
+
+  this->max_atom_capacity_ = 0;
+  for (std::size_t i = 0; i < this->atom_capacity_.size(); i++) {
+    if (this->atom_capacity_[i] > this->max_atom_capacity_)
+      this->max_atom_capacity_ = this->atom_capacity_[i];
+  }
+
+  this->allocate_cub_for_device(dev);
+
+  return;
+}
+
 void glst_workspace::clear(void) {
   this->deallocate_cub();
 
@@ -518,75 +559,86 @@ void glst_workspace::clear(void) {
   return;
 }
 
+void glst_workspace::allocate_cub_for_device(const int dev) {
+  cudaCheck(cudaSetDevice(dev));
+
+  this->cub_work_buffer_[dev] = nullptr;
+  this->cub_work_buffer_size_[dev] = 0;
+
+  const std::size_t atom_capacity = this->atom_capacity_[dev];
+
+  if (atom_capacity == 0)
+    return;
+
+  if (atom_capacity >
+      static_cast<std::size_t>(std::numeric_limits<int>::max())) {
+    throw std::runtime_error("FATAL ERROR: glst_workspace::allocate_cub: "
+                             "Atom capacity exceeds CUB int range");
+  }
+
+  const int num_items = static_cast<int>(atom_capacity);
+
+  // Determine storage requirements for CUB functions
+  std::size_t size0 = 0, size1 = 0, size2 = 0;
+
+  cub::DeviceRadixSort::SortPairs(
+      this->cub_work_buffer_[dev], size0,
+      this->atom_cell_idx_[dev].d_array().data(),
+      this->atom_cell_sorted_idx_[dev].d_array().data(),
+      this->idx_[dev].d_array().data(), this->sorted_idx_[dev].d_array().data(),
+      num_items);
+
+  cub::DeviceRadixSort::SortPairs(
+      this->cub_work_buffer_[dev], size1,
+      this->atom_cell_idx_[dev].d_array().data(),
+      this->atom_cell_sorted_idx_[dev].d_array().data(),
+      this->fx_[dev].d_array().data(), this->fx_[dev].d_array().data(),
+      num_items);
+
+  cub::DeviceRadixSort::SortPairs(
+      this->cub_work_buffer_[dev], size2,
+      this->atom_cell_idx_[dev].d_array().data(),
+      this->atom_cell_sorted_idx_[dev].d_array().data(),
+      this->packets_[dev].d_array().data(),
+      this->sorted_packets_[dev].d_array().data(), num_items);
+
+  this->cub_work_buffer_size_[dev] = size0;
+  if (size1 > this->cub_work_buffer_size_[dev])
+    this->cub_work_buffer_size_[dev] = size1;
+  if (size2 > this->cub_work_buffer_size_[dev])
+    this->cub_work_buffer_size_[dev] = size2;
+
+  cudaCheck(cudaMalloc(&(this->cub_work_buffer_[dev]),
+                       this->cub_work_buffer_size_[dev]));
+
+  return;
+}
+
 void glst_workspace::allocate_cub(const int device_count) {
   this->cub_work_buffer_.resize(device_count);
   this->cub_work_buffer_size_.resize(device_count);
 
-  for (int dev = 0; dev < device_count; dev++) {
-    cudaCheck(cudaSetDevice(dev));
+  for (int dev = 0; dev < device_count; dev++)
+    this->allocate_cub_for_device(dev);
 
+  return;
+}
+
+void glst_workspace::deallocate_cub_for_device(const int dev) {
+  cudaCheck(cudaSetDevice(dev));
+  if (this->cub_work_buffer_[dev] != nullptr) {
+    cudaCheck(cudaFree(this->cub_work_buffer_[dev]));
     this->cub_work_buffer_[dev] = nullptr;
-    this->cub_work_buffer_size_[dev] = 0;
-
-    const std::size_t atom_capacity = this->atom_capacity_[dev];
-
-    if (atom_capacity == 0)
-      continue;
-
-    if (atom_capacity >
-        static_cast<std::size_t>(std::numeric_limits<int>::max())) {
-      throw std::runtime_error("FATAL ERROR: glst_workspace::allocate_cub: "
-                               "Atom capacity exceeds CUB int range");
-    }
-
-    const int num_items = static_cast<int>(atom_capacity);
-
-    // Determine storage requirements for CUB functions
-    std::size_t size0 = 0, size1 = 0, size2 = 0;
-
-    cub::DeviceRadixSort::SortPairs(
-        this->cub_work_buffer_[dev], size0,
-        this->atom_cell_idx_[dev].d_array().data(),
-        this->atom_cell_sorted_idx_[dev].d_array().data(),
-        this->idx_[dev].d_array().data(),
-        this->sorted_idx_[dev].d_array().data(), num_items);
-
-    cub::DeviceRadixSort::SortPairs(
-        this->cub_work_buffer_[dev], size1,
-        this->atom_cell_idx_[dev].d_array().data(),
-        this->atom_cell_sorted_idx_[dev].d_array().data(),
-        this->fx_[dev].d_array().data(), this->fx_[dev].d_array().data(),
-        num_items);
-
-    cub::DeviceRadixSort::SortPairs(
-        this->cub_work_buffer_[dev], size2,
-        this->atom_cell_idx_[dev].d_array().data(),
-        this->atom_cell_sorted_idx_[dev].d_array().data(),
-        this->packets_[dev].d_array().data(),
-        this->sorted_packets_[dev].d_array().data(), num_items);
-
-    this->cub_work_buffer_size_[dev] = size0;
-    if (size1 > this->cub_work_buffer_size_[dev])
-      this->cub_work_buffer_size_[dev] = size1;
-    if (size2 > this->cub_work_buffer_size_[dev])
-      this->cub_work_buffer_size_[dev] = size2;
-
-    cudaCheck(cudaMalloc(&(this->cub_work_buffer_[dev]),
-                         this->cub_work_buffer_size_[dev]));
   }
+
+  this->cub_work_buffer_size_[dev] = 0;
 
   return;
 }
 
 void glst_workspace::deallocate_cub(void) {
-  for (std::size_t dev = 0; dev < this->cub_work_buffer_.size(); dev++) {
-    cudaCheck(cudaSetDevice(static_cast<int>(dev)));
-    if (this->cub_work_buffer_[dev] != nullptr) {
-      cudaCheck(cudaFree(this->cub_work_buffer_[dev]));
-      this->cub_work_buffer_[dev] = nullptr;
-    }
-    this->cub_work_buffer_size_[dev] = 0;
-  }
+  for (std::size_t dev = 0; dev < this->cub_work_buffer_.size(); dev++)
+    this->deallocate_cub_for_device(static_cast<int>(dev));
 
   return;
 }
