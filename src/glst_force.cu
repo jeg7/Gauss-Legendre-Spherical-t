@@ -388,6 +388,7 @@ void glst_force::calc_lr_ef(void) {
 
   for (unsigned int tile = 0; tile < this->plan_->tile_count(); tile++) {
     this->calc_sf_tile(tile);
+    this->exchange_sf_tile(tile);
     this->sum_rmt_sf_tile(tile);
     this->calc_lr_ef_tile(tile);
   }
@@ -739,6 +740,7 @@ void glst_force::calc_ener_force(const double *d_rx, const double *d_ry,
 
   for (unsigned int tile = 0; tile < this->plan_->tile_count(); tile++) {
     this->calc_sf_tile(tile);
+    this->exchange_sf_tile(tile);
     this->sum_rmt_sf_tile(tile);
     this->calc_lr_ef_tile(tile);
   }
@@ -1560,6 +1562,142 @@ void glst_force::calc_sf_tile(const unsigned int tile) {
             local_cell_count, first_global_cell);
 
     cudaCheck(cudaGetLastError());
+  }
+
+  return;
+}
+
+void glst_force::exchange_sf_tile(const unsigned int tile) {
+  if (this->plan_ == nullptr) {
+    throw std::runtime_error(
+        "FATAL ERROR: glst_force::exchange_sf_tile: Plan is not initialized");
+  }
+
+  const bool has_long_range_cells =
+      ((this->plan_->ncell_x() > 2) && (this->plan_->ncell_y() > 2) &&
+       (this->plan_->ncell_z() > 2));
+  if (!has_long_range_cells)
+    return;
+
+  if (tile >= this->plan_->tile_count()) {
+    throw std::runtime_error(
+        "FATAL ERROR: glst_force::exchange_sf_tile: Tile is out of bounds");
+  }
+
+  const unsigned int tile_node_count = this->plan_->tile_node_count(tile);
+
+  if (tile_node_count == 0) {
+    throw std::runtime_error(
+        "FATAL ERROR: glst_force::exchange_sf_tile: Tile node count is 0");
+  }
+
+  if (tile_node_count > this->plan_->max_tile_nodes()) {
+    throw std::runtime_error(
+        "FATAL ERROR: glst_force::exchange_sf_tile: Tile exceeds buffer size");
+  }
+
+  // No cell-domain communication is required when there is only one cell
+  // partition. This covers both single-GPU mode and pure tile decomposition.
+  if (this->cell_partition_count_ == 1)
+    return;
+
+  const unsigned int tile_partition = this->plan_->tile_partition_idx(tile);
+
+  if ((static_cast<std::size_t>(tile_partition) >=
+       this->cell_comm_devs_.size()) ||
+      (static_cast<std::size_t>(tile_partition) >= this->cell_comms_.size())) {
+    throw std::runtime_error("FATAL ERROR: glst_force::exchange_sf_tile: Tile "
+                             "partition does not have a cell communicator");
+  }
+
+  const std::vector<int> &devs = this->cell_comm_devs_[tile_partition];
+  const std::vector<ncclComm_t> &comms = this->cell_comms_[tile_partition];
+
+  if (devs.size() != static_cast<std::size_t>(this->cell_partition_count_)) {
+    throw std::runtime_error(
+        "FATAL ERROR: glst_force::exchange_sf_tile: Cell communicator device "
+        "count does not match cell partition count");
+  }
+
+  if (comms.size() != devs.size()) {
+    throw std::runtime_error(
+        "FATAL ERROR: glst_force::exchange_sf_tile: Cell communicator handle "
+        "count does not match device count");
+  }
+
+  const std::size_t sf_entry_count =
+      static_cast<std::size_t>(this->plan_->ncell()) *
+      static_cast<std::size_t>(tile_node_count);
+
+  // Make each communication stream wait for calc_sf_tile on its corresponding
+  // compute stream.
+  for (std::size_t rank = 0; rank < devs.size(); rank++) {
+    const int dev = devs[rank];
+
+    if ((dev < 0) || (dev >= this->cuda_count_)) {
+      throw std::runtime_error("FATAL ERROR: glst_force::exchange_sf_tile: "
+                               "Cell communicator device is out of range");
+    }
+
+    if (this->dev_tile_partition_[dev] != tile_partition) {
+      throw std::runtime_error("FATAL ERROR: glst_force::exchange_sf_tile: "
+                               "Device belongs to the wrong tile partition");
+    }
+
+    if (this->dev_cell_partition_[dev] != static_cast<unsigned int>(rank)) {
+      throw std::runtime_error(
+          "FATAL ERROR: glst_force::exchange_sf_tile: Cell communicator rank "
+          "does not match cell partition");
+    }
+
+    if (sf_entry_count > this->workspace_->sf_tile_buffer_capacity(dev)) {
+      throw std::runtime_error("FATAL ERROR: glst_force::exhcnage_sf_tile: "
+                               "Active SF tile exceeds workspace capacity");
+    }
+
+    cudaCheck(cudaSetDevice(dev));
+    cudaCheck(
+        cudaEventRecord(this->comp_events_[dev], this->comp_streams_[dev]));
+    cudaCheck(cudaStreamWaitEvent(this->comm_streams_[dev],
+                                  this->comp_events_[dev], 0));
+  }
+
+  // Each cell partition has nonzero entries only for its owned cells. Summing
+  // those disjoint entries reconstructs the complete global S_tile on every
+  // member of this tile partition's cell communicator.
+  ncclCheck(ncclGroupStart());
+
+  for (std::size_t rank = 0; rank < devs.size(); rank++) {
+    const int dev = devs[rank];
+
+    cudaCheck(cudaSetDevice(dev));
+
+    double *sf_re = this->workspace_->sf_re()[dev].d_array().data();
+    double *sf_im = this->workspace_->sf_im()[dev].d_array().data();
+
+    ncclCheck(ncclAllReduce(static_cast<const void *>(sf_re),
+                            static_cast<void *>(sf_re), sf_entry_count,
+                            ncclDouble, ncclSum, comms[rank],
+                            this->comm_streams_[dev]));
+
+    ncclCheck(ncclAllReduce(static_cast<const void *>(sf_im),
+                            static_cast<void *>(sf_im), sf_entry_count,
+                            ncclDouble, ncclSum, comms[rank],
+                            this->comm_streams_[dev]));
+  }
+
+  ncclCheck(ncclGroupEnd());
+
+  // Make subsequent prefix-sum and remote-sum kernels wait for both
+  // all-reduces.
+  for (std::size_t rank = 0; rank < devs.size(); rank++) {
+    const int dev = devs[rank];
+
+    cudaCheck(cudaSetDevice(dev));
+    cudaCheck(
+        cudaEventRecord(this->comm_events_[dev], this->comm_streams_[dev]));
+    cudaCheck(cudaStreamWaitEvent(this->comp_streams_[dev],
+                                  this->comm_events_[dev], 0));
   }
 
   return;

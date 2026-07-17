@@ -68,6 +68,10 @@ public:
   static void calc_sf_tile(glst_force &force, const unsigned int tile) {
     force.calc_sf_tile(tile);
   }
+
+  static void exchange_sf_tile(glst_force &force, const unsigned int tile) {
+    force.exchange_sf_tile(tile);
+  }
 };
 
 static void require(const bool condition, const std::string &message) {
@@ -270,6 +274,111 @@ static double verify_tile(glst_force &force, const std::vector<double> &atom_rx,
         std::ostringstream message;
         message << "GPU " << dev << ", tile " << tile
                 << ": write beyond active compact tile range at SF entry "
+                << entry << " (active entries " << active_entry_count
+                << ", capacity " << buffer_capacity << ")";
+        throw std::runtime_error(message.str());
+      }
+    }
+  }
+
+  glst_force_test_access::exchange_sf_tile(force, tile);
+
+  for (int dev = 0; dev < cuda_count; dev++) {
+    cudaCheck(cudaSetDevice(dev));
+    cudaCheck(cudaDeviceSynchronize());
+
+    workspace.sf_re()[dev].transfer_to_host();
+    workspace.sf_im()[dev].transfer_to_host();
+  }
+
+  for (int dev = 0; dev < cuda_count; dev++) {
+    const unsigned int device_tile_partition =
+        glst_force_test_access::dev_tile_partition(force, dev);
+    const bool owns_tile = (device_tile_partition == tile_partition);
+
+    const std::size_t buffer_capacity = workspace.sf_tile_buffer_capacity(dev);
+
+    if (!owns_tile) {
+      // A cell communicator for this tile must not touch devices belonging to
+      // another tile partition.
+      for (std::size_t entry = 0; entry < buffer_capacity; entry++) {
+        if ((workspace.sf_re()[dev][entry] != sentinel) ||
+            (workspace.sf_im()[dev][entry] != sentinel)) {
+          std::ostringstream message;
+          message << "GPU " << dev << ", tile " << tile
+                  << ": S_tile exchange modified a non-participating tile "
+                     "partition at entry "
+                  << entry;
+          throw std::runtime_error(message.str());
+        }
+      }
+
+      continue;
+    }
+
+    // Every participant must now contain the complete global-cell S_tile.
+    for (unsigned int global_cell = 0; global_cell < plan.ncell();
+         global_cell++) {
+      for (unsigned int local_node = 0; local_node < node_count; local_node++) {
+        const std::size_t entry = static_cast<std::size_t>(global_cell) *
+                                      static_cast<std::size_t>(node_count) +
+                                  static_cast<std::size_t>(local_node);
+
+        const unsigned int global_node = node_point + local_node;
+
+        const double theta = plan.x()[dev][global_node] * atom_rx[global_cell] +
+                             plan.y()[dev][global_node] * atom_ry[global_cell] +
+                             plan.z()[dev][global_node] * atom_rz[global_cell];
+
+        const double expected_re = atom_qc[global_cell] * std::cos(theta);
+        const double expected_im = -atom_qc[global_cell] * std::sin(theta);
+
+        const double observed_re = workspace.sf_re()[dev][entry];
+        const double observed_im = workspace.sf_im()[dev][entry];
+
+        if (!std::isfinite(observed_re) || !std::isfinite(observed_im)) {
+          std::ostringstream message;
+          message << "GPU " << dev << ", tile " << tile
+                  << ": non-finite post-exchange structure factor for global "
+                     "cell "
+                  << global_cell << ", local node " << local_node;
+          throw std::runtime_error(message.str());
+        }
+
+        const double error_re = std::abs(observed_re - expected_re);
+        const double error_im = std::abs(observed_im - expected_im);
+
+        max_error = std::max(max_error, error_re);
+        max_error = std::max(max_error, error_im);
+
+        if ((error_re > threshold) || (error_im > threshold)) {
+          std::ostringstream message;
+          message << "GPU " << dev << ", tile " << tile
+                  << ": post-exchange structure-factor mismatch for global "
+                     "cell "
+                  << global_cell << ", local node " << local_node
+                  << ", global node " << global_node << std::setprecision(17)
+                  << " (observed re=" << observed_re
+                  << ", expected re=" << expected_re
+                  << ", observed im=" << observed_im
+                  << ", expected im=" << expected_im
+                  << ", re error=" << error_re << ", im error=" << error_im
+                  << ")";
+          throw std::runtime_error(message.str());
+        }
+      }
+    }
+
+    // The all-reduce count must cover only the active compact tile. The
+    // unused tail of max_tile_nodes must remain untouched.
+    for (std::size_t entry = active_entry_count; entry < buffer_capacity;
+         entry++) {
+      if ((workspace.sf_re()[dev][entry] != sentinel) ||
+          (workspace.sf_im()[dev][entry] != sentinel)) {
+        std::ostringstream message;
+        message << "GPU " << dev << ", tile " << tile
+                << ": S_tile exchange wrote beyond the active compact range "
+                   "at entry "
                 << entry << " (active entries " << active_entry_count
                 << ", capacity " << buffer_capacity << ")";
         throw std::runtime_error(message.str());
