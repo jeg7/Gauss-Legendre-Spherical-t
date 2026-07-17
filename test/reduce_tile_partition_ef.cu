@@ -571,10 +571,87 @@ static double run_case(const unsigned int cell_partition_count,
   require(reduced_value_count > 0,
           "Reduction test did not check any owned force/energy values");
 
+  // Run the same calculation through the public orchestration method. The
+  // workspace is deliberately nonzero here, so this also verifies that
+  // calc_ener_force zeroes old force/energy values before accumulating.
+  force.calc_ener_force(rx.d_array().data(), ry.d_array().data(),
+                        rz.d_array().data(), qc.d_array().data());
+
+  const ef_snapshot orchestrated = snapshot_ef(workspace, cuda_count);
+
+  double orchestration_max_error = 0.0;
+  std::size_t orchestration_value_count = 0;
+  std::size_t zero_halo_value_count = 0;
+
+  for (unsigned int cell_partition = 0; cell_partition < cell_partition_count;
+       cell_partition++) {
+    const int root_dev = root_devs[cell_partition];
+    const std::size_t owned_atom_count = owned_atom_counts[cell_partition];
+    const std::size_t atom_capacity = workspace.atom_capacity(root_dev);
+
+    require(workspace.owned_atom_count(root_dev) == owned_atom_count,
+            "calc_ener_force changed the root owned atom count");
+
+    for (std::size_t atom = 0; atom < owned_atom_count; atom++) {
+      std::ostringstream prefix;
+      prefix << "calc_ener_force, cell partition " << cell_partition
+             << ", root GPU " << root_dev << ", local atom " << atom;
+
+      double error = verify_close(orchestrated.fx[root_dev][atom],
+                                  expected_fx[cell_partition][atom], threshold,
+                                  prefix.str() + ", fx");
+      orchestration_max_error = std::max(orchestration_max_error, error);
+
+      error = verify_close(orchestrated.fy[root_dev][atom],
+                           expected_fy[cell_partition][atom], threshold,
+                           prefix.str() + ", fy");
+      orchestration_max_error = std::max(orchestration_max_error, error);
+
+      error = verify_close(orchestrated.fz[root_dev][atom],
+                           expected_fz[cell_partition][atom], threshold,
+                           prefix.str() + ", fz");
+      orchestration_max_error = std::max(orchestration_max_error, error);
+
+      error = verify_close(orchestrated.en[root_dev][atom],
+                           expected_en[cell_partition][atom], threshold,
+                           prefix.str() + ", en");
+      orchestration_max_error = std::max(orchestration_max_error, error);
+
+      orchestration_value_count += 4;
+    }
+
+    // calc_ener_force must zero the complete local allocation, while all
+    // calculation and reduction kernels are restricted to owned atoms.
+    for (std::size_t atom = owned_atom_count; atom < atom_capacity; atom++) {
+      if ((orchestrated.fx[root_dev][atom] != 0.0) ||
+          (orchestrated.fy[root_dev][atom] != 0.0) ||
+          (orchestrated.fz[root_dev][atom] != 0.0) ||
+          (orchestrated.en[root_dev][atom] != 0.0)) {
+        std::ostringstream message;
+        message << "calc_ener_force, cell partition " << cell_partition
+                << ", root GPU " << root_dev
+                << ": halo force/energy entry was modified at local atom "
+                << atom << " (owned atoms " << owned_atom_count << ", capacity "
+                << atom_capacity << ")";
+        throw std::runtime_error(message.str());
+      }
+
+      zero_halo_value_count += 4;
+    }
+  }
+
+  require(orchestration_value_count == reduced_value_count,
+          "calc_ener_force checked value count does not match the manual "
+          "reduction reference");
+
+  max_error = std::max(max_error, orchestration_max_error);
+
   std::cout << "PASS reduce_tile_partition_ef: layout " << cell_partition_count
             << " x " << tile_partition_count << ", " << ncell_axis
             << "^3 cells, " << reduced_value_count << " reduced values, "
-            << checked_halo_count << " halo values, max error "
+            << orchestration_value_count << " calc_ener_force values, "
+            << checked_halo_count << " preserved sentinel halo values, "
+            << zero_halo_value_count << " zeroed halo values, max error "
             << std::scientific << std::setprecision(6) << max_error
             << std::endl;
 

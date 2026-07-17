@@ -716,12 +716,20 @@ void glst_force::calc_ener_force(const double *d_rx, const double *d_ry,
                              "Plan is not initialized");
   }
 
-  this->require_single_gpu_runtime("calc_ener_force");
+  if (this->workspace_ == nullptr) {
+    throw std::runtime_error("FATAL ERROR: glst_force::calc_ener_force: "
+                             "Workspace is not initialized");
+  }
 
+  // In multi-GPU mode, assign_atoms_multi_gpu also constructs and distributes
+  // the owned-plus-halo short-range source arrays
   this->assign_atoms(d_rx, d_ry, d_rz, d_qc);
 
+  // assign_atoms may resize local atom storage, so zero after assignment.
   this->zero_ef();
 
+  // Iterate in the canonical global tile order. Each tile-aware method filters
+  // execution to the devices that own the tile's tile partition.
   for (unsigned int tile = 0; tile < this->plan_->tile_count(); tile++) {
     this->calc_sf_tile(tile);
     this->exchange_sf_tile(tile);
@@ -729,6 +737,9 @@ void glst_force::calc_ener_force(const double *d_rx, const double *d_ry,
     this->calc_lr_ef_tile(tile);
   }
 
+  // Only tile partition 0 computes short-range interactions in multi-GPU modes.
+  // The subsequent tile-partition reduction adds the long-range contributions
+  // from all other tile ranks.
   this->calc_sr_ef();
   this->comm_ef();
 
