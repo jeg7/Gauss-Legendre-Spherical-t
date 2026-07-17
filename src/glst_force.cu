@@ -1874,7 +1874,8 @@ __global__ static void calc_rmt_sum_kernel(
     const double *__restrict__ cw, const unsigned int *__restrict__ groups,
     const unsigned int nc, const unsigned int *__restrict__ grp_r_in,
     const unsigned int *__restrict__ grp_r_out, const unsigned int nx,
-    const unsigned int ny, const unsigned int nz, const unsigned int ncell) {
+    const unsigned int ny, const unsigned int nz,
+    const unsigned int local_cell_count, const unsigned int first_global_cell) {
   const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
   if (idx >= nc)
@@ -1883,10 +1884,14 @@ __global__ static void calc_rmt_sum_kernel(
   const double wc = cw[idx];
   const unsigned int grp = groups[idx];
 
-  for (unsigned int cell = blockIdx.y; cell < ncell; cell += gridDim.y) {
-    const unsigned int x = cell / (ny * nz);
-    const unsigned int y = (cell / nz) % ny;
-    const unsigned int z = cell % nz;
+  for (unsigned int local_cell = blockIdx.y; local_cell < local_cell_count;
+       local_cell += gridDim.y) {
+    const unsigned int global_cell = first_global_cell + local_cell;
+
+    const unsigned int x = global_cell / (ny * nz);
+    const unsigned int y = (global_cell / nz) % ny;
+    const unsigned int z = global_cell % nz;
+
     const unsigned int inner = grp_r_in[grp];
     const unsigned int outer = grp_r_out[grp];
 
@@ -1897,8 +1902,8 @@ __global__ static void calc_rmt_sum_kernel(
     shell_re *= wc;
     shell_im *= wc;
 
-    rmt_sum_re[cell * nc + idx] = shell_re;
-    rmt_sum_im[cell * nc + idx] = shell_im;
+    rmt_sum_re[local_cell * nc + idx] = shell_re;
+    rmt_sum_im[local_cell * nc + idx] = shell_im;
   }
 
   return;
@@ -1934,11 +1939,43 @@ void glst_force::sum_rmt_sf_tile(const unsigned int tile) {
                              "Tile exceeds buffer size");
   }
 
+  const unsigned int tile_partition = this->plan_->tile_partition_idx(tile);
+
+  const unsigned int nc = tile_node_count;
+  const unsigned int off = tile_node_point;
+
   for (int dev = 0; dev < this->cuda_count_; dev++) {
+    if (this->dev_tile_partition_[dev] != tile_partition)
+      continue;
+
     cudaCheck(cudaSetDevice(dev));
 
-    const unsigned int nc = tile_node_count;
-    const unsigned int off = tile_node_point;
+    const unsigned int cell_partition = this->dev_cell_partition_[dev];
+
+    const unsigned int local_cell_count =
+        this->plan_->local_cell_count(cell_partition);
+
+    const unsigned int first_global_cell =
+        this->plan_->first_global_cell(cell_partition);
+
+    if (static_cast<std::size_t>(local_cell_count) !=
+        this->workspace_->cell_capacity(dev)) {
+      throw std::runtime_error(
+          "FATAL ERROR: glst_force::sum_rmt_sf_tile: Local cell count does not "
+          "match workspace capacity");
+    }
+
+    const std::size_t rmt_entry_count =
+        static_cast<std::size_t>(local_cell_count) *
+        static_cast<std::size_t>(nc);
+
+    if (rmt_entry_count > this->workspace_->rmt_tile_buffer_capacity(dev)) {
+      throw std::runtime_error("FATAL ERROR: glst_force::sum_rmt_sf_tile: "
+                               "Active rmt tile exceeds workspace capacity");
+    }
+
+    if (local_cell_count == 0)
+      continue;
 
     {
       constexpr dim3 num_threads(512, 1, 1);
@@ -1992,7 +2029,7 @@ void glst_force::sum_rmt_sf_tile(const unsigned int tile) {
       constexpr dim3 num_threads(512, 1, 1);
 #endif
       const dim3 num_blocks((nc + num_threads.x - 1) / num_threads.x,
-                            std::min(65535u, this->plan_->ncell()), 1);
+                            std::min(65535u, local_cell_count), 1);
 
       calc_rmt_sum_kernel<<<num_blocks, num_threads, 0,
                             this->comp_streams_[dev]>>>(
@@ -2005,7 +2042,7 @@ void glst_force::sum_rmt_sf_tile(const unsigned int tile) {
           this->plan_->grp_r_in()[dev].d_array().data(),
           this->plan_->grp_r_out()[dev].d_array().data(),
           this->plan_->ncell_x(), this->plan_->ncell_y(),
-          this->plan_->ncell_z(), this->plan_->ncell());
+          this->plan_->ncell_z(), local_cell_count, first_global_cell);
 
       cudaCheck(cudaGetLastError());
     }
