@@ -92,53 +92,254 @@ std::vector<cuda_container<double>> &glst_force::en(void) {
 void glst_force::get_ef(cuda_container<double> &fx, cuda_container<double> &fy,
                         cuda_container<double> &fz,
                         cuda_container<double> &en) {
-  this->require_single_gpu_runtime("get_ef");
+  constexpr std::string_view function_name = "glst_force::get_ef";
+
+  if (this->plan_ == nullptr) {
+    throw std::runtime_error("FATAL ERROR: " + std::string(function_name) +
+                             ": Plan is not initialized");
+  }
+
+  if (this->workspace_ == nullptr) {
+    throw std::runtime_error("FATAL ERROR: " + std::string(function_name) +
+                             ": Workspace is not initialized");
+  }
+
+  const std::size_t natom = static_cast<std::size_t>(this->plan_->natom());
 
   cudaCheck(cudaSetDevice(0));
-  fx.resize(this->plan_->natom());
-  fy.resize(this->plan_->natom());
-  fz.resize(this->plan_->natom());
-  en.resize(this->plan_->natom());
 
-  cub::DeviceRadixSort::SortPairs(
-      this->workspace_->cub_work_buffer()[0],
-      this->workspace_->cub_work_buffer_size()[0],
-      this->workspace_->sorted_idx()[0].d_array().data(),
-      this->workspace_->idx()[0].d_array().data(),
-      this->workspace_->fx()[0].d_array().data(), fx.d_array().data(),
-      this->plan_->natom(), 0, static_cast<int>(8 * sizeof(unsigned int)),
-      this->comp_streams_[0]);
-  cub::DeviceRadixSort::SortPairs(
-      this->workspace_->cub_work_buffer()[0],
-      this->workspace_->cub_work_buffer_size()[0],
-      this->workspace_->sorted_idx()[0].d_array().data(),
-      this->workspace_->idx()[0].d_array().data(),
-      this->workspace_->fy()[0].d_array().data(), fy.d_array().data(),
-      this->plan_->natom(), 0, static_cast<int>(8 * sizeof(unsigned int)),
-      this->comp_streams_[0]);
-  cub::DeviceRadixSort::SortPairs(
-      this->workspace_->cub_work_buffer()[0],
-      this->workspace_->cub_work_buffer_size()[0],
-      this->workspace_->sorted_idx()[0].d_array().data(),
-      this->workspace_->idx()[0].d_array().data(),
-      this->workspace_->fz()[0].d_array().data(), fz.d_array().data(),
-      this->plan_->natom(), 0, static_cast<int>(8 * sizeof(unsigned int)),
-      this->comp_streams_[0]);
-  cub::DeviceRadixSort::SortPairs(
-      this->workspace_->cub_work_buffer()[0],
-      this->workspace_->cub_work_buffer_size()[0],
-      this->workspace_->sorted_idx()[0].d_array().data(),
-      this->workspace_->idx()[0].d_array().data(),
-      this->workspace_->en()[0].d_array().data(), en.d_array().data(),
-      this->plan_->natom(), 0, static_cast<int>(8 * sizeof(unsigned int)),
-      this->comp_streams_[0]);
+  fx.resize(natom);
+  fy.resize(natom);
+  fz.resize(natom);
+  en.resize(natom);
 
-  cudaCheck(cudaStreamSynchronize(this->comp_streams_[0]));
+  // Preserve the existing single-GPU path exactly. Its local atom allocation
+  // contains all atoms, so the existing CUB sort remains valid.
+  if (this->execution_mode_ == GLST_EXECUTION_MODE::SINGLE_GPU_TILED) {
+    cub::DeviceRadixSort::SortPairs(
+        this->workspace_->cub_work_buffer()[0],
+        this->workspace_->cub_work_buffer_size()[0],
+        this->workspace_->sorted_idx()[0].d_array().data(),
+        this->workspace_->idx()[0].d_array().data(),
+        this->workspace_->fx()[0].d_array().data(), fx.d_array().data(),
+        this->plan_->natom(), 0, static_cast<int>(8 * sizeof(unsigned int)),
+        this->comp_streams_[0]);
 
-  fx.transfer_to_host();
-  fy.transfer_to_host();
-  fz.transfer_to_host();
-  en.transfer_to_host();
+    cub::DeviceRadixSort::SortPairs(
+        this->workspace_->cub_work_buffer()[0],
+        this->workspace_->cub_work_buffer_size()[0],
+        this->workspace_->sorted_idx()[0].d_array().data(),
+        this->workspace_->idx()[0].d_array().data(),
+        this->workspace_->fy()[0].d_array().data(), fy.d_array().data(),
+        this->plan_->natom(), 0, static_cast<int>(8 * sizeof(unsigned int)),
+        this->comp_streams_[0]);
+
+    cub::DeviceRadixSort::SortPairs(
+        this->workspace_->cub_work_buffer()[0],
+        this->workspace_->cub_work_buffer_size()[0],
+        this->workspace_->sorted_idx()[0].d_array().data(),
+        this->workspace_->idx()[0].d_array().data(),
+        this->workspace_->fz()[0].d_array().data(), fz.d_array().data(),
+        this->plan_->natom(), 0, static_cast<int>(8 * sizeof(unsigned int)),
+        this->comp_streams_[0]);
+
+    cub::DeviceRadixSort::SortPairs(
+        this->workspace_->cub_work_buffer()[0],
+        this->workspace_->cub_work_buffer_size()[0],
+        this->workspace_->sorted_idx()[0].d_array().data(),
+        this->workspace_->idx()[0].d_array().data(),
+        this->workspace_->en()[0].d_array().data(), en.d_array().data(),
+        this->plan_->natom(), 0, static_cast<int>(8 * sizeof(unsigned int)),
+        this->comp_streams_[0]);
+
+    cudaCheck(cudaStreamSynchronize(this->comp_streams_[0]));
+
+    fx.transfer_to_host();
+    fy.transfer_to_host();
+    fz.transfer_to_host();
+    en.transfer_to_host();
+
+    return;
+  }
+
+  // Multi-GPU path. There must be one tile communicator per cell partition.
+  // Rank 0 of each communicator it tile partition 0 and owns the complete
+  // reduced local result.
+  if (this->tile_comm_devs_.size() !=
+      static_cast<std::size_t>(this->cell_partition_count_)) {
+    throw std::runtime_error(
+        "FATAL ERROR: " + std::string(function_name) +
+        ": Tile communicator topology does not match cell partition count");
+  }
+
+  std::size_t total_owned_atom_count = 0;
+  std::size_t max_owned_atom_count = 0;
+
+  // Validate the root-device topology and determine the temporary-buffer size
+  for (unsigned int cell_partition = 0;
+       cell_partition < this->cell_partition_count_; cell_partition++) {
+    const std::vector<int> &devs = this->tile_comm_devs_[cell_partition];
+
+    if (devs.size() != static_cast<std::size_t>(this->tile_partition_count_)) {
+      throw std::runtime_error("FATAL ERROR: " + std::string(function_name) +
+                               ": Tile communicator device count does not "
+                               "match tile partition count");
+    }
+
+    if (devs.empty()) {
+      throw std::runtime_error("FATAL ERROR: " + std::string(function_name) +
+                               ": Tile communicator has no root device");
+    }
+
+    const int root_dev = devs[0];
+
+    if ((root_dev < 0) || (root_dev >= this->cuda_count_)) {
+      throw std::runtime_error("FATAL ERROR: " + std::string(function_name) +
+                               ": Root device is out of range");
+    }
+
+    if (this->dev_cell_partition_[root_dev] != cell_partition) {
+      throw std::runtime_error(
+          "FATAL ERROR: " + std::string(function_name) +
+          ": Root device belongs to the wrong cell partition");
+    }
+
+    const std::size_t owned_atom_count =
+        this->workspace_->owned_atom_count(root_dev);
+
+    if (owned_atom_count > this->workspace_->atom_capacity(root_dev)) {
+      throw std::runtime_error(
+          "FATAL ERROR: " + std::string(function_name) +
+          ": Root owned atom count exceeds its atom capacity");
+    }
+
+    if ((total_owned_atom_count > natom) ||
+        (owned_atom_count > natom - total_owned_atom_count)) {
+      throw std::runtime_error("FATAL ERROR: " + std::string(function_name) +
+                               ": Sum of root owned atom counts exceeds natom");
+    }
+
+    total_owned_atom_count += owned_atom_count;
+
+    if (owned_atom_count > max_owned_atom_count)
+      max_owned_atom_count = owned_atom_count;
+  }
+
+  if (total_owned_atom_count != natom) {
+    throw std::runtime_error("FATAL ERROR: " + std::string(function_name) +
+                             ": Root owned atom coutns do not sum to natom");
+  }
+
+  // Allocate one reusable set of host staging arrays. Their size is the largest
+  // cell partition, not natom, so the gather does not create another complete
+  // global force/energy copy.
+  std::vector<unsigned int> local_idx(max_owned_atom_count);
+  std::vector<double> local_fx(max_owned_atom_count);
+  std::vector<double> local_fy(max_owned_atom_count);
+  std::vector<double> local_fz(max_owned_atom_count);
+  std::vector<double> local_en(max_owned_atom_count);
+
+  std::vector<unsigned int> atom_seen(natom, 0u);
+
+  std::fill(fx.h_array().begin(), fx.h_array().end(), 0.0);
+  std::fill(fy.h_array().begin(), fy.h_array().end(), 0.0);
+  std::fill(fz.h_array().begin(), fz.h_array().end(), 0.0);
+  std::fill(en.h_array().begin(), en.h_array().end(), 0.0);
+
+  total_owned_atom_count = 0;
+
+  // Gather one root at a time and scatter directly by original atom index.
+  for (unsigned int cell_partition = 0;
+       cell_partition < this->cell_partition_count_; cell_partition++) {
+    const int root_dev = this->tile_comm_devs_[cell_partition][0];
+    const std::size_t owned_atom_count =
+        this->workspace_->owned_atom_count(root_dev);
+
+    if (owned_atom_count == 0)
+      continue;
+
+    cudaCheck(cudaSetDevice(root_dev));
+
+    // comm_ef() already establishes this dependency. Synchronizing here keeps
+    // get_ef() independently safe if it is called after the public phased API.
+    cudaCheck(cudaStreamSynchronize(this->comp_streams_[root_dev]));
+
+    const std::size_t index_bytes = owned_atom_count * sizeof(unsigned int);
+    const std::size_t value_bytes = owned_atom_count * sizeof(double);
+
+    cudaCheck(cudaMemcpy(
+        static_cast<void *>(local_idx.data()),
+        static_cast<const void *>(
+            this->workspace_->sorted_idx()[root_dev].d_array().data()),
+        index_bytes, cudaMemcpyDeviceToHost));
+
+    cudaCheck(cudaMemcpy(static_cast<void *>(local_fx.data()),
+                         static_cast<const void *>(
+                             this->workspace_->fx()[root_dev].d_array().data()),
+                         value_bytes, cudaMemcpyDeviceToHost));
+
+    cudaCheck(cudaMemcpy(static_cast<void *>(local_fy.data()),
+                         static_cast<const void *>(
+                             this->workspace_->fy()[root_dev].d_array().data()),
+                         value_bytes, cudaMemcpyDeviceToHost));
+
+    cudaCheck(cudaMemcpy(static_cast<void *>(local_fz.data()),
+                         static_cast<const void *>(
+                             this->workspace_->fz()[root_dev].d_array().data()),
+                         value_bytes, cudaMemcpyDeviceToHost));
+
+    cudaCheck(cudaMemcpy(static_cast<void *>(local_en.data()),
+                         static_cast<const void *>(
+                             this->workspace_->en()[root_dev].d_array().data()),
+                         value_bytes, cudaMemcpyDeviceToHost));
+
+    for (std::size_t local_atom = 0; local_atom < owned_atom_count;
+         local_atom++) {
+      const unsigned int global_atom = local_idx[local_atom];
+
+      if (static_cast<std::size_t>(global_atom) >= natom) {
+        throw std::runtime_error("FATAL ERROR: " + std::string(function_name) +
+                                 ": Original atom index is out of range");
+      }
+
+      if (atom_seen[global_atom] != 0u) {
+        throw std::runtime_error(
+            "FATAL ERROR: " + std::string(function_name) +
+            ": Original atom index was gathered more than once");
+      }
+
+      atom_seen[global_atom] = 1u;
+
+      fx[global_atom] = local_fx[local_atom];
+      fy[global_atom] = local_fy[local_atom];
+      fz[global_atom] = local_fz[local_atom];
+      en[global_atom] = local_en[local_atom];
+    }
+
+    total_owned_atom_count += owned_atom_count;
+  }
+
+  if (total_owned_atom_count != natom) {
+    throw std::runtime_error("FATAL ERROR: " + std::string(function_name) +
+                             ": Gathered atom count does not equal natom");
+  }
+
+  for (std::size_t atom = 0; atom < natom; atom++) {
+    if (atom_seen[atom] == 0u) {
+      throw std::runtime_error(
+          "FATAL ERROR: " + std::string(function_name) +
+          ": At least one original atom index was not gathered");
+    }
+  }
+
+  // The host arrays are already complete. Synchronize the device side of the
+  // public output containers on GPU 0 to preserve the existing get_ef behavior.
+  cudaCheck(cudaSetDevice(0));
+
+  fx.transfer_to_device();
+  fy.transfer_to_device();
+  fz.transfer_to_device();
+  en.transfer_to_device();
 
   return;
 }

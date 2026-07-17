@@ -646,10 +646,140 @@ static double run_case(const unsigned int cell_partition_count,
 
   max_error = std::max(max_error, orchestration_max_error);
 
+  cuda_container<double> gathered_fx;
+  cuda_container<double> gathered_fy;
+  cuda_container<double> gathered_fz;
+  cuda_container<double> gathered_en;
+
+  force.get_ef(gathered_fx, gathered_fy, gathered_fz, gathered_en);
+
+  require(gathered_fx.size() == natom,
+          "Gathered x-force array does not contain natom values");
+  require(gathered_fy.size() == natom,
+          "Gathered y-force array does not contain natom values");
+  require(gathered_fz.size() == natom,
+          "Gathered z-force array does not contain natom values");
+  require(gathered_en.size() == natom,
+          "Gathered energy array does not contain natom values");
+
+  std::vector<double> expected_global_fx(natom, 0.0);
+  std::vector<double> expected_global_fy(natom, 0.0);
+  std::vector<double> expected_global_fz(natom, 0.0);
+  std::vector<double> expected_global_en(natom, 0.0);
+  std::vector<unsigned char> expected_atom_seen(natom, 0u);
+
+  std::size_t expected_atom_count = 0;
+
+  /*
+   * Construct the global reference from tile-partition-0 roots using the same
+   * original-index metadata that get_ef must consume.
+   */
+  for (unsigned int cell_partition = 0; cell_partition < cell_partition_count;
+       cell_partition++) {
+    const int root_dev = root_devs[cell_partition];
+    const std::size_t owned_atom_count = workspace.owned_atom_count(root_dev);
+
+    cudaCheck(cudaSetDevice(root_dev));
+    workspace.sorted_idx()[root_dev].transfer_to_host();
+
+    const std::vector<unsigned int> &original_idx =
+        workspace.sorted_idx()[root_dev].h_array();
+
+    require(original_idx.size() >= owned_atom_count,
+            "Root original-index array is smaller than owned atom count");
+
+    for (std::size_t local_atom = 0; local_atom < owned_atom_count;
+         local_atom++) {
+      const unsigned int global_atom = original_idx[local_atom];
+
+      require(global_atom < natom,
+              "Root original atom index is out of global range");
+      require(expected_atom_seen[global_atom] == 0u,
+              "Root original atom index appeared more than once");
+
+      expected_atom_seen[global_atom] = 1u;
+
+      expected_global_fx[global_atom] = orchestrated.fx[root_dev][local_atom];
+      expected_global_fy[global_atom] = orchestrated.fy[root_dev][local_atom];
+      expected_global_fz[global_atom] = orchestrated.fz[root_dev][local_atom];
+      expected_global_en[global_atom] = orchestrated.en[root_dev][local_atom];
+
+      expected_atom_count++;
+    }
+  }
+
+  require(expected_atom_count == natom,
+          "Root owned atom counts do not cover natom");
+
+  for (unsigned int atom = 0; atom < natom; atom++) {
+    require(expected_atom_seen[atom] != 0u,
+            "Expected global result is missing an original atom index");
+  }
+
+  double gather_max_error = 0.0;
+  std::size_t gathered_value_count = 0;
+
+  /*
+   * Pass 0 validates the host arrays populated directly by get_ef().
+   * Pass 1 destroys those host values and reloads from GPU 0, proving that the
+   * output device arrays were synchronized too.
+   */
+  for (unsigned int pass = 0; pass < 2; pass++) {
+    if (pass == 1) {
+      const double nan = std::numeric_limits<double>::quiet_NaN();
+
+      std::fill(gathered_fx.h_array().begin(), gathered_fx.h_array().end(),
+                nan);
+      std::fill(gathered_fy.h_array().begin(), gathered_fy.h_array().end(),
+                nan);
+      std::fill(gathered_fz.h_array().begin(), gathered_fz.h_array().end(),
+                nan);
+      std::fill(gathered_en.h_array().begin(), gathered_en.h_array().end(),
+                nan);
+
+      cudaCheck(cudaSetDevice(0));
+
+      gathered_fx.transfer_to_host();
+      gathered_fy.transfer_to_host();
+      gathered_fz.transfer_to_host();
+      gathered_en.transfer_to_host();
+    }
+
+    for (unsigned int atom = 0; atom < natom; atom++) {
+      std::ostringstream prefix;
+      prefix << "get_ef pass " << pass << ", global atom " << atom;
+
+      double error = verify_close(gathered_fx[atom], expected_global_fx[atom],
+                                  threshold, prefix.str() + ", fx");
+      gather_max_error = std::max(gather_max_error, error);
+
+      error = verify_close(gathered_fy[atom], expected_global_fy[atom],
+                           threshold, prefix.str() + ", fy");
+      gather_max_error = std::max(gather_max_error, error);
+
+      error = verify_close(gathered_fz[atom], expected_global_fz[atom],
+                           threshold, prefix.str() + ", fz");
+      gather_max_error = std::max(gather_max_error, error);
+
+      error = verify_close(gathered_en[atom], expected_global_en[atom],
+                           threshold, prefix.str() + ", en");
+      gather_max_error = std::max(gather_max_error, error);
+
+      gathered_value_count += 4;
+    }
+  }
+
+  require(gathered_value_count ==
+              static_cast<std::size_t>(8) * static_cast<std::size_t>(natom),
+          "Unexpected number of gathered host/device values checked");
+
+  max_error = std::max(max_error, gather_max_error);
+
   std::cout << "PASS reduce_tile_partition_ef: layout " << cell_partition_count
             << " x " << tile_partition_count << ", " << ncell_axis
             << "^3 cells, " << reduced_value_count << " reduced values, "
             << orchestration_value_count << " calc_ener_force values, "
+            << gathered_value_count << " gathered host/device values, "
             << checked_halo_count << " preserved sentinel halo values, "
             << zero_halo_value_count << " zeroed halo values, max error "
             << std::scientific << std::setprecision(6) << max_error
