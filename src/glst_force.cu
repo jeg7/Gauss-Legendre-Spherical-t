@@ -1651,7 +1651,7 @@ void glst_force::exchange_sf_tile(const unsigned int tile) {
     }
 
     if (sf_entry_count > this->workspace_->sf_tile_buffer_capacity(dev)) {
-      throw std::runtime_error("FATAL ERROR: glst_force::exhcnage_sf_tile: "
+      throw std::runtime_error("FATAL ERROR: glst_force::exchange_sf_tile: "
                                "Active SF tile exceeds workspace capacity");
     }
 
@@ -2240,8 +2240,8 @@ void glst_force::deallocate(void) {
     }
   }
 
-  if (this->execution_mode_ != GLST_EXECUTION_MODE::SINGLE_GPU_TILED)
-    disable_p2p(this->cuda_count_);
+  // if (this->execution_mode_ != GLST_EXECUTION_MODE::SINGLE_GPU_TILED)
+  //   disable_p2p(this->cuda_count_);
 
   this->comp_streams_.clear();
   this->comm_streams_.clear();
@@ -2284,7 +2284,12 @@ void glst_force::init_cuda_resources(void) {
     return;
   }
 
-  enable_p2p(this->cuda_count_);
+  // NCCL enables peer access as needed when communicator transports connect.
+  // Pre-enabling every deviec pair here causes NCCL to encounter
+  // cudaErrorPeerAccessAlreadyEnabled during lazy connection setup, which
+  // compute-sanitizer reports as an API error even though the collective
+  // completes successfully.
+  // enable_p2p(this->cuda_count_);
 
   // Initialize streams and events
   this->comp_streams_.resize(this->cuda_count_);
