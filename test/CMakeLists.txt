@@ -41,6 +41,13 @@ target_link_libraries(calc_sf_hybrid
   GLST
 )
 
+add_executable(reduce_tile_partition_ef
+  ${GLST_SOURCE_DIR}/test/reduce_tile_partition_ef.cu
+)
+target_link_libraries(reduce_tile_partition_ef
+  GLST
+)
+
 # add_executable(setup_plan
 #   ${GLST_SOURCE_DIR}/test/setup_plan.cu
 # )

@@ -11,7 +11,6 @@
 #include "glst_force.hcu"
 
 #include "cuda_utils.hcu"
-#include "device_comm.hcu"
 #include "reduce.hcu"
 
 #include <algorithm>
@@ -697,29 +696,14 @@ void glst_force::calc_sr_ef(void) {
 }
 
 void glst_force::comm_ef(void) {
-  this->require_single_gpu_runtime("comm_ef");
+  this->reduce_tile_partition_ef();
 
-  if (this->execution_mode_ == GLST_EXECUTION_MODE::SINGLE_GPU_TILED) {
-    cudaCheck(cudaSetDevice(0));
-    cudaCheck(cudaStreamSynchronize(this->comp_streams_[0]));
-    return;
-  }
-
-  // Synchronize to ensure that all devices are done computing
+  // Preserve the existing synchronous public-method behavior. For
+  // tile-decomposed cases, each compute stream waits on its
+  // communication-completion event before this synchronization.
   for (int dev = 0; dev < this->cuda_count_; dev++) {
     cudaCheck(cudaSetDevice(dev));
     cudaCheck(cudaStreamSynchronize(this->comp_streams_[dev]));
-  }
-
-  nccl_root_reduce_sum_ef_ip(this->workspace_->fx(), this->workspace_->fy(),
-                             this->workspace_->fz(), this->workspace_->en(),
-                             this->plan_->natom(), this->nccl_comms_,
-                             this->comm_streams_, this->cuda_count_);
-
-  // Synchronize to ensure that all devices are done communicating
-  for (int dev = 0; dev < this->cuda_count_; dev++) {
-    cudaCheck(cudaSetDevice(dev));
-    cudaCheck(cudaStreamSynchronize(this->comm_streams_[dev]));
   }
 
   return;
@@ -2228,6 +2212,166 @@ void glst_force::calc_lr_ef_tile(const unsigned int tile) {
             local_cell_count);
 
     cudaCheck(cudaGetLastError());
+  }
+
+  return;
+}
+
+void glst_force::reduce_tile_partition_ef(void) {
+  constexpr std::string_view function_name =
+      "glst_force::reduce_tile_partition_ef";
+
+  if (this->plan_ == nullptr) {
+    throw std::runtime_error("FATAL ERROR: " + std::string(function_name) +
+                             ": Plan is not initialized");
+  }
+
+  if (this->workspace_ == nullptr) {
+    throw std::runtime_error("FATAL ERROR: " + std::string(function_name) +
+                             ": Workspace is not initialized");
+  }
+
+  // This covers single-GPU mode and pure cell decomposition.
+  if (this->tile_partition_count_ == 1)
+    return;
+
+  if (this->tile_comm_devs_.size() !=
+      static_cast<std::size_t>(this->cell_partition_count_)) {
+    throw std::runtime_error("FATAL ERROR: " + std::string(function_name) +
+                             ": Tile communicator device topology does not "
+                             "match cell partition count");
+  }
+
+  if (this->tile_comms_.size() !=
+      static_cast<std::size_t>(this->cell_partition_count_)) {
+    throw std::runtime_error(
+        "FATAL ERROR: " + std::string(function_name) +
+        ": Tile communicator topology does not match cell partition count");
+  }
+
+  for (unsigned int cell_partition = 0;
+       cell_partition < this->cell_partition_count_; cell_partition++) {
+    const std::vector<int> &devs = this->tile_comm_devs_[cell_partition];
+    const std::vector<ncclComm_t> &comms = this->tile_comms_[cell_partition];
+
+    if (devs.size() != static_cast<std::size_t>(this->tile_partition_count_)) {
+      throw std::runtime_error("FATAL ERROR: " + std::string(function_name) +
+                               ": Tile communicator device count does not "
+                               "match tile partition count");
+    }
+
+    if (comms.size() != devs.size()) {
+      throw std::runtime_error(
+          "FATAL ERROR: " + std::string(function_name) +
+          ": Tile communicator handle count does not match device count");
+    }
+
+    // Validate every rank before beginning the collective. This is important:
+    // Every rank in a NCCL collective must use the same count and datatype.
+    std::size_t owned_atom_count = 0;
+
+    for (std::size_t rank = 0; rank < devs.size(); rank++) {
+      const int dev = devs[rank];
+
+      if ((dev < 0) || (dev >= this->cuda_count_)) {
+        throw std::runtime_error("FATAL ERROR: " + std::string(function_name) +
+                                 ": Tile communicator device is out of range");
+      }
+
+      if (this->dev_cell_partition_[dev] != cell_partition) {
+        throw std::runtime_error(
+            "FATAL ERROR: " + std::string(function_name) +
+            ": Device belongs to the wrong cell partition");
+      }
+
+      if (this->dev_tile_partition_[dev] != static_cast<unsigned int>(rank)) {
+        throw std::runtime_error(
+            "FATAL ERROR: " + std::string(function_name) +
+            ": Tile communicator rank does not match tile partition");
+      }
+
+      const std::size_t dev_owned_atom_count =
+          this->workspace_->owned_atom_count(dev);
+
+      if (rank == 0)
+        owned_atom_count = dev_owned_atom_count;
+      else if (dev_owned_atom_count != owned_atom_count) {
+        throw std::runtime_error("FATAL ERROR: " + std::string(function_name) +
+                                 ": Tile ranks in one cell partition have "
+                                 "different owned atom counts");
+      }
+
+      if (dev_owned_atom_count > this->workspace_->atom_capacity(dev)) {
+        throw std::runtime_error(
+            "FATAL ERROR: " + std::string(function_name) +
+            ": Owned atom count exceeds workspace atom capacity");
+      }
+    }
+
+    if (owned_atom_count == 0)
+      continue;
+
+    // Ensure that the communication streams see all preceding long-range work
+    // and the root-only short-range work.
+    for (std::size_t rank = 0; rank < devs.size(); rank++) {
+      const int dev = devs[rank];
+
+      cudaCheck(cudaSetDevice(dev));
+      cudaCheck(
+          cudaEventRecord(this->comp_events_[dev], this->comp_streams_[dev]));
+      cudaCheck(cudaStreamWaitEvent(this->comm_streams_[dev],
+                                    this->comp_events_[dev], 0));
+    }
+
+    // Root rank is communicator rank 0, which is tile partition 0. Use four
+    // root reductions rather than four all-reduces because only tile partition
+    // 0 needs complete local results.
+    ncclCheck(ncclGroupStart());
+
+    for (std::size_t rank = 0; rank < devs.size(); rank++) {
+      const int dev = devs[rank];
+
+      cudaCheck(cudaSetDevice(dev));
+
+      double *fx = this->workspace_->fx()[dev].d_array().data();
+      double *fy = this->workspace_->fy()[dev].d_array().data();
+      double *fz = this->workspace_->fz()[dev].d_array().data();
+      double *en = this->workspace_->en()[dev].d_array().data();
+
+      ncclCheck(ncclReduce(static_cast<const void *>(fx),
+                           static_cast<void *>(fx), owned_atom_count,
+                           ncclDouble, ncclSum, 0, comms[rank],
+                           this->comm_streams_[dev]));
+
+      ncclCheck(ncclReduce(static_cast<const void *>(fy),
+                           static_cast<void *>(fy), owned_atom_count,
+                           ncclDouble, ncclSum, 0, comms[rank],
+                           this->comm_streams_[dev]));
+
+      ncclCheck(ncclReduce(static_cast<const void *>(fz),
+                           static_cast<void *>(fz), owned_atom_count,
+                           ncclDouble, ncclSum, 0, comms[rank],
+                           this->comm_streams_[dev]));
+
+      ncclCheck(ncclReduce(static_cast<const void *>(en),
+                           static_cast<void *>(en), owned_atom_count,
+                           ncclDouble, ncclSum, 0, comms[rank],
+                           this->comm_streams_[dev]));
+    }
+
+    ncclCheck(ncclGroupEnd());
+
+    // Prevent subsequent compute work, zeroing, or result gathering from
+    // touching these arrays before the reduction has completed.
+    for (std::size_t rank = 0; rank < devs.size(); rank++) {
+      const int dev = devs[rank];
+
+      cudaCheck(cudaSetDevice(dev));
+      cudaCheck(
+          cudaEventRecord(this->comm_events_[dev], this->comm_streams_[dev]));
+      cudaCheck(cudaStreamWaitEvent(this->comp_streams_[dev],
+                                    this->comm_events_[dev], 0));
+    }
   }
 
   return;

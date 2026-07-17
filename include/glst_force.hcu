@@ -86,6 +86,7 @@ private:
   void exchange_sf_tile(const unsigned int tile);
   void sum_rmt_sf_tile(const unsigned int tile);
   void calc_lr_ef_tile(const unsigned int tile);
+  void reduce_tile_partition_ef(void);
   void zero_ef(void);
 
 private:
