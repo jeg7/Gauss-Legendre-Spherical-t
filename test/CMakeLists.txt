@@ -48,6 +48,13 @@ target_link_libraries(reduce_tile_partition_ef
   GLST
 )
 
+add_executable(hybrid_layout_correctness
+  ${GLST_SOURCE_DIR}/test/hybrid_layout_correctness.cu
+)
+target_link_libraries(hybrid_layout_correctness
+  GLST
+)
+
 # add_executable(setup_plan
 #   ${GLST_SOURCE_DIR}/test/setup_plan.cu
 # )
