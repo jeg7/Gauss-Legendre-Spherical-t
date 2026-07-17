@@ -76,6 +76,12 @@ public:
   static void sum_rmt_sf_tile(glst_force &force, const unsigned int tile) {
     force.sum_rmt_sf_tile(tile);
   }
+
+  static void calc_lr_ef_tile(glst_force &force, const unsigned int tile) {
+    force.calc_lr_ef_tile(tile);
+  }
+
+  static void zero_ef(glst_force &force) { force.zero_ef(); }
 };
 
 static void require(const bool condition, const std::string &message) {
@@ -181,6 +187,7 @@ static double verify_tile(glst_force &force, const std::vector<double> &atom_rx,
   constexpr double sentinel = 12345.0;
   constexpr double sf_threshold = 1.0e-12;
   constexpr double rmt_threshold = 1.0e-11;
+  constexpr double ef_threshold = 1.0e-10;
 
   const glst_plan &plan = glst_force_test_access::plan(force);
   glst_workspace &workspace = glst_force_test_access::workspace(force);
@@ -860,6 +867,196 @@ static double verify_tile(glst_force &force, const std::vector<double> &atom_rx,
                    "range at entry "
                 << entry << " (active entries " << active_rmt_entry_count
                 << ", capacity " << rmt_buffer_capacity << ")";
+        throw std::runtime_error(message.str());
+      }
+    }
+  }
+
+  glst_force_test_access::zero_ef(force);
+  glst_force_test_access::calc_lr_ef_tile(force, tile);
+
+  for (int dev = 0; dev < cuda_count; dev++) {
+    cudaCheck(cudaSetDevice(dev));
+    cudaCheck(cudaDeviceSynchronize());
+
+    workspace.cell_atom_point()[dev].transfer_to_host();
+    workspace.cell_atom_count()[dev].transfer_to_host();
+
+    workspace.fx()[dev].transfer_to_host();
+    workspace.fy()[dev].transfer_to_host();
+    workspace.fz()[dev].transfer_to_host();
+    workspace.en()[dev].transfer_to_host();
+  }
+
+  for (int dev = 0; dev < cuda_count; dev++) {
+    const unsigned int cell_partition =
+        glst_force_test_access::dev_cell_partition(force, dev);
+
+    const unsigned int device_tile_partition =
+        glst_force_test_access::dev_tile_partition(force, dev);
+
+    const bool owns_tile = (device_tile_partition == tile_partition);
+
+    const unsigned int local_cell_count = plan.local_cell_count(cell_partition);
+
+    const std::size_t atom_capacity = workspace.atom_capacity(dev);
+
+    const std::size_t owned_atom_count = workspace.owned_atom_count(dev);
+
+    require(owned_atom_count <= atom_capacity,
+            "Owned atom count exceeds atom capacity");
+
+    if (!owns_tile) {
+      for (std::size_t atom = 0; atom < atom_capacity; atom++) {
+        if ((workspace.fx()[dev][atom] != 0.0) ||
+            (workspace.fy()[dev][atom] != 0.0) ||
+            (workspace.fz()[dev][atom] != 0.0) ||
+            (workspace.en()[dev][atom] != 0.0)) {
+          std::ostringstream message;
+          message << "GPU " << dev << ", tile " << tile
+                  << ": calc_lr_ef_tile modified a non-participating tile "
+                     "rank at atom entry "
+                  << atom;
+          throw std::runtime_error(message.str());
+        }
+      }
+
+      continue;
+    }
+
+    for (unsigned int local_cell = 0; local_cell < local_cell_count;
+         local_cell++) {
+      const unsigned int global_cell =
+          plan.global_cell_from_local_cell(cell_partition, local_cell);
+
+      const unsigned int atom_point =
+          workspace.cell_atom_point()[dev][local_cell];
+
+      const unsigned int atom_count =
+          workspace.cell_atom_count()[dev][local_cell];
+
+      require(atom_count == 1,
+              "calc_sf_hybrid LR test requires one atom per owned cell");
+
+      require(static_cast<std::size_t>(atom_point) < owned_atom_count,
+              "Owned target atom point is outside the owned atom range");
+
+      const double xa = atom_rx[global_cell];
+      const double ya = atom_ry[global_cell];
+      const double za = atom_rz[global_cell];
+      const double qa = atom_qc[global_cell];
+
+      double expected_fx = 0.0;
+      double expected_fy = 0.0;
+      double expected_fz = 0.0;
+      double expected_en = 0.0;
+
+      for (unsigned int local_node = 0; local_node < node_count; local_node++) {
+        const unsigned int global_node = node_point + local_node;
+
+        const double xc = plan.x()[dev][global_node];
+        const double yc = plan.y()[dev][global_node];
+        const double zc = plan.z()[dev][global_node];
+
+        const std::size_t rmt_entry = static_cast<std::size_t>(local_cell) *
+                                          static_cast<std::size_t>(node_count) +
+                                      static_cast<std::size_t>(local_node);
+
+        const double rmt_re = workspace.rmt_sum_re()[dev][rmt_entry];
+
+        const double rmt_im = workspace.rmt_sum_im()[dev][rmt_entry];
+
+        const double theta = xc * xa + yc * ya + zc * za;
+
+        const double re = std::cos(theta);
+        const double im = std::sin(theta);
+
+        const double dre = qa * (re * rmt_re - im * rmt_im);
+
+        const double dim = qa * (re * rmt_im + im * rmt_re);
+
+        expected_fx += dim * xc;
+        expected_fy += dim * yc;
+        expected_fz += dim * zc;
+        expected_en += dre;
+      }
+
+      const double observed_fx = workspace.fx()[dev][atom_point];
+
+      const double observed_fy = workspace.fy()[dev][atom_point];
+
+      const double observed_fz = workspace.fz()[dev][atom_point];
+
+      const double observed_en = workspace.en()[dev][atom_point];
+
+      if (!std::isfinite(observed_fx) || !std::isfinite(observed_fy) ||
+          !std::isfinite(observed_fz) || !std::isfinite(observed_en)) {
+        std::ostringstream message;
+        message << "GPU " << dev << ", tile " << tile
+                << ": non-finite long-range result for local cell "
+                << local_cell << ", global cell " << global_cell;
+        throw std::runtime_error(message.str());
+      }
+
+      const double error_fx = std::abs(observed_fx - expected_fx);
+
+      const double error_fy = std::abs(observed_fy - expected_fy);
+
+      const double error_fz = std::abs(observed_fz - expected_fz);
+
+      const double error_en = std::abs(observed_en - expected_en);
+
+      const double allowed_fx =
+          ef_threshold * std::max(1.0, std::abs(expected_fx));
+
+      const double allowed_fy =
+          ef_threshold * std::max(1.0, std::abs(expected_fy));
+
+      const double allowed_fz =
+          ef_threshold * std::max(1.0, std::abs(expected_fz));
+
+      const double allowed_en =
+          ef_threshold * std::max(1.0, std::abs(expected_en));
+
+      max_error = std::max(max_error, error_fx);
+      max_error = std::max(max_error, error_fy);
+      max_error = std::max(max_error, error_fz);
+      max_error = std::max(max_error, error_en);
+
+      if ((error_fx > allowed_fx) || (error_fy > allowed_fy) ||
+          (error_fz > allowed_fz) || (error_en > allowed_en)) {
+        std::ostringstream message;
+
+        message << "GPU " << dev << ", tile " << tile
+                << ": local long-range mismatch for local cell " << local_cell
+                << ", global cell " << global_cell << std::setprecision(17)
+                << " (observed fx=" << observed_fx
+                << ", expected fx=" << expected_fx
+                << ", observed fy=" << observed_fy
+                << ", expected fy=" << expected_fy
+                << ", observed fz=" << observed_fz
+                << ", expected fz=" << expected_fz
+                << ", observed en=" << observed_en
+                << ", expected en=" << expected_en << ")";
+
+        throw std::runtime_error(message.str());
+      }
+    }
+
+    // Atom storage after owned_atom_count contains short-range halo atoms.
+    // Long-range target evaluation must not modify them.
+    for (std::size_t atom = owned_atom_count; atom < atom_capacity; atom++) {
+      if ((workspace.fx()[dev][atom] != 0.0) ||
+          (workspace.fy()[dev][atom] != 0.0) ||
+          (workspace.fz()[dev][atom] != 0.0) ||
+          (workspace.en()[dev][atom] != 0.0)) {
+        std::ostringstream message;
+
+        message << "GPU " << dev << ", tile " << tile
+                << ": calc_lr_ef_tile modified halo atom entry " << atom
+                << " (owned atoms " << owned_atom_count << ", capacity "
+                << atom_capacity << ")";
+
         throw std::runtime_error(message.str());
       }
     }

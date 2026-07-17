@@ -2057,21 +2057,25 @@ calc_lr_ef_kernel(double *__restrict__ fx, double *__restrict__ fy,
                   double *__restrict__ fz, double *__restrict__ en,
                   const double *__restrict__ rx, const double *__restrict__ ry,
                   const double *__restrict__ rz, const double *__restrict__ qc,
-                  const unsigned int *__restrict__ cell_atom_points,
-                  const unsigned int *__restrict__ cell_atom_counts,
+                  const unsigned int *__restrict__ local_cell_atom_points,
+                  const unsigned int *__restrict__ local_cell_atom_counts,
                   const double *__restrict__ cx, const double *__restrict__ cy,
                   const double *__restrict__ cz,
                   const double *__restrict__ rmt_sum_re,
                   const double *__restrict__ rmt_sum_im, const unsigned int nc,
-                  const unsigned int ncell) {
+                  const unsigned int local_cell_count) {
   __shared__ double s_cache[BLOCK * 5];
 
   const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
-  for (unsigned int cell = blockIdx.y; cell < ncell; cell += gridDim.y) {
-    const unsigned int apnt = cell_atom_points[cell];
-    const unsigned int acnt = cell_atom_counts[cell];
+  for (unsigned int local_cell = blockIdx.y; local_cell < local_cell_count;
+       local_cell += gridDim.y) {
+    const unsigned int apnt = local_cell_atom_points[local_cell];
+    const unsigned int acnt = local_cell_atom_counts[local_cell];
     const bool active = (idx < acnt);
+
+    const std::size_t rmt_point =
+        static_cast<std::size_t>(local_cell) * static_cast<std::size_t>(nc);
 
     double xa = 0.0, ya = 0.0, za = 0.0, qa = 0.0;
     if (active) {
@@ -2085,16 +2089,19 @@ calc_lr_ef_kernel(double *__restrict__ fx, double *__restrict__ fy,
     for (unsigned int i = 0; i < nc; i += BLOCK) {
       __syncthreads();
       if (i + threadIdx.x < nc) {
-        s_cache[threadIdx.x * 5 + 0] = cx[i + threadIdx.x];
-        s_cache[threadIdx.x * 5 + 1] = cy[i + threadIdx.x];
-        s_cache[threadIdx.x * 5 + 2] = cz[i + threadIdx.x];
-        s_cache[threadIdx.x * 5 + 3] = rmt_sum_re[cell * nc + i + threadIdx.x];
-        s_cache[threadIdx.x * 5 + 4] = rmt_sum_im[cell * nc + i + threadIdx.x];
+        const unsigned int local_node = i + threadIdx.x;
+
+        s_cache[threadIdx.x * 5 + 0] = cx[local_node];
+        s_cache[threadIdx.x * 5 + 1] = cy[local_node];
+        s_cache[threadIdx.x * 5 + 2] = cz[local_node];
+        s_cache[threadIdx.x * 5 + 3] = rmt_sum_re[rmt_point + local_node];
+        s_cache[threadIdx.x * 5 + 4] = rmt_sum_im[rmt_point + local_node];
       }
       __syncthreads();
 
       if (active) { // Only "active" threads do expensive sincos work
         const unsigned int n = min(BLOCK, nc - i);
+
         for (unsigned int j = 0; j < n; j++) {
           const double xc = s_cache[j * 5 + 0];
           const double yc = s_cache[j * 5 + 1];
@@ -2157,17 +2164,49 @@ void glst_force::calc_lr_ef_tile(const unsigned int tile) {
                              "Tile exceeds buffer size");
   }
 
+  const unsigned int tile_partition = this->plan_->tile_partition_idx(tile);
+
+  const unsigned int nc = tile_node_count;
+  const unsigned int off = tile_node_point;
+
   for (int dev = 0; dev < this->cuda_count_; dev++) {
+    if (this->dev_tile_partition_[dev] != tile_partition)
+      continue;
+
     cudaCheck(cudaSetDevice(dev));
 
-    const unsigned int nc = tile_node_count;
-    const unsigned int off = tile_node_point;
+    const unsigned int cell_partition = this->dev_cell_partition_[dev];
+
+    const unsigned int local_cell_count =
+        this->plan_->local_cell_count(cell_partition);
+
+    if (static_cast<std::size_t>(local_cell_count) !=
+        this->workspace_->cell_capacity(dev)) {
+      throw std::runtime_error(
+          "FATAL ERROR: glst_force::calc_lr_ef_tile: Local ell count does not "
+          "match workspace capacity");
+    }
+
+    const std::size_t rmt_entry_count =
+        static_cast<std::size_t>(local_cell_count) *
+        static_cast<std::size_t>(nc);
+
+    if (rmt_entry_count > this->workspace_->rmt_tile_buffer_capacity(dev)) {
+      throw std::runtime_error("FATAL ERROR: glst_force::calc_lr_ef_tile: "
+                               "Active rmt tile exceeds workspace capacity");
+    }
+
+    if (local_cell_count == 0)
+      continue;
+
+    const unsigned int max_atoms_cell = this->workspace_->max_atoms_cell()[dev];
+
+    if (max_atoms_cell == 0)
+      continue;
 
     constexpr dim3 num_threads(64, 1, 1);
-    const dim3 num_blocks(
-        (this->workspace_->max_atoms_cell()[dev] + num_threads.x - 1) /
-            num_threads.x,
-        std::min(65535u, this->plan_->ncell()), 1);
+    const dim3 num_blocks((max_atoms_cell + num_threads.x - 1) / num_threads.x,
+                          std::min(65535u, local_cell_count), 1);
 
     calc_lr_ef_kernel<num_threads.x>
         <<<num_blocks, num_threads, 0, this->comp_streams_[dev]>>>(
@@ -2186,7 +2225,7 @@ void glst_force::calc_lr_ef_tile(const unsigned int tile) {
             this->plan_->z()[dev].d_array().data() + off,
             this->workspace_->rmt_sum_re()[dev].d_array().data(),
             this->workspace_->rmt_sum_im()[dev].d_array().data(), nc,
-            this->plan_->ncell());
+            local_cell_count);
 
     cudaCheck(cudaGetLastError());
   }
