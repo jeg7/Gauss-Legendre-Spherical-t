@@ -17,6 +17,7 @@
 
 #include <nccl.h>
 
+#include <cstddef>
 #include <iosfwd>
 #include <memory>
 #include <string>
@@ -28,6 +29,26 @@ enum class GLST_EXECUTION_MODE {
   MULTI_GPU_CELL,
   MULTI_GPU_TILE,
   MULTI_GPU_CELL_TILE
+};
+
+struct glst_profile {
+  double atom_assignment_scatter_ms = 0.0;
+  double owned_halo_source_scatter_ms = 0.0;
+  double zero_ef_ms = 0.0;
+
+  double calc_sf_ms = 0.0;
+  double exchange_sf_ms = 0.0;
+  double sum_rmt_sf_ms = 0.0;
+  double calc_lr_ef_ms = 0.0;
+
+  double calc_sr_ef_ms = 0.0;
+  double reduce_tile_ef_ms = 0.0;
+
+  double instrumented_compute_ms = 0.0;
+
+  std::size_t sf_collective_input_bytes = 0;
+  std::size_t owned_atom_replicas = 0;
+  std::size_t halo_atom_replicas = 0;
 };
 
 class glst_force_test_access;
@@ -89,6 +110,11 @@ private:
   void reduce_tile_partition_ef(void);
   void zero_ef(void);
 
+  void reset_profile(void);
+  void synchronize_compute_streams(void) const;
+  void synchronize_tile_partition_compute_streams(
+      const unsigned int tile_partition) const;
+
 private:
   void deallocate(void);
   void init_cuda_resources(void);
@@ -139,6 +165,9 @@ private:
   std::vector<std::vector<int>> tile_comm_devs_;
   std::vector<std::vector<ncclComm_t>> cell_comms_;
   std::vector<std::vector<ncclComm_t>> tile_comms_;
+
+  bool profiling_enabled_;
+  glst_profile profile_;
 
   bool gpu_layout_user_set_;
   bool cuda_initialized_;

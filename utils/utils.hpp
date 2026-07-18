@@ -12,7 +12,15 @@
 #define __UTILS_UTILS__
 
 #include <cstddef>
+#include <string_view>
 #include <vector>
+
+unsigned int parse_uint_arg(const std::string_view text,
+                            const std::string_view label,
+                            const bool allow_zero);
+
+double parse_positive_double_arg(const std::string_view text,
+                                 const std::string_view label);
 
 double avg(const std::vector<double> &x);
 

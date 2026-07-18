@@ -14,6 +14,77 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <stdexcept>
+#include <string>
+
+unsigned int parse_uint_arg(const std::string_view text,
+                            const std::string_view label,
+                            const bool allow_zero) {
+  const std::string value(text);
+
+  if (value.empty())
+    throw std::runtime_error(std::string(label) + " is empty");
+
+  for (std::size_t i = 0; i < value.size(); i++) {
+    if ((value[i] < '0') || (value[i] > '9')) {
+      throw std::runtime_error(std::string(label) +
+                               " must be an unsigned integer: " + value);
+    }
+  }
+
+  std::size_t consumed = 0;
+  unsigned long long int parsed = 0;
+
+  try {
+    parsed = std::stoull(value, &consumed, 10);
+  } catch (const std::exception &) {
+    throw std::runtime_error(
+        std::string(label) +
+        " is outside the supported integer range: " + value);
+  }
+
+  if (consumed != value.size()) {
+    throw std::runtime_error(std::string(label) +
+                             " contains trailing characters: " + value);
+  }
+
+  if ((!allow_zero) && (parsed == 0))
+    throw std::runtime_error(std::string(label) + " must be positive");
+
+  if (parsed > static_cast<unsigned long long int>(
+                   std::numeric_limits<unsigned int>::max())) {
+    throw std::runtime_error(std::string(label) +
+                             " exceeds unsigned int range");
+  }
+
+  return static_cast<unsigned int>(parsed);
+}
+
+double parse_positive_double_arg(const std::string_view text,
+                                 const std::string_view label) {
+  const std::string value(text);
+  std::size_t consumed = 0;
+  double parsed = 0.0;
+
+  try {
+    parsed = std::stod(value, &consumed);
+  } catch (const std::exception &) {
+    throw std::runtime_error(std::string(label) +
+                             " must be a floating-point number: " + value);
+  }
+
+  if (consumed != value.size()) {
+    throw std::runtime_error(std::string(label) +
+                             " contains trailing characters: " + value);
+  }
+
+  if (!std::isfinite(parsed) || (parsed <= 0.0)) {
+    throw std::runtime_error(std::string(label) +
+                             " must be a finite positive value");
+  }
+
+  return parsed;
+}
 
 double avg(const std::vector<double> &x) {
   double sum = 0.0;

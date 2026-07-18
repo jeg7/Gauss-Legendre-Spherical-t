@@ -13,16 +13,24 @@
 #include "cuda_utils.hcu"
 #include "reduce.hcu"
 
-#include <algorithm>
-#include <cstddef>
 #include <cub/cub.cuh>
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <cuda_runtime_api.h>
+
+#include <algorithm>
+#include <chrono>
+#include <cstddef>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
 #include <string>
+
+static double
+profile_elapsed_ms(const std::chrono::steady_clock::time_point &start,
+                   const std::chrono::steady_clock::time_point &end) {
+  return std::chrono::duration<double, std::milli>(end - start).count();
+}
 
 glst_force::glst_force(void)
     : plan_(nullptr), workspace_(nullptr),
@@ -31,7 +39,8 @@ glst_force::glst_force(void)
       dev_tile_partition_(), cuda_count_(-1), dev_cell_idx_(), comp_streams_(),
       comm_streams_(), comp_events_(), comm_events_(), nccl_devs_(),
       nccl_comms_(), cell_comm_devs_(), tile_comm_devs_(), cell_comms_(),
-      tile_comms_(), gpu_layout_user_set_(false), cuda_initialized_(false) {}
+      tile_comms_(), profiling_enabled_(false), profile_(),
+      gpu_layout_user_set_(false), cuda_initialized_(false) {}
 
 glst_force::glst_force(const unsigned int natom, const double tol,
                        const double box_dim_x, const double box_dim_y,
@@ -922,27 +931,104 @@ void glst_force::calc_ener_force(const double *d_rx, const double *d_ry,
                              "Workspace is not initialized");
   }
 
-  // In multi-GPU mode, assign_atoms_multi_gpu also constructs and distributes
-  // the owned-plus-halo short-range source arrays
-  this->assign_atoms(d_rx, d_ry, d_rz, d_qc);
+  if (!this->profiling_enabled_) {
+    // In multi-GPU mode, assign_atoms_multi_gpu also constructs and distributes
+    // the owned-plus-halo short-range source arrays
+    this->assign_atoms(d_rx, d_ry, d_rz, d_qc);
 
-  // assign_atoms may resize local atom storage, so zero after assignment.
-  this->zero_ef();
+    // assign_atoms may resize local atom storage, so zero after assignment.
+    this->zero_ef();
 
-  // Iterate in the canonical global tile order. Each tile-aware method filters
-  // execution to the devices that own the tile's tile partition.
-  for (unsigned int tile = 0; tile < this->plan_->tile_count(); tile++) {
-    this->calc_sf_tile(tile);
-    this->exchange_sf_tile(tile);
-    this->sum_rmt_sf_tile(tile);
-    this->calc_lr_ef_tile(tile);
+    // Iterate in the canonical global tile order. Each tile-aware method
+    // filters execution to the devices that own the tile's tile partition.
+    for (unsigned int tile = 0; tile < this->plan_->tile_count(); tile++) {
+      this->calc_sf_tile(tile);
+      this->exchange_sf_tile(tile);
+      this->sum_rmt_sf_tile(tile);
+      this->calc_lr_ef_tile(tile);
+    }
+
+    // Only tile partition 0 computes short-range interactions in multi-GPU
+    // modes. The subsequent tile-partition reduction adds the long-range
+    // contributions from all other tile ranks.
+    this->calc_sr_ef();
+    this->comm_ef();
+
+    return;
   }
 
-  // Only tile partition 0 computes short-range interactions in multi-GPU modes.
-  // The subsequent tile-partition reduction adds the long-range contributions
-  // from all other tile ranks.
+  this->reset_profile();
+
+  const std::chrono::steady_clock::time_point total_start =
+      std::chrono::steady_clock::now();
+
+  this->assign_atoms(d_rx, d_ry, d_rz, d_qc);
+
+  std::chrono::steady_clock::time_point phase_start =
+      std::chrono::steady_clock::now();
+
+  this->zero_ef();
+  this->synchronize_compute_streams();
+
+  std::chrono::steady_clock::time_point phase_end =
+      std::chrono::steady_clock::now();
+
+  this->profile_.zero_ef_ms = profile_elapsed_ms(phase_start, phase_end);
+
+  for (unsigned int tile = 0; tile < this->plan_->tile_count(); tile++) {
+    const unsigned int tile_partition = this->plan_->tile_partition_idx(tile);
+
+    phase_start = std::chrono::steady_clock::now();
+    this->calc_sf_tile(tile);
+    this->synchronize_tile_partition_compute_streams(tile_partition);
+    phase_end = std::chrono::steady_clock::now();
+    this->profile_.calc_sf_ms += profile_elapsed_ms(phase_start, phase_end);
+
+    phase_start = std::chrono::steady_clock::now();
+    this->exchange_sf_tile(tile);
+    this->synchronize_tile_partition_compute_streams(tile_partition);
+    phase_end = std::chrono::steady_clock::now();
+    this->profile_.exchange_sf_ms += profile_elapsed_ms(phase_start, phase_end);
+
+    if (this->cell_partition_count_ > 1) {
+      const std::size_t entry_count =
+          static_cast<std::size_t>(this->plan_->ncell()) *
+          static_cast<std::size_t>(this->plan_->tile_node_count(tile));
+
+      this->profile_.sf_collective_input_bytes +=
+          2 * entry_count * sizeof(double) *
+          static_cast<std::size_t>(this->cell_partition_count_);
+    }
+
+    phase_start = std::chrono::steady_clock::now();
+    this->sum_rmt_sf_tile(tile);
+    this->synchronize_tile_partition_compute_streams(tile_partition);
+    phase_end = std::chrono::steady_clock::now();
+    this->profile_.sum_rmt_sf_ms += profile_elapsed_ms(phase_start, phase_end);
+
+    phase_start = std::chrono::steady_clock::now();
+    this->calc_lr_ef_tile(tile);
+    this->synchronize_tile_partition_compute_streams(tile_partition);
+    phase_end = std::chrono::steady_clock::now();
+    this->profile_.calc_lr_ef_ms += profile_elapsed_ms(phase_start, phase_end);
+  }
+
+  phase_start = std::chrono::steady_clock::now();
   this->calc_sr_ef();
+  this->synchronize_tile_partition_compute_streams(0);
+  phase_end = std::chrono::steady_clock::now();
+  this->profile_.calc_sr_ef_ms = profile_elapsed_ms(phase_start, phase_end);
+
+  phase_start = std::chrono::steady_clock::now();
   this->comm_ef();
+  phase_end = std::chrono::steady_clock::now();
+  this->profile_.reduce_tile_ef_ms = profile_elapsed_ms(phase_start, phase_end);
+
+  const std::chrono::steady_clock::time_point total_end =
+      std::chrono::steady_clock::now();
+
+  this->profile_.instrumented_compute_ms =
+      profile_elapsed_ms(total_start, total_end);
 
   return;
 }
@@ -1134,6 +1220,10 @@ __global__ static void unpack_kernel(
 void glst_force::assign_atoms_single_gpu(const double *d_rx, const double *d_ry,
                                          const double *d_rz,
                                          const double *d_qc) {
+  std::chrono::steady_clock::time_point assignment_start;
+  if (this->profiling_enabled_)
+    assignment_start = std::chrono::steady_clock::now();
+
   for (int dev = 0; dev < this->cuda_count_; dev++) {
     cudaCheck(cudaSetDevice(dev));
 
@@ -1259,6 +1349,21 @@ void glst_force::assign_atoms_single_gpu(const double *d_rx, const double *d_ry,
 
       cudaCheck(cudaGetLastError());
     }
+  }
+
+  if (this->profiling_enabled_) {
+    this->synchronize_compute_streams();
+
+    const std::chrono::steady_clock::time_point assignment_end =
+        std::chrono::steady_clock::now();
+
+    this->profile_.atom_assignment_scatter_ms =
+        profile_elapsed_ms(assignment_start, assignment_end);
+
+    this->profile_.owned_halo_source_scatter_ms = 0.0;
+    this->profile_.owned_atom_replicas =
+        static_cast<std::size_t>(this->plan_->natom());
+    this->profile_.halo_atom_replicas = 0;
   }
 
   return;
@@ -1443,6 +1548,10 @@ void glst_force::assign_atoms_multi_gpu(const double *d_rx, const double *d_ry,
                              "Plan is not initialized");
   }
 
+  std::chrono::steady_clock::time_point assignment_start;
+  if (this->profiling_enabled_)
+    assignment_start = std::chrono::steady_clock::now();
+
   const unsigned int natom = this->plan_->natom();
   const unsigned int ncell_x = this->plan_->ncell_x();
   const unsigned int ncell_y = this->plan_->ncell_y();
@@ -1510,23 +1619,42 @@ void glst_force::assign_atoms_multi_gpu(const double *d_rx, const double *d_ry,
        partition++) {
     std::vector<atom_packet> &owned_packets =
         partition_owned_packets[partition];
-    std::vector<atom_packet> &source_packets =
-        partition_source_packets[partition];
 
     const std::vector<unsigned int> &owned_cells =
         this->plan_->partition_cell_idx(partition);
+
     for (std::size_t i = 0; i < owned_cells.size(); i++) {
       const unsigned int cell = owned_cells[i];
       const std::vector<atom_packet> &cell_atoms = cell_packets[cell];
       owned_packets.insert(owned_packets.end(), cell_atoms.begin(),
                            cell_atoms.end());
     }
+  }
+
+  if (this->profiling_enabled_) {
+    const std::chrono::steady_clock::time_point assignment_end =
+        std::chrono::steady_clock::now();
+
+    this->profile_.atom_assignment_scatter_ms =
+        profile_elapsed_ms(assignment_start, assignment_end);
+  }
+
+  std::chrono::steady_clock::time_point halo_start;
+  if (this->profiling_enabled_)
+    halo_start = std::chrono::steady_clock::now();
+
+  for (unsigned int partition = 0; partition < this->cell_partition_count_;
+       partition++) {
+    std::vector<atom_packet> &source_packets =
+        partition_source_packets[partition];
 
     const std::vector<unsigned int> &source_cells =
         this->plan_->partition_sr_source_cell_idx(partition);
+
     for (std::size_t i = 0; i < source_cells.size(); i++) {
       const unsigned int cell = source_cells[i];
       const std::vector<atom_packet> &cell_atoms = cell_packets[cell];
+
       source_packets.insert(source_packets.end(), cell_atoms.begin(),
                             cell_atoms.end());
     }
@@ -1544,6 +1672,16 @@ void glst_force::assign_atoms_multi_gpu(const double *d_rx, const double *d_ry,
 
     const std::size_t owned_atom_count = owned_packets.size();
     const std::size_t source_atom_count = source_packets.size();
+
+    if (this->profiling_enabled_) {
+      this->profile_.owned_atom_replicas += owned_atom_count;
+      if (source_atom_count < owned_atom_count) {
+        throw std::runtime_error(
+            "FATAL ERROR: glst_force::assign_atoms_multi_gpu: Source atom "
+            "count is smaller than owned atom count");
+      }
+      this->profile_.halo_atom_replicas += source_atom_count - owned_atom_count;
+    }
 
     const std::size_t local_cell_count =
         static_cast<std::size_t>(this->plan_->local_cell_count(cell_partition));
@@ -1662,6 +1800,16 @@ void glst_force::assign_atoms_multi_gpu(const double *d_rx, const double *d_ry,
 
     this->workspace_->sr_source_cell_atom_count()[dev].transfer_to_device();
     this->workspace_->sr_source_cell_atom_point()[dev].transfer_to_device();
+  }
+
+  if (this->profiling_enabled_) {
+    this->synchronize_compute_streams();
+
+    const std::chrono::steady_clock::time_point halo_end =
+        std::chrono::steady_clock::now();
+
+    this->profile_.owned_halo_source_scatter_ms =
+        profile_elapsed_ms(halo_start, halo_end);
   }
 
 #ifdef __GLST_DEBUG__
@@ -2613,6 +2761,30 @@ void glst_force::zero_ef(void) {
         nbytes, this->comp_streams_[dev]));
   }
 
+  return;
+}
+
+void glst_force::reset_profile(void) {
+  this->profile_ = glst_profile();
+  return;
+}
+
+void glst_force::synchronize_compute_streams(void) const {
+  for (int dev = 0; dev < this->cuda_count_; dev++) {
+    cudaCheck(cudaSetDevice(dev));
+    cudaCheck(cudaStreamSynchronize(this->comp_streams_[dev]));
+  }
+  return;
+}
+
+void glst_force::synchronize_tile_partition_compute_streams(
+    const unsigned int tile_partition) const {
+  for (int dev = 0; dev < this->cuda_count_; dev++) {
+    if (this->dev_tile_partition_[dev] != tile_partition)
+      continue;
+    cudaCheck(cudaSetDevice(dev));
+    cudaCheck(cudaStreamSynchronize(this->comp_streams_[dev]));
+  }
   return;
 }
 
