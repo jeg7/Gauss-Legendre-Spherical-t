@@ -11,6 +11,7 @@
 #include "glst_plan.hcu"
 
 #include "cuda_utils.hcu"
+#include "error_utils.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -18,8 +19,8 @@
 #include <iostream>
 #include <limits>
 #include <numeric>
-#include <stdexcept>
 #include <string>
+#include <string_view>
 
 static double erfc_inv(const double y, const double tol) {
   constexpr unsigned long long int MAX_IT = 100000000;
@@ -39,9 +40,8 @@ static double erfc_inv(const double y, const double tol) {
   }
 
   if (std::abs(err) >= tol) {
-    throw std::runtime_error("FATAL ERROR: erfc_inv(const double, const "
-                             "double): Inverse of erfc not found after " +
-                             std::to_string(MAX_IT) + " iterations");
+    utl::throw_error("erfc_inv", "Inverse of erfc not found after " +
+                                     std::to_string(MAX_IT) + " iterations");
   }
 
   return x;
@@ -145,10 +145,9 @@ const std::vector<cuda_container<unsigned int>> &glst_plan::group(void) const {
 }
 
 const cubature &glst_plan::cubature_data(void) const {
-  if (this->cubature_ == nullptr) {
-    throw std::runtime_error("FATAL ERROR: glst_plan::cubature_data: Cubature "
-                             "has not been initialized");
-  }
+  utl::require(this->cubature_ != nullptr, "glst_plan::cubature_data",
+               "Cubature has not been initialized");
+
   return *(this->cubature_);
 }
 
@@ -171,26 +170,23 @@ const std::vector<unsigned int> &glst_plan::tile_node_count(void) const {
 }
 
 unsigned int glst_plan::tile_group(const unsigned int tile) const {
-  if (tile >= this->tile_count_) {
-    throw std::runtime_error(
-        "FATAL ERROR: glst_plan::tile_group: Tile index out of range");
-  }
+  utl::require(tile < this->tile_count_, "glst_plan::tile_group",
+               "Tile index out of range");
+
   return this->tile_group_[tile];
 }
 
 unsigned int glst_plan::tile_node_point(const unsigned int tile) const {
-  if (tile >= this->tile_count_) {
-    throw std::runtime_error(
-        "FATAL ERROR: glst_plan::tile_node_point: Tile index out of range");
-  }
+  utl::require(tile < this->tile_count_, "glst_plan::tile_node_point",
+               "Tile index out of range");
+
   return this->tile_node_point_[tile];
 }
 
 unsigned int glst_plan::tile_node_count(const unsigned int tile) const {
-  if (tile >= this->tile_count_) {
-    throw std::runtime_error(
-        "FATAL ERROR: glst_plan::tile_node_count: Tile index out of range");
-  }
+  utl::require(tile < this->tile_count_, "glst_plan::tile_node_count",
+               "Tile index out of range");
+
   return this->tile_node_count_[tile];
 }
 
@@ -218,29 +214,27 @@ glst_plan::partition_tile_node_count(void) const {
 }
 
 unsigned int glst_plan::tile_partition_idx(const unsigned int tile) const {
-  if (tile >= this->tile_count_) {
-    throw std::runtime_error(
-        "FATAL ERROR: glst_plan::tile_partition_idx: Tile index out of range");
-  }
+  utl::require(tile < this->tile_count_, "glst_plan::tile_partition_idx",
+               "Tile index out of range");
+
   return this->tile_partition_idx_[tile];
 }
 
 const std::vector<unsigned int> &
 glst_plan::partition_tile_idx(const unsigned int tile_partition) const {
-  if (tile_partition >= this->tile_partition_count_) {
-    throw std::runtime_error("FATAL ERROR: glst_plan::partition_tile_idx: Tile "
-                             "partition index out of range");
-  }
+  utl::require(tile_partition < this->tile_partition_count_,
+               "glst_plan::partition_tile_idx",
+               "Tile partition index out of range");
+
   return this->partition_tile_idx_[tile_partition];
 }
 
 unsigned int
 glst_plan::partition_tile_node_count(const unsigned int tile_partition) const {
-  if (tile_partition >= this->tile_partition_count_) {
-    throw std::runtime_error(
-        "FATAL ERROR: glst_plan::partition_tile_node_count: Tile partition "
-        "index out of range");
-  }
+  utl::require(tile_partition < this->tile_partition_count_,
+               "glst_plan::partition_tile_node_count",
+               "Tile partition index out of range");
+
   return this->partition_tile_node_count_[tile_partition];
 }
 
@@ -266,19 +260,18 @@ glst_plan::partition_cell_idx(void) const {
 }
 
 unsigned int glst_plan::cell_partition_idx(const unsigned int cell) const {
-  if (cell >= this->ncell_) {
-    throw std::runtime_error(
-        "FATAL ERROR: glst_plan::cell_partition_idx: Cell index out of range");
-  }
+  utl::require(cell < this->ncell_, "glst_plan::cell_partition_idx",
+               "Cell index out of range");
+
   return this->cell_partition_idx_[cell];
 }
 
 const std::vector<unsigned int> &
 glst_plan::partition_cell_idx(const unsigned int cell_partition) const {
-  if (cell_partition >= this->cell_partition_count_) {
-    throw std::runtime_error("FATAL ERROR: glst_plan::partition_cell_idx: Cell "
-                             "partition index out of range");
-  }
+  utl::require(cell_partition < this->cell_partition_count_,
+               "glst_plan::partition_cell_idx",
+               "Cell partition index out of range");
+
   return this->partition_cell_idx_[cell_partition];
 }
 
@@ -310,50 +303,46 @@ glst_plan::partition_sr_source_cell_idx(void) const {
 
 const std::vector<unsigned int> &glst_plan::partition_left_halo_cell_idx(
     const unsigned int cell_partition) const {
-  if (cell_partition >= this->cell_partition_count_) {
-    throw std::runtime_error(
-        "FATAL ERROR: glst_plan::partition_left_halo_cell_idx: Cell partition "
-        "index out of range");
-  }
+  utl::require(cell_partition < this->cell_partition_count_,
+               "glst_plan::partition_left_halo_cell_idx",
+               "Cell partition index out of range");
+
   return this->partition_left_halo_cell_idx_[cell_partition];
 }
 
 const std::vector<unsigned int> &glst_plan::partition_right_halo_cell_idx(
     const unsigned int cell_partition) const {
-  if (cell_partition >= this->cell_partition_count_) {
-    throw std::runtime_error(
-        "FATAL ERROR: glst_plan::partition_right_halo_cell_idx: Cell partition "
-        "index out of range");
-  }
+  utl::require(cell_partition < this->cell_partition_count_,
+               "glst_plan::partition_right_halo_cell_idx",
+               "Cell partition index out of range");
+
   return this->partition_right_halo_cell_idx_[cell_partition];
 }
 
 const std::vector<unsigned int> &
 glst_plan::partition_halo_cell_idx(const unsigned int cell_partition) const {
-  if (cell_partition >= this->cell_partition_count_) {
-    throw std::runtime_error(
-        "FATAL ERROR: glst_plan::partition_halo_cell_idx: Cell partition "
-        "index out of range");
-  }
+  utl::require(cell_partition < this->cell_partition_count_,
+               "glst_plan::partition_halo_cell_idx",
+               "Cell partition index out of range");
+
   return this->partition_halo_cell_idx_[cell_partition];
 }
 
 const std::vector<unsigned int> &glst_plan::partition_sr_source_cell_idx(
     const unsigned int cell_partition) const {
-  if (cell_partition >= this->cell_partition_count_) {
-    throw std::runtime_error(
-        "FATAL ERROR: glst_plan::partition_sr_source_cell_idx: Cell partition "
-        "index out of range");
-  }
+  utl::require(cell_partition < this->cell_partition_count_,
+               "glst_plan::partition_sr_source_cell_idx",
+               "Cell partition index out of range");
+
   return this->partition_sr_source_cell_idx_[cell_partition];
 }
 
 unsigned int
 glst_plan::first_global_cell(const unsigned int cell_partition) const {
-  if (cell_partition >= this->cell_partition_count_) {
-    throw std::runtime_error("FATAL ERROR: glst_plan::first_global_cell: Cell "
-                             "partition index out of range");
-  }
+  utl::require(cell_partition < this->cell_partition_count_,
+               "glst_plan::first_global_cell",
+               "Cell partition index out of range");
+
   return this->cell_partition_x_point_[cell_partition] * this->ncell_y_ *
          this->ncell_z_;
 }
@@ -361,28 +350,22 @@ glst_plan::first_global_cell(const unsigned int cell_partition) const {
 unsigned int
 glst_plan::local_cell_from_global_cell(const unsigned int cell_partition,
                                        const unsigned int global_cell) const {
-  if (cell_partition >= this->cell_partition_count_) {
-    throw std::runtime_error(
-        "FATAL ERROR: glst_plan::local_cell_from_global_cell: Cell "
-        "partition index out of range");
-  }
+  constexpr std::string_view function_name =
+      "glst_plan::local_cell_from_global_cell";
 
-  if (global_cell >= this->ncell_) {
-    throw std::runtime_error(
-        "FATAL ERROR: glst_plan::local_cell_from_global_cell: Global cell "
-        "index out of range");
-  }
+  utl::require(cell_partition < this->cell_partition_count_, function_name,
+               "Cell partition index out of range");
+
+  utl::require(global_cell < this->ncell_, function_name,
+               "Global cell index out of range");
 
   const unsigned int yz_count = this->ncell_y_ * this->ncell_z_;
   const unsigned int x = global_cell / yz_count;
   const unsigned int x_point = this->cell_partition_x_point_[cell_partition];
   const unsigned int x_count = this->cell_partition_x_count_[cell_partition];
 
-  if ((x < x_point) || (x >= x_point + x_count)) {
-    throw std::runtime_error(
-        "FATAL ERROR: glst_plan::local_cell_from_global_cell: Global cell is "
-        "outside cell partition");
-  }
+  utl::require((x >= x_point) && (x < x_point + x_count), function_name,
+               "Global cell is outside cell partition");
 
   return global_cell - this->first_global_cell(cell_partition);
 }
@@ -390,17 +373,14 @@ glst_plan::local_cell_from_global_cell(const unsigned int cell_partition,
 unsigned int
 glst_plan::global_cell_from_local_cell(const unsigned int cell_partition,
                                        const unsigned int local_cell) const {
-  if (cell_partition >= this->cell_partition_count_) {
-    throw std::runtime_error(
-        "FATAL ERROR: glst_plan::global_cell_from_local_cell: Cell "
-        "partition index out of range");
-  }
+  constexpr std::string_view function_name =
+      "glst_plan::global_cell_from_local_cell";
 
-  if (local_cell >= this->local_cell_count(cell_partition)) {
-    throw std::runtime_error(
-        "FATAL ERROR: glst_plan::global_cell_from_local_cell: Local cell index "
-        "out of range");
-  }
+  utl::require(cell_partition < this->cell_partition_count_, function_name,
+               "Cell partition index out of range");
+
+  utl::require(local_cell < this->local_cell_count(cell_partition),
+               function_name, "Local cell index out of range");
 
   return this->first_global_cell(cell_partition) + local_cell;
 }
@@ -408,10 +388,8 @@ glst_plan::global_cell_from_local_cell(const unsigned int cell_partition,
 void glst_plan::global_cell_coords(unsigned int &x, unsigned int &y,
                                    unsigned int &z,
                                    const unsigned int global_cell) const {
-  if (global_cell >= this->ncell_) {
-    throw std::runtime_error("FATAL ERROR: glst_plan::global_cell_coords: "
-                             "Global cell index out of range");
-  }
+  utl::require(global_cell < this->ncell_, "glst_plan::global_cell_coords",
+               "Global cell index out of range");
 
   const unsigned int yz_count = this->ncell_y_ * this->ncell_z_;
 
@@ -531,10 +509,8 @@ void glst_plan::init_alpha_groups(const double tol) {
 
   int device_count = 0;
   cudaCheck(cudaGetDeviceCount(&device_count));
-  if (device_count < 1) {
-    throw std::runtime_error("FATAL ERROR: glst_plan::init_alpha_groups: Could "
-                             "not find and CUDA capable devices");
-  }
+  utl::require(device_count >= 1, "glst_plan::init_alpha_groups",
+               "Could not find and CUDA-capable devices");
 
   std::vector<unsigned int> grp_r_in((this->ngroup_ > 0) ? this->ngroup_ : 1);
   std::vector<unsigned int> grp_r_out((this->ngroup_ > 0) ? this->ngroup_ : 1);
@@ -560,10 +536,8 @@ void glst_plan::init_alpha_groups(const double tol) {
 }
 
 void glst_plan::init_cubature(const double tol) {
-  if (this->ngroup_ == 0) {
-    throw std::runtime_error("FATAL ERROR: glst_plan::init_cubature: Alpha "
-                             "groups have not been initialized");
-  }
+  utl::require(this->ngroup_ > 0, "glst_plan::init_cubature",
+               "Alpha groups have not been initialized");
 
   this->cubature_ = std::make_unique<cubature>(tol, this->ngroup_, this->rmax_,
                                                this->alpha_, this->zcut_);
@@ -572,15 +546,12 @@ void glst_plan::init_cubature(const double tol) {
 }
 
 void glst_plan::init_tile_schedule(const unsigned int max_tile_nodes) {
-  if (max_tile_nodes == 0) {
-    throw std::runtime_error("FATAL ERROR: glst_plan::init_tile_schedule: "
-                             "max_tile_nodes must be > 0");
-  }
+  constexpr std::string_view function_name = "glst_plan::init_tile_schedule";
 
-  if (this->cubature_ == nullptr) {
-    throw std::runtime_error("FATAL ERROR: glst_plan::init_tile_schedule: "
-                             "Cubature has not been initialized");
-  }
+  utl::require(max_tile_nodes > 0, function_name, "max_tile_nodes must be > 0");
+
+  utl::require(this->cubature_ != nullptr, function_name,
+               "Cubature has not been initialized");
 
   this->max_tile_nodes_ = max_tile_nodes;
   this->tile_count_ = 0;
@@ -599,11 +570,9 @@ void glst_plan::init_tile_schedule(const unsigned int max_tile_nodes) {
     const unsigned int group_node_count =
         static_cast<unsigned int>(this->cubature_->num_nodes()[0][group]);
 
-    if ((group_point > total_nodes) ||
-        (group_node_count > total_nodes - group_point)) {
-      throw std::runtime_error("FATAL ERROR: glst_plan::init_tile_schedule: "
-                               "Cubature group node range is out of bounds");
-    }
+    utl::require((group_point <= total_nodes) &&
+                     (group_node_count <= total_nodes - group_point),
+                 function_name, "Cubature group node range is out of bounds");
 
     unsigned int group_offset = 0;
 
@@ -628,15 +597,13 @@ void glst_plan::init_tile_schedule(const unsigned int max_tile_nodes) {
 }
 
 void glst_plan::init_tile_partitions(const unsigned int tile_partition_count) {
-  if (tile_partition_count == 0) {
-    throw std::runtime_error("FATAL ERROR: glst_plan::init_tile_partitions: "
-                             "tile_partition_count must be > 0");
-  }
+  constexpr std::string_view function_name = "glst_plan::init_tile_partitions";
 
-  if (this->tile_count_ == 0) {
-    throw std::runtime_error("FATAL ERROR: glst_plan::init_tile_partitions: "
-                             "Tile schedule has not been initialized");
-  }
+  utl::require(tile_partition_count > 0, function_name,
+               "tile_partition_count must be > 0");
+
+  utl::require(this->tile_count_ > 0, function_name,
+               "Tile schedule has not been initialized");
 
   this->tile_partition_count_ = tile_partition_count;
 
@@ -660,20 +627,18 @@ void glst_plan::init_tile_partitions(const unsigned int tile_partition_count) {
 }
 
 void glst_plan::init_cell_partitions(const unsigned int cell_partition_count) {
-  if (cell_partition_count == 0) {
-    throw std::runtime_error("FATAL ERROR: glst_plan::init_cell_partitions: "
-                             "cell_partition_count must be > 0");
-  }
+  constexpr std::string_view function_name = "glst_plan::init_cell_partitions";
+
+  utl::require(cell_partition_count > 0, function_name,
+               "cell_partition_count must be > 0");
 
   const unsigned int ncell_x = this->ncell_x_;
   const unsigned int ncell_y = this->ncell_y_;
   const unsigned int ncell_z = this->ncell_z_;
   const unsigned int ncell = this->ncell_;
 
-  if ((ncell_x == 0) || (ncell_y == 0) || (ncell_z == 0)) {
-    throw std::runtime_error("FATAL ERROR: glst_plan::init_cell_partitions: "
-                             "Cell dimensions are invalid");
-  }
+  utl::require((ncell_x > 0) && (ncell_y > 0) && (ncell_z > 0), function_name,
+               "Cell dimensions are invalid");
 
   this->cell_partition_count_ = cell_partition_count;
   this->cell_partition_idx_.assign(ncell, 0);
@@ -711,11 +676,8 @@ void glst_plan::init_cell_partitions(const unsigned int cell_partition_count) {
         for (unsigned int z = 0; z < ncell_z; z++) {
           const unsigned int cell = (x * ncell_y + y) * ncell_z + z;
 
-          if (cell >= ncell) {
-            throw std::runtime_error(
-                "FATAL ERROR: glst_plan::init_cell_partitions: "
-                "Computed cell index is out of range");
-          }
+          utl::require(cell < ncell, function_name,
+                       "Computed cell index is out of range");
 
           this->cell_partition_idx_[cell] = part;
           cell_visit_count[cell]++;
@@ -726,11 +688,9 @@ void glst_plan::init_cell_partitions(const unsigned int cell_partition_count) {
   }
 
   for (unsigned int cell = 0; cell < ncell; cell++) {
-    if (cell_visit_count[cell] != 1) {
-      throw std::runtime_error("FATAL ERROR: glst_plan::init_cell_partitions: "
-                               "Every global cell must be "
-                               "assigned to exactly one cell partition");
-    }
+    utl::require(
+        cell_visit_count[cell] == 1, function_name,
+        "Every global cell must be assigned to exactly one cell partition");
   }
 
   this->init_short_range_halo_plan();
@@ -739,30 +699,25 @@ void glst_plan::init_cell_partitions(const unsigned int cell_partition_count) {
 }
 
 void glst_plan::validate(void) const {
+  constexpr std::string_view function_name = "glst_plan::validate";
+
   const std::size_t expected_ncell = static_cast<std::size_t>(this->ncell_x_) *
                                      static_cast<std::size_t>(this->ncell_y_) *
                                      static_cast<std::size_t>(this->ncell_z_);
 
-  if (expected_ncell >
-      static_cast<std::size_t>(std::numeric_limits<unsigned int>::max())) {
-    throw std::runtime_error("FATAL ERROR: glst_plan::validate: ncell product "
-                             "exceeds unsigned int range");
-  }
+  utl::require(expected_ncell <= static_cast<std::size_t>(
+                                     std::numeric_limits<unsigned int>::max()),
+               function_name, "ncell product exceeds unsigned int range");
 
-  if (static_cast<std::size_t>(this->ncell_) != expected_ncell) {
-    throw std::runtime_error("FATAL ERROR: glst_plan::validate: ncell does not "
-                             "match ncell_x * ncell_y * ncell_z");
-  }
+  utl::require(static_cast<std::size_t>(this->ncell_) == expected_ncell,
+               function_name,
+               "ncell does not match ncell_x * ncell_y * ncell_z");
 
-  if (this->cubature_ == nullptr) {
-    throw std::runtime_error(
-        "FATAL ERROR: glst_plan::validate: Cubature has not been initialized");
-  }
+  utl::require(this->cubature_ != nullptr, function_name,
+               "Cubature has not been initialized");
 
-  if (this->ngroup_ != this->cubature_->num_cubatures()) {
-    throw std::runtime_error("FATAL ERROR: glst_plan::validate: ngroup does "
-                             "not match cubature num_cubatures");
-  }
+  utl::require(this->ngroup_ == this->cubature_->num_cubatures(), function_name,
+               "ngroup does not match cubature num_cubatures");
 
   const auto &points = this->cubature_->points();
   const auto &num_nodes = this->cubature_->num_nodes();
@@ -772,63 +727,52 @@ void glst_plan::validate(void) const {
   const auto &w = this->cubature_->w();
   const auto &group_array = this->cubature_->group();
 
-  if (this->grp_r_in_.empty() || this->grp_r_out_.empty()) {
-    throw std::runtime_error("FATAL ERROR: glst_plan::validate: Alpha-group "
-                             "radius metadata is empty");
-  }
+  utl::require(!this->grp_r_in_.empty() && !this->grp_r_out_.empty(),
+               function_name, "Alpha-group radius metadata is empty");
 
-  if ((this->grp_r_in_.size() != points.size()) ||
-      (this->grp_r_out_.size() != points.size())) {
-    throw std::runtime_error(
-        "FATAL ERROR: glst_plan::validate: Alpha-group radius metadata device "
-        "count does not match cubature device count");
-  }
+  utl::require((this->grp_r_in_.size() == points.size()) &&
+                   (this->grp_r_out_.size() == points.size()),
+               function_name,
+               "Alpha-group radius metadata device count does not match "
+               "cubature device count");
 
   for (std::size_t dev = 0; dev < this->grp_r_in_.size(); dev++) {
-    if ((this->grp_r_in_[dev].size() !=
-         static_cast<std::size_t>(this->ngroup_)) ||
-        (this->grp_r_out_[dev].size() !=
-         static_cast<std::size_t>(this->ngroup_))) {
-      throw std::runtime_error("FATAL ERROR: glst_plan::validate: Alpha-group "
-                               "radius metadata sizes do not match ngroup");
-    }
+    utl::require((this->grp_r_in_[dev].size() ==
+                  static_cast<std::size_t>(this->ngroup_)) &&
+                     (this->grp_r_out_[dev].size() ==
+                      static_cast<std::size_t>(this->ngroup_)),
+                 function_name,
+                 "Alpha-group radius metadata sizes do not match ngroup");
   }
 
-  if ((this->ncell_alpha_group_.size() !=
-       static_cast<std::size_t>(this->ngroup_)) ||
-      (this->rmax_.size() != static_cast<std::size_t>(this->ngroup_)) ||
-      (this->alpha_.size() != static_cast<std::size_t>(this->ngroup_)) ||
-      (this->zcut_.size() != static_cast<std::size_t>(this->ngroup_))) {
-    throw std::runtime_error("FATAL ERROR: glst_plan::validate: Alpha-group "
-                             "host metadata sizes do not match ngroup");
-  }
+  utl::require(
+      (this->ncell_alpha_group_.size() ==
+       static_cast<std::size_t>(this->ngroup_)) &&
+          (this->rmax_.size() == static_cast<std::size_t>(this->ngroup_)) &&
+          (this->alpha_.size() == static_cast<std::size_t>(this->ngroup_)) &&
+          (this->zcut_.size() == static_cast<std::size_t>(this->ngroup_)),
+      function_name, "Alpha-group host metadata sizes do not match ngroup");
 
-  if (points.empty() || num_nodes.empty() || x.empty() || y.empty() ||
-      z.empty() || w.empty() || group_array.empty()) {
-    throw std::runtime_error(
-        "FATAL ERROR: glst_plan::validate: Cubature storage is empty");
-  }
+  utl::require(!points.empty() && !num_nodes.empty() && !x.empty() &&
+                   !y.empty() && !z.empty() && !w.empty() &&
+                   !group_array.empty(),
+               function_name, "Cubature storage is empty");
 
-  if ((points[0].size() < static_cast<std::size_t>(this->ngroup_)) ||
-      (num_nodes[0].size() < static_cast<std::size_t>(this->ngroup_))) {
-    throw std::runtime_error("FATAL ERROR: glst_plan::validate: Cubature group "
-                             "metadata is smaller than ngroup");
-  }
+  utl::require(
+      (points[0].size() >= static_cast<std::size_t>(this->ngroup_)) &&
+          (num_nodes[0].size() >= static_cast<std::size_t>(this->ngroup_)),
+      function_name, "Cubature group metadata is smaller than ngroup");
 
   const std::size_t total_nodes =
       static_cast<std::size_t>(this->cubature_->tot_num_nodes());
 
-  if (total_nodes == 0) {
-    throw std::runtime_error(
-        "FATAL ERROR: glst_plan::validate: Cubature has zero nodes");
-  }
+  utl::require(total_nodes > 0, function_name, "Cubature has zero nodes");
 
-  if ((x[0].size() != total_nodes) || (y[0].size() != total_nodes) ||
-      (z[0].size() != total_nodes) || (w[0].size() != total_nodes) ||
-      (group_array[0].size() != total_nodes)) {
-    throw std::runtime_error("FATAL ERROR: glst_plan::validate: Cubature node "
-                             "arrays do not match total node count");
-  }
+  utl::require(
+      (x[0].size() == total_nodes) && (y[0].size() == total_nodes) &&
+          (z[0].size() == total_nodes) && (w[0].size() == total_nodes) &&
+          (group_array[0].size() == total_nodes),
+      function_name, "Cubature node arrays do not match total node count");
 
   std::size_t group_node_sum = 0;
   std::vector<std::size_t> group_begin(this->ngroup_);
@@ -839,37 +783,28 @@ void glst_plan::validate(void) const {
     const std::size_t group_count =
         static_cast<std::size_t>(num_nodes[0][group]);
 
-    if ((group_point > total_nodes) ||
-        (group_count > total_nodes - group_point)) {
-      throw std::runtime_error("FATAL ERROR: glst_plan::validate: Cubature "
-                               "group node range is out of bounds");
-    }
+    utl::require((group_point <= total_nodes) &&
+                     (group_count <= total_nodes - group_point),
+                 function_name, "Cubature group node range is out of bounds");
 
     group_begin[group] = group_point;
     group_end[group] = group_point + group_count;
     group_node_sum += group_count;
   }
 
-  if (group_node_sum != total_nodes) {
-    throw std::runtime_error(
-        "FATAL ERROR: glst_plan::validate: Sum of cubature group node counts "
-        "does not match total cubature node count");
-  }
+  utl::require(group_node_sum == total_nodes, function_name,
+               "Sum of cubature group node counts does not match total "
+               "cubature node count");
 
-  if (this->max_tile_nodes_ == 0) {
-    throw std::runtime_error(
-        "FATAL ERROR: glst_plan::validate: max_tile_nodes is 0");
-  }
+  utl::require(this->max_tile_nodes_ > 0, function_name, "max_tile_nodes is 0");
 
-  if ((static_cast<std::size_t>(this->tile_count_) !=
-       this->tile_group_.size()) ||
-      (static_cast<std::size_t>(this->tile_count_) !=
-       this->tile_node_point_.size()) ||
-      (static_cast<std::size_t>(this->tile_count_) !=
-       this->tile_node_count_.size())) {
-    throw std::runtime_error("FATAL ERROR: glst_plan::validate: Tile metadata "
-                             "sizes do not match tile_count");
-  }
+  utl::require((static_cast<std::size_t>(this->tile_count_) ==
+                this->tile_group_.size()) &&
+                   (static_cast<std::size_t>(this->tile_count_) ==
+                    this->tile_node_point_.size()) &&
+                   (static_cast<std::size_t>(this->tile_count_) ==
+                    this->tile_node_count_.size()),
+               function_name, "Tile metadata sizes do not match tile_count");
 
   std::size_t tile_node_sum = 0;
   std::vector<std::size_t> next_node_point(this->ngroup_);
@@ -879,94 +814,71 @@ void glst_plan::validate(void) const {
   for (unsigned int tile = 0; tile < this->tile_count_; tile++) {
     const unsigned int tile_group = this->tile_group_[tile];
 
-    if (this->tile_node_count_[tile] == 0) {
-      throw std::runtime_error(
-          "FATAL ERROR: glst_plan::validate: Zero-sized tile encountered");
-    }
+    utl::require(this->tile_node_count_[tile] > 0, function_name,
+                 "Zero-sized tile encountered");
 
-    if (this->tile_node_count_[tile] > this->max_tile_nodes_) {
-      throw std::runtime_error(
-          "FATAL ERROR: glst_plan::validate: Tile exceeds max_tile_nodes");
-    }
+    utl::require(this->tile_node_count_[tile] <= this->max_tile_nodes_,
+                 function_name, "Tile exceeds max_tile_nodes");
 
-    if (tile_group >= this->ngroup_) {
-      throw std::runtime_error(
-          "FATAL ERROR: glst_plan::validate: Tile has invalid cubature group");
-    }
+    utl::require(tile_group < this->ngroup_, function_name,
+                 "Tile has invalid cubature group");
 
-    if ((tile > 0) && (tile_group < this->tile_group_[tile - 1])) {
-      throw std::runtime_error("FATAL ERROR: glst_plan::validate: Tile groups "
-                               "are not monotonically ordered");
-    }
+    utl::require((tile == 0) || (tile_group >= this->tile_group_[tile - 1]),
+                 function_name, "Tile groups are not monotonically ordered");
 
     const std::size_t tile_begin =
         static_cast<std::size_t>(this->tile_node_point_[tile]);
     const std::size_t tile_count =
         static_cast<std::size_t>(this->tile_node_count_[tile]);
 
-    if ((tile_begin > total_nodes) || (tile_count > total_nodes - tile_begin)) {
-      throw std::runtime_error(
-          "FATAL ERROR: glst_plan::validate: Tile node range is out of bounds");
-    }
+    utl::require((tile_begin <= total_nodes) &&
+                     (tile_count <= total_nodes - tile_begin),
+                 function_name, "Tile node range is out of bounds");
 
     const std::size_t tile_end = tile_begin + tile_count;
 
-    if ((tile_begin < group_begin[tile_group]) ||
-        (tile_end > group_end[tile_group])) {
-      throw std::runtime_error("FATAL ERROR: glst_plan::validate: Tile crosses "
-                               "a cubature group boundary");
-    }
+    utl::require((tile_begin >= group_begin[tile_group]) &&
+                     (tile_end <= group_end[tile_group]),
+                 function_name, "Tile crosses a cubature group boundary");
 
-    if (tile_begin != next_node_point[tile_group]) {
-      throw std::runtime_error(
-          "FATAL ERROR: glst_plan::validate: Non-contiguous tile coverage "
-          "inside cubature group");
-    }
+    utl::require(tile_begin == next_node_point[tile_group], function_name,
+                 "Non-contiguous tile coverage inside cubature group");
 
     next_node_point[tile_group] = tile_end;
     tile_node_sum += tile_count;
   }
 
-  if (tile_node_sum != total_nodes) {
-    throw std::runtime_error(
-        "FATAL ERROR: glst_plan::validate: Sum of tile node counts does not "
-        "match total cubature node count");
-  }
+  utl::require(
+      tile_node_sum == total_nodes, function_name,
+      "Sum of tile node counts does not match total cubature node count");
 
   for (unsigned int group = 0; group < this->ngroup_; group++) {
     if (next_node_point[group] != group_end[group]) {
-      throw std::runtime_error(
-          "FATAL ERROR: glst_plan::validate: Tile schedule does not cover "
-          "every cubature node in group " +
-          std::to_string(group));
+      utl::throw_error(
+          function_name,
+          "Tile schedule does not cover every cubature node in group " +
+              std::to_string(group));
     }
   }
 
-  if (this->tile_partition_count_ == 0) {
-    throw std::runtime_error(
-        "FATAL ERROR: glst_plan::validate: tile_partition_count == 0");
-  }
+  utl::require(this->tile_partition_count_ > 0, function_name,
+               "tile_partition_count == 0");
 
-  if (this->tile_partition_idx_.size() !=
-      static_cast<std::size_t>(this->tile_count_)) {
-    throw std::runtime_error(
-        "FATAL ERROR: glst_plan::validate: tile_partition_idx size does not "
-        "match tile_count");
-  }
+  utl::require(this->tile_partition_idx_.size() ==
+                   static_cast<std::size_t>(this->tile_count_),
+               function_name,
+               "tile_partition_idx size does not match tile_count");
 
-  if (this->partition_tile_idx_.size() !=
-      static_cast<std::size_t>(this->tile_partition_count_)) {
-    throw std::runtime_error(
-        "FATAL ERROR: glst_plan::validate: partition_tile_idx size does not "
-        "match tile_partition_count");
-  }
+  utl::require(this->partition_tile_idx_.size() ==
+                   static_cast<std::size_t>(this->tile_partition_count_),
+               function_name,
+               "partition_tile_idx size does not match tile_partition_count");
 
-  if (this->partition_tile_node_count_.size() !=
-      static_cast<std::size_t>(this->tile_partition_count_)) {
-    throw std::runtime_error(
-        "FATAL ERROR: glst_plan::validate: partition_tile_node_count size does "
-        "not match tile_partition_count");
-  }
+  utl::require(
+      this->partition_tile_node_count_.size() ==
+          static_cast<std::size_t>(this->tile_partition_count_),
+      function_name,
+      "partition_tile_node_count size does not match tile_partition_count");
 
   std::vector<unsigned int> tile_visit_count(this->tile_count_, 0);
   std::vector<unsigned int> observed_partition_node_count(
@@ -975,15 +887,11 @@ void glst_plan::validate(void) const {
   for (unsigned int tile = 0; tile < this->tile_count_; tile++) {
     const unsigned int partition = this->tile_partition_idx_[tile];
 
-    if (partition >= this->tile_partition_count_) {
-      throw std::runtime_error(
-          "FATAL ERROR: glst_plan::validate: Tile has invalid tile partition");
-    }
+    utl::require(partition < this->tile_partition_count_, function_name,
+                 "Tile has invalid tile partition");
 
-    if (partition != tile % this->tile_partition_count_) {
-      throw std::runtime_error("FATAL ERROR: glst_plan::validate: Tile "
-                               "partition assignment is not deterministic");
-    }
+    utl::require(partition == tile % this->tile_partition_count_, function_name,
+                 "Tile partition assignment is not deterministic");
   }
 
   for (unsigned int partition = 0; partition < this->tile_partition_count_;
@@ -994,30 +902,22 @@ void glst_plan::validate(void) const {
     for (std::size_t i = 0; i < tiles.size(); i++) {
       const unsigned int tile = tiles[i];
 
-      if (tile >= this->tile_count_) {
-        throw std::runtime_error("FATAL ERROR: glst_plan::validate: Partition "
-                                 "tile list contains out-of-range tile");
-      }
+      utl::require(tile < this->tile_count_, function_name,
+                   "Partition tile list contains out-of-range tile");
 
-      if (this->tile_partition_idx_[tile] != partition) {
-        throw std::runtime_error("FATAL ERROR: glst_plan::validate: Partition "
-                                 "tile list disagrees with tile_partition_idx");
-      }
+      utl::require(this->tile_partition_idx_[tile] == partition, function_name,
+                   "Partition tile list disagrees with tile_partition_idx");
 
-      if ((i > 0) && (tiles[i] <= tiles[i - 1])) {
-        throw std::runtime_error("FATAL ERROR: glst_plan::validate: Partition "
-                                 "tile list is not in deterministic order");
-      }
+      utl::require((i == 0) || (tiles[i] > tiles[i - 1]), function_name,
+                   "Partition tile list is not in deterministic order");
 
       tile_visit_count[tile]++;
       observed_partition_node_count[partition] += this->tile_node_count_[tile];
     }
 
-    if (observed_partition_node_count[partition] !=
-        this->partition_tile_node_count_[partition]) {
-      throw std::runtime_error("FATAL ERROR: glst_plan::validate: Partition "
-                               "node count is inconsistent");
-    }
+    utl::require(observed_partition_node_count[partition] ==
+                     this->partition_tile_node_count_[partition],
+                 function_name, "Partition node count is inconsistent");
   }
 
   std::size_t partition_node_sum = 0;
@@ -1027,51 +927,38 @@ void glst_plan::validate(void) const {
         static_cast<std::size_t>(this->partition_tile_node_count_[partition]);
   }
 
-  if (partition_node_sum != total_nodes) {
-    throw std::runtime_error(
-        "FATAL ERROR: glst_plan::validate: Sum of tile partition node counts "
-        "does not match total cubature node count");
-  }
+  utl::require(partition_node_sum == total_nodes, function_name,
+               "Sum of tile partition node counts does not match total "
+               "cubature node count");
 
   for (unsigned int tile = 0; tile < this->tile_count_; tile++) {
-    if (tile_visit_count[tile] != 1) {
-      throw std::runtime_error(
-          "FATAL ERROR: glst_plan::validate: Every global tile must belong to "
-          "exactly one tile partition");
-    }
+    utl::require(tile_visit_count[tile] == 1, function_name,
+                 "Every global tile must belong to exactly one tile partition");
   }
 
-  if (this->cell_partition_count_ == 0) {
-    throw std::runtime_error(
-        "FATAL ERROR: glst_plan::validate: cell_partition_count_ == 0");
-  }
+  utl::require(this->cell_partition_count_ > 0, function_name,
+               "cell_partition_count_ == 0");
 
-  if (this->cell_partition_idx_.size() !=
-      static_cast<std::size_t>(this->ncell_)) {
-    throw std::runtime_error("FATAL ERROR: glst_plan::validate: "
-                             "cell_partition_idx size does not match ncell");
-  }
+  utl::require(this->cell_partition_idx_.size() ==
+                   static_cast<std::size_t>(this->ncell_),
+               function_name, "cell_partition_idx size does not match ncell");
 
-  if (this->cell_partition_x_point_.size() !=
-      static_cast<std::size_t>(this->cell_partition_count_)) {
-    throw std::runtime_error(
-        "FATAL ERROR: glst_plan::validate: cell_partition_x_point size does "
-        "not match cell_partition_count");
-  }
+  utl::require(
+      this->cell_partition_x_point_.size() ==
+          static_cast<std::size_t>(this->cell_partition_count_),
+      function_name,
+      "cell_partition_x_point size does not match cell_partition_count");
 
-  if (this->cell_partition_x_count_.size() !=
-      static_cast<std::size_t>(this->cell_partition_count_)) {
-    throw std::runtime_error(
-        "FATAL ERROR: glst_plan::validate: cell_partition_x_count size does "
-        "not match cell_partition_count");
-  }
+  utl::require(
+      this->cell_partition_x_count_.size() ==
+          static_cast<std::size_t>(this->cell_partition_count_),
+      function_name,
+      "cell_partition_x_count size does not match cell_partition_count");
 
-  if (this->partition_cell_idx_.size() !=
-      static_cast<std::size_t>(this->cell_partition_count_)) {
-    throw std::runtime_error(
-        "FATAL ERROR: glst_plan::validate: partition_cell_idx size does not "
-        "match cell_partition_count");
-  }
+  utl::require(this->partition_cell_idx_.size() ==
+                   static_cast<std::size_t>(this->cell_partition_count_),
+               function_name,
+               "partition_cell_idx size does not match cell_partition_count");
 
   std::vector<unsigned int> cell_visit_count(this->ncell_, 0);
 
@@ -1083,53 +970,40 @@ void glst_plan::validate(void) const {
     const std::size_t expected_cell_count =
         static_cast<std::size_t>(x_count) * static_cast<std::size_t>(yz_count);
 
-    if (this->partition_cell_idx_[part].size() != expected_cell_count) {
-      throw std::runtime_error("FATAL ERROR: glst_plan::validate: Partition "
-                               "cell list size does not match x-range size");
-    }
+    utl::require(this->partition_cell_idx_[part].size() == expected_cell_count,
+                 function_name,
+                 "Partition cell list size does not match x-range size");
 
-    if ((x_point > this->ncell_x_) || (x_count > this->ncell_x_ - x_point)) {
-      throw std::runtime_error("FATAL ERROR: glst_plan::validate: Cell "
-                               "partition x-range is out of bounds");
-    }
+    utl::require((x_point <= this->ncell_x_) &&
+                     (x_count <= this->ncell_x_ - x_point),
+                 function_name, "Cell partition x-range is out of bounds");
 
     const std::vector<unsigned int> &cells = this->partition_cell_idx_[part];
 
     for (std::size_t i = 0; i < cells.size(); i++) {
       const unsigned int cell = cells[i];
 
-      if (cell >= this->ncell_) {
-        throw std::runtime_error("FATAL ERROR: glst_plan::validate: Partition "
-                                 "cell list contains out-of-range cell");
-      }
+      utl::require(cell < this->ncell_, function_name,
+                   "Partition cell list contains out-of-range cell");
 
-      if (this->cell_partition_idx_[cell] != part) {
-        throw std::runtime_error(
-            "FATAL ERROR: glst_plan::validate: partition_cell_idx disagrees "
-            "with cell_partition_idx");
-      }
+      utl::require(this->cell_partition_idx_[cell] == part, function_name,
+                   "partition_cell_idx disagrees with cell_partition_idx");
 
       const unsigned int x = cell / (this->ncell_y_ * this->ncell_z_);
-      if ((x < x_point) || (x >= x_point + x_count)) {
-        throw std::runtime_error("FATAL ERROR: glst_plan::validate: Partition "
-                                 "cell is outside its x-range");
-      }
+      utl::require((x >= x_point) && (x < x_point + x_count), function_name,
+                   "Partition cell is outside its x-range");
 
       const unsigned int local_cell =
           this->local_cell_from_global_cell(part, cell);
 
-      if (local_cell != static_cast<unsigned int>(i)) {
-        throw std::runtime_error("FATAL ERROR: glst_plan::validate: Local cell "
-                                 "index is not deterministic");
-      }
+      utl::require(local_cell == static_cast<unsigned int>(i), function_name,
+                   "Local cell index is not deterministic");
 
       const unsigned int round_trip_cell =
           this->global_cell_from_local_cell(part, local_cell);
 
-      if (round_trip_cell != cell) {
-        throw std::runtime_error("FATAL ERROR: glst_plan::validate: "
-                                 "Local/global cell round-trip failed");
-      }
+      utl::require(round_trip_cell == cell, function_name,
+                   "Local/global cell round-trip failed");
 
       unsigned int cx = 0, cy = 0, cz = 0;
       this->global_cell_coords(cx, cy, cz, cell);
@@ -1137,47 +1011,38 @@ void glst_plan::validate(void) const {
       const unsigned int rebuilt_cell =
           (cx * this->ncell_y_ + cy) * this->ncell_z_ + cz;
 
-      if (rebuilt_cell != cell) {
-        throw std::runtime_error("FATAL ERROR: glst_plan::validate: Global "
-                                 "cell coordinate conversion failed");
-      }
+      utl::require(rebuilt_cell == cell, function_name,
+                   "Global cell coordinate conversion failed");
 
       cell_visit_count[cell]++;
     }
   }
 
   for (unsigned int cell = 0; cell < this->ncell_; cell++) {
-    if (cell_visit_count[cell] != 1) {
-      throw std::runtime_error(
-          "FATAL ERROR: glst_plan::validate: Every global cell must belong to "
-          "exactly one cell partition");
-    }
+    utl::require(cell_visit_count[cell] == 1, function_name,
+                 "Every global cell must belong to exactly one cell partition");
   }
 
-  if (this->partition_left_halo_cell_idx_.size() !=
-      static_cast<std::size_t>(this->cell_partition_count_)) {
-    throw std::runtime_error("FATAL ERROR: glst_plan::validate: left halo "
-                             "metadata size does not match cell partitions");
-  }
+  utl::require(this->partition_left_halo_cell_idx_.size() ==
+                   static_cast<std::size_t>(this->cell_partition_count_),
+               function_name,
+               "Left halo metadata size does not match cell partitions");
 
-  if (this->partition_right_halo_cell_idx_.size() !=
-      static_cast<std::size_t>(this->cell_partition_count_)) {
-    throw std::runtime_error("FATAL ERROR: glst_plan::validate: right halo "
-                             "metadata size does not match cell partitions");
-  }
+  utl::require(this->partition_right_halo_cell_idx_.size() ==
+                   static_cast<std::size_t>(this->cell_partition_count_),
+               function_name,
+               "Right halo metadata size does not match cell partitions");
 
-  if (this->partition_halo_cell_idx_.size() !=
-      static_cast<std::size_t>(this->cell_partition_count_)) {
-    throw std::runtime_error("FATAL ERROR: glst_plan::validate: halo metadata "
-                             "size does not match cell partitions");
-  }
+  utl::require(this->partition_halo_cell_idx_.size() ==
+                   static_cast<std::size_t>(this->cell_partition_count_),
+               function_name,
+               "Halo metadata size does not match cell partitions");
 
-  if (this->partition_sr_source_cell_idx_.size() !=
-      static_cast<std::size_t>(this->cell_partition_count_)) {
-    throw std::runtime_error(
-        "FATAL ERROR: glst_plan::validate: short-range source metadata size "
-        "does not match cell partitions");
-  }
+  utl::require(
+      this->partition_sr_source_cell_idx_.size() ==
+          static_cast<std::size_t>(this->cell_partition_count_),
+      function_name,
+      "Short-range source metadata size does not match cell partitions");
 
   const unsigned int yz_count = this->ncell_y_ * this->ncell_z_;
 
@@ -1205,77 +1070,56 @@ void glst_plan::validate(void) const {
             ? static_cast<std::size_t>(yz_count)
             : 0;
 
-    if (left_cells.size() != expected_left_count) {
-      throw std::runtime_error("FATAL ERROR: glst_plan::validate: left halo "
-                               "plane size is incorrect");
-    }
+    utl::require(left_cells.size() == expected_left_count, function_name,
+                 "Left halo plane size is incorrect");
 
-    if (right_cells.size() != expected_right_count) {
-      throw std::runtime_error("FATAL ERROR: glst_plan::validate: right halo "
-                               "plane size is incorrect");
-    }
+    utl::require(right_cells.size() == expected_right_count, function_name,
+                 "Right halo plane size is incorrect");
 
-    if (halo_cells.size() != left_cells.size() + right_cells.size()) {
-      throw std::runtime_error("FATAL ERROR: glst_plan::validate: combined "
-                               "halo size is inconsistent");
-    }
+    utl::require(halo_cells.size() == left_cells.size() + right_cells.size(),
+                 function_name, "Combined halo size is inconsistent");
 
-    if (source_cells.size() != owned_cells.size() + halo_cells.size()) {
-      throw std::runtime_error("FATAL ERROR: glst_plan::validate: short-range "
-                               "source size is inconsistent");
-    }
+    utl::require(source_cells.size() == owned_cells.size() + halo_cells.size(),
+                 function_name, "Short-range source size is inconsistent");
 
     for (std::size_t i = 0; i < owned_cells.size(); i++) {
-      if (source_cells[i] != owned_cells[i]) {
-        throw std::runtime_error(
-            "FATAL ERROR: glst_plan::validate: short-range source list does "
-            "not start with owned cells");
-      }
+      utl::require(source_cells[i] == owned_cells[i], function_name,
+                   "Short-range source list does not start with owned cells");
     }
 
     for (std::size_t i = 0; i < halo_cells.size(); i++) {
-      if (source_cells[owned_cells.size() + i] != halo_cells[i]) {
-        throw std::runtime_error(
-            "FATAL ERROR: glst_plan::validate: short-range source list does "
-            "not append halo cells");
-      }
+      utl::require(source_cells[owned_cells.size() + i] == halo_cells[i],
+                   function_name,
+                   "Short-range source list does not append halo cells");
     }
 
     for (std::size_t i = 0; i < left_cells.size(); i++) {
       unsigned int x = 0, y = 0, z = 0;
       this->global_cell_coords(x, y, z, left_cells[i]);
 
-      if (x != x_point - 1) {
-        throw std::runtime_error("FATAL ERROR: glst_plan::validate: left halo "
-                                 "cell is not on the adjacent x plane");
-      }
+      utl::require(x == x_point - 1, function_name,
+                   "Left halo cell is not on the adjacent x plane");
 
-      if (this->cell_partition_idx_[left_cells[i]] == part) {
-        throw std::runtime_error("FATAL ERROR: glst_plan::validate: left halo "
-                                 "cell is owned by the target partition");
-      }
+      utl::require(this->cell_partition_idx_[left_cells[i]] != part,
+                   function_name,
+                   "Left halo cell is owned by the target partition");
     }
 
     for (std::size_t i = 0; i < right_cells.size(); i++) {
       unsigned int x = 0, y = 0, z = 0;
       this->global_cell_coords(x, y, z, right_cells[i]);
 
-      if (x != x_end) {
-        throw std::runtime_error("FATAL ERROR: glst_plan::validate: right halo "
-                                 "cell is not on the adjacent x plane");
-      }
+      utl::require(x == x_end, function_name,
+                   "Right halo cell is not on the adjacent x plane");
 
-      if (this->cell_partition_idx_[right_cells[i]] == part) {
-        throw std::runtime_error("FATAL ERROR: glst_plan::validate: right halo "
-                                 "cell is owned by the target partition");
-      }
+      utl::require(this->cell_partition_idx_[right_cells[i]] != part,
+                   function_name,
+                   "Right halo cell is owned by the target partition");
     }
 
     if (this->cell_partition_count_ == 1) {
-      if (!halo_cells.empty()) {
-        throw std::runtime_error("FATAL ERROR: glst_plan::validate: single-GPU "
-                                 "partition has halo cells");
-      }
+      utl::require(halo_cells.empty(), function_name,
+                   "Single-GPU partition has halo cells");
     }
   }
 

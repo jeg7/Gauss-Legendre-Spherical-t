@@ -11,34 +11,35 @@
 #include "glst_workspace.hcu"
 
 #include "cuda_utils.hcu"
+#include "error_utils.hpp"
 
 #include <cub/cub.cuh>
 #include <limits>
-#include <stdexcept>
 #include <string>
 #include <string_view>
 
 inline static std::size_t checked_mul(const std::size_t a, const std::size_t b,
                                       const std::string_view label) {
   if ((a != 0) && (b > std::numeric_limits<std::size_t>::max() / a)) {
-    const std::string s(label);
-    throw std::runtime_error(
-        "FATAL ERROR: glst_workspace: Overflow while computing " + s);
+    utl::throw_error("checked_mul",
+                     "Overflow while computing " + std::string(label));
   }
   return (a * b);
 }
 
 glst_workspace::glst_workspace(void)
     : max_atom_capacity_(0), max_cell_capacity_(0), tile_node_capacity_(0),
-      max_sf_tile_buffer_capacity_(0), max_rmt_tile_buffer_capacity_(0),
-      atom_capacity_(), cell_capacity_(), sf_tile_buffer_capacity_(),
+      max_sf_tile_buffer_capacity_(0), max_sf_exchange_tile_buffer_capacity_(0),
+      max_rmt_tile_buffer_capacity_(0), atom_capacity_(), cell_capacity_(),
+      sf_tile_buffer_capacity_(), sf_exchange_tile_buffer_capacity_(),
       rmt_tile_buffer_capacity_(), owned_atom_count_(),
       sr_source_cell_capacity_(), idx_(), sorted_idx_(), rx_(), ry_(), rz_(),
       qc_(), packets_(), sorted_packets_(), atom_cell_idx_(),
       atom_cell_sorted_idx_(), fx_(), fy_(), fz_(), en_(), cell_atom_point_(),
       cell_atom_count_(), max_atoms_cell_(), sr_source_cell_atom_point_(),
-      sr_source_cell_atom_count_(), sf_re_(), sf_im_(), rmt_sum_re_(),
-      rmt_sum_im_() {}
+      sr_source_cell_atom_count_(), sf_re_(), sf_im_(), sf_exchange_re_(),
+      sf_exchange_im_(), rmt_sum_re_(), rmt_sum_im_(), cub_work_buffer_(),
+      cub_work_buffer_size_() {}
 
 glst_workspace::glst_workspace(const glst_plan &plan, const int device_count)
     : glst_workspace() {
@@ -47,9 +48,11 @@ glst_workspace::glst_workspace(const glst_plan &plan, const int device_count)
 
 glst_workspace::glst_workspace(
     const glst_plan &plan, const std::vector<unsigned int> &dev_cell_partition,
-    const int device_count)
+    const int device_count, const bool use_full_sf_buffer,
+    const unsigned int sf_exchange_chunk_x_count)
     : glst_workspace() {
-  this->init(plan, dev_cell_partition, device_count);
+  this->init(plan, dev_cell_partition, device_count, use_full_sf_buffer,
+             sf_exchange_chunk_x_count);
 }
 
 glst_workspace::~glst_workspace(void) { this->deallocate_cub(); }
@@ -70,58 +73,66 @@ std::size_t glst_workspace::max_sf_tile_buffer_capacity(void) const {
   return this->max_sf_tile_buffer_capacity_;
 }
 
+std::size_t glst_workspace::max_sf_exchange_tile_buffer_capacity(void) const {
+  return this->max_sf_exchange_tile_buffer_capacity_;
+}
+
 std::size_t glst_workspace::max_rmt_tile_buffer_capacity(void) const {
   return this->max_rmt_tile_buffer_capacity_;
 }
 
 std::size_t glst_workspace::atom_capacity(const int dev) const {
-  if (static_cast<std::size_t>(dev) >= this->atom_capacity_.size()) {
-    throw std::runtime_error("FATAL ERROR: glst_workspace::atom_capacity: "
-                             "Device index out of range");
-  }
+  utl::require(static_cast<std::size_t>(dev) < this->atom_capacity_.size(),
+               "glst_workspace::atom_capacity", "Device index out of range");
+
   return this->atom_capacity_[dev];
 }
 
 std::size_t glst_workspace::cell_capacity(const int dev) const {
-  if (static_cast<std::size_t>(dev) >= this->cell_capacity_.size()) {
-    throw std::runtime_error("FATAL ERROR: glst_workspace::cell_capacity: "
-                             "Device index out of range");
-  }
+  utl::require(static_cast<std::size_t>(dev) < this->cell_capacity_.size(),
+               "glst_workspace::cell_capacity", "Device index out of range");
+
   return this->cell_capacity_[dev];
 }
 
 std::size_t glst_workspace::sf_tile_buffer_capacity(const int dev) const {
-  if (static_cast<std::size_t>(dev) >= this->sf_tile_buffer_capacity_.size()) {
-    throw std::runtime_error(
-        "FATAL ERROR: glst_workspace::sf_tile_buffer_capacity: "
-        "Device index out of range");
-  }
+  utl::require(
+      static_cast<std::size_t>(dev) < this->sf_tile_buffer_capacity_.size(),
+      "glst_workspace::sf_tile_buffer_capacity", "Device index out of range");
+
   return this->sf_tile_buffer_capacity_[dev];
 }
 
+std::size_t
+glst_workspace::sf_exchange_tile_buffer_capacity(const int dev) const {
+  utl::require(static_cast<std::size_t>(dev) <
+                   this->sf_exchange_tile_buffer_capacity_.size(),
+               "glst_workspace::sf_exchange_tile_buffer_capacity",
+               "Device index out of range");
+
+  return this->sf_exchange_tile_buffer_capacity_[dev];
+}
+
 std::size_t glst_workspace::rmt_tile_buffer_capacity(const int dev) const {
-  if (static_cast<std::size_t>(dev) >= this->rmt_tile_buffer_capacity_.size()) {
-    throw std::runtime_error(
-        "FATAL ERROR: glst_workspace::rmt_tile_buffer_capacity: "
-        "Device index out of range");
-  }
+  utl::require(
+      static_cast<std::size_t>(dev) < this->rmt_tile_buffer_capacity_.size(),
+      "glst_workspace::rmt_tile_buffer_capacity", "Device index out of range");
+
   return this->rmt_tile_buffer_capacity_[dev];
 }
 
 std::size_t glst_workspace::owned_atom_count(const int dev) const {
-  if (static_cast<std::size_t>(dev) >= this->owned_atom_count_.size()) {
-    throw std::runtime_error("FATAL ERROR: glst_workspace::owned_atom_count: "
-                             "Device index out of range");
-  }
+  utl::require(static_cast<std::size_t>(dev) < this->owned_atom_count_.size(),
+               "glst_workspace::owned_atom_count", "Device index out of range");
+
   return this->owned_atom_count_[dev];
 }
 
 std::size_t glst_workspace::sr_source_cell_capacity(const int dev) const {
-  if (static_cast<std::size_t>(dev) >= this->sr_source_cell_capacity_.size()) {
-    throw std::runtime_error(
-        "FATAL ERROR: glst_workspace::sr_source_cell_capacity: "
-        "Device index out of range");
-  }
+  utl::require(
+      static_cast<std::size_t>(dev) < this->sr_source_cell_capacity_.size(),
+      "glst_workspace::sr_source_cell_capacity", "Device index out of range");
+
   return this->sr_source_cell_capacity_[dev];
 }
 
@@ -226,6 +237,16 @@ const std::vector<cuda_container<double>> &glst_workspace::sf_re(void) const {
 
 const std::vector<cuda_container<double>> &glst_workspace::sf_im(void) const {
   return this->sf_im_;
+}
+
+const std::vector<cuda_container<double>> &
+glst_workspace::sf_exchange_re(void) const {
+  return this->sf_exchange_re_;
+}
+
+const std::vector<cuda_container<double>> &
+glst_workspace::sf_exchange_im(void) const {
+  return this->sf_exchange_im_;
 }
 
 const std::vector<cuda_container<double>> &
@@ -336,6 +357,14 @@ std::vector<cuda_container<double>> &glst_workspace::sf_im(void) {
   return this->sf_im_;
 }
 
+std::vector<cuda_container<double>> &glst_workspace::sf_exchange_re(void) {
+  return this->sf_exchange_re_;
+}
+
+std::vector<cuda_container<double>> &glst_workspace::sf_exchange_im(void) {
+  return this->sf_exchange_im_;
+}
+
 std::vector<cuda_container<double>> &glst_workspace::rmt_sum_re(void) {
   return this->rmt_sum_re_;
 }
@@ -353,10 +382,7 @@ std::vector<std::size_t> &glst_workspace::cub_work_buffer_size(void) {
 }
 
 void glst_workspace::init(const glst_plan &plan, const int device_count) {
-  if (device_count < 1) {
-    throw std::runtime_error(
-        "FATAL ERROR: glst_workspace::init: device_count < 1");
-  }
+  utl::require(device_count >= 1, "glst_workspace::init", "device_count < 1");
 
   std::vector<unsigned int> dev_cell_partition(device_count, 0);
   for (int dev = 0; dev < device_count; dev++) {
@@ -364,52 +390,70 @@ void glst_workspace::init(const glst_plan &plan, const int device_count) {
       dev_cell_partition[dev] = static_cast<unsigned int>(dev);
   }
 
-  this->init(plan, dev_cell_partition, device_count);
+  this->init(plan, dev_cell_partition, device_count, true, 0);
 
   return;
 }
 
 void glst_workspace::init(const glst_plan &plan,
                           const std::vector<unsigned int> &dev_cell_partition,
-                          const int device_count) {
+                          const int device_count, const bool use_full_sf_buffer,
+                          const unsigned int sf_exchange_chunk_x_count) {
+  constexpr std::string_view function_name = "glst_workspace::init";
+
   this->clear();
 
-  if (device_count < 1) {
-    throw std::runtime_error(
-        "FATAL ERROR: glst_workspace::init: device_count < 1");
-  }
+  utl::require(device_count >= 1, function_name, "device_count < 1");
 
-  if (dev_cell_partition.size() != static_cast<std::size_t>(device_count)) {
-    throw std::runtime_error(
-        "FATAL ERROR: glst_workspace::init: dev_cell_partition size does not "
-        "match device_count");
-  }
+  utl::require(
+      dev_cell_partition.size() == static_cast<std::size_t>(device_count),
+      function_name, "dev_cell_partition size does not match device_count");
 
   const std::size_t global_natom = static_cast<std::size_t>(plan.natom());
   const std::size_t global_ncell = static_cast<std::size_t>(plan.ncell());
   const std::size_t max_tile_nodes =
       static_cast<std::size_t>(plan.max_tile_nodes());
 
-  if (global_natom == 0)
-    throw std::runtime_error("FATAL ERROR: glst_workspace::init: natom is 0");
+  utl::require(global_natom > 0, function_name, "natom is 0");
 
-  if (global_ncell == 0)
-    throw std::runtime_error("FATAL ERROR: glst_workspace::init: ncell is 0");
+  utl::require(global_ncell > 0, function_name, "ncell is 0");
 
-  if (max_tile_nodes == 0) {
-    throw std::runtime_error(
-        "FATAL ERROR: glst_workspace::init: max_tile_nodes is 0");
+  utl::require(max_tile_nodes > 0, function_name, "max_tile_nodes is 0");
+
+  std::size_t sf_exchange_capacity = 0;
+
+  if ((!use_full_sf_buffer) && (plan.cell_partition_count() > 1)) {
+    utl::require(
+        sf_exchange_chunk_x_count > 0, function_name,
+        "Local S_tile exchange requires a positive x-plane chunk count");
+
+    utl::require(sf_exchange_chunk_x_count <= plan.ncell_x(), function_name,
+                 "S_tile exchange chunk exceeds ncell_x");
+
+    const std::size_t yz_cell_count =
+        checked_mul(static_cast<std::size_t>(plan.ncell_y()),
+                    static_cast<std::size_t>(plan.ncell_z()),
+                    "S_tile exchange yz-cell count");
+
+    const std::size_t sf_exchange_cell_count =
+        checked_mul(static_cast<std::size_t>(sf_exchange_chunk_x_count),
+                    yz_cell_count, "S_tile exchange buffer capacity");
+
+    sf_exchange_capacity = checked_mul(sf_exchange_cell_count, max_tile_nodes,
+                                       "S_tile exchange tile buffer capacity");
   }
 
   this->max_atom_capacity_ = 0;
   this->max_cell_capacity_ = 0;
   this->tile_node_capacity_ = max_tile_nodes;
   this->max_sf_tile_buffer_capacity_ = 0;
+  this->max_sf_exchange_tile_buffer_capacity_ = 0;
   this->max_rmt_tile_buffer_capacity_ = 0;
 
   this->atom_capacity_.assign(device_count, 0);
   this->cell_capacity_.assign(device_count, 0);
   this->sf_tile_buffer_capacity_.assign(device_count, 0);
+  this->sf_exchange_tile_buffer_capacity_.assign(device_count, 0);
   this->rmt_tile_buffer_capacity_.assign(device_count, 0);
   this->owned_atom_count_.assign(device_count, 0);
   this->sr_source_cell_capacity_.assign(device_count, 0);
@@ -417,10 +461,8 @@ void glst_workspace::init(const glst_plan &plan,
   for (int dev = 0; dev < device_count; dev++) {
     const unsigned int cell_partition = dev_cell_partition[dev];
 
-    if (cell_partition >= plan.cell_partition_count()) {
-      throw std::runtime_error("FATAL ERROR: glst_workspace::init: Device cell "
-                               "partition is out of range");
-    }
+    utl::require(cell_partition < plan.cell_partition_count(), function_name,
+                 "Device cell partition is out of range");
 
     const std::size_t local_cell_count =
         (device_count == 1)
@@ -435,39 +477,50 @@ void glst_workspace::init(const glst_plan &plan,
     const std::size_t sr_source_cell_count = local_cell_count + halo_cell_count;
 
     std::size_t local_atom_capacity = global_natom;
+
     if (device_count > 1) {
       const std::size_t atom_cell_product = checked_mul(
           global_natom, local_cell_count, "local atom capacity numerator");
 
-      if ((global_ncell > 1) &&
-          (atom_cell_product >
-           std::numeric_limits<std::size_t>::max() - (global_ncell - 1))) {
-        throw std::runtime_error("FATAL ERROR: glst_workspace::init: Overflow "
-                                 "while computing local atom capacity");
-      }
+      utl::require(
+          (global_ncell <= 1) ||
+              (atom_cell_product <=
+               std::numeric_limits<std::size_t>::max() - (global_ncell - 1)),
+          function_name, "Overflow while computing local atom capacity");
 
       local_atom_capacity =
           (atom_cell_product + global_ncell - 1) / global_ncell;
     }
 
+    const std::size_t sf_cell_count =
+        (use_full_sf_buffer) ? global_ncell : local_cell_count;
+
     const std::size_t sf_capacity =
-        checked_mul(global_ncell, max_tile_nodes, "sf tile buffer capacity");
+        checked_mul(sf_cell_count, max_tile_nodes, "sf tile buffer capacity");
+
     const std::size_t rmt_capacity = checked_mul(
         local_cell_count, max_tile_nodes, "rmt_sum tile buffer capacity");
 
     this->atom_capacity_[dev] = local_atom_capacity;
     this->cell_capacity_[dev] = local_cell_count;
     this->sf_tile_buffer_capacity_[dev] = sf_capacity;
+    this->sf_exchange_tile_buffer_capacity_[dev] = sf_exchange_capacity;
     this->rmt_tile_buffer_capacity_[dev] = rmt_capacity;
     this->owned_atom_count_[dev] = local_atom_capacity;
     this->sr_source_cell_capacity_[dev] = sr_source_cell_count;
 
     if (local_atom_capacity > this->max_atom_capacity_)
       this->max_atom_capacity_ = local_atom_capacity;
+
     if (local_cell_count > this->max_cell_capacity_)
       this->max_cell_capacity_ = local_cell_count;
+
     if (sf_capacity > this->max_sf_tile_buffer_capacity_)
       this->max_sf_tile_buffer_capacity_ = sf_capacity;
+
+    if (sf_exchange_capacity > this->max_sf_exchange_tile_buffer_capacity_)
+      this->max_sf_exchange_tile_buffer_capacity_ = sf_exchange_capacity;
+
     if (rmt_capacity > this->max_rmt_tile_buffer_capacity_)
       this->max_rmt_tile_buffer_capacity_ = rmt_capacity;
   }
@@ -496,6 +549,8 @@ void glst_workspace::init(const glst_plan &plan,
 
   this->sf_re_.resize(device_count);
   this->sf_im_.resize(device_count);
+  this->sf_exchange_re_.resize(device_count);
+  this->sf_exchange_im_.resize(device_count);
   this->rmt_sum_re_.resize(device_count);
   this->rmt_sum_im_.resize(device_count);
 
@@ -529,6 +584,11 @@ void glst_workspace::init(const glst_plan &plan,
     this->sf_re_[dev].resize(this->sf_tile_buffer_capacity_[dev]);
     this->sf_im_[dev].resize(this->sf_tile_buffer_capacity_[dev]);
 
+    this->sf_exchange_re_[dev].resize(
+        this->sf_exchange_tile_buffer_capacity_[dev]);
+    this->sf_exchange_im_[dev].resize(
+        this->sf_exchange_tile_buffer_capacity_[dev]);
+
     this->rmt_sum_re_[dev].resize(this->rmt_tile_buffer_capacity_[dev]);
     this->rmt_sum_im_[dev].resize(this->rmt_tile_buffer_capacity_[dev]);
   }
@@ -540,11 +600,9 @@ void glst_workspace::init(const glst_plan &plan,
 
 void glst_workspace::resize_atom_storage(const int dev,
                                          const std::size_t atom_capacity) {
-  if (static_cast<std::size_t>(dev) >= this->atom_capacity_.size()) {
-    throw std::runtime_error(
-        "FATAL ERROR: glst_workspace::resize_atom_storage: Device index out of "
-        "range");
-  }
+  utl::require(static_cast<std::size_t>(dev) < this->atom_capacity_.size(),
+               "glst_workspace::resize_atom_storage",
+               "Device index out of range");
 
   cudaCheck(cudaSetDevice(dev));
 
@@ -583,17 +641,14 @@ void glst_workspace::resize_atom_storage(const int dev,
 
 void glst_workspace::set_owned_atom_count(const int dev,
                                           const std::size_t owned_atom_count) {
-  if (static_cast<std::size_t>(dev) >= this->owned_atom_count_.size()) {
-    throw std::runtime_error(
-        "FATAL ERROR: glst_workspace::set_owned_atom_count: Device index out "
-        "of range");
-  }
+  constexpr std::string_view function_name =
+      "glst_workspace::set_owned_atom_count";
 
-  if (owned_atom_count > this->atom_capacity_[dev]) {
-    throw std::runtime_error(
-        "FATAL ERROR: glst_workspace::set_owned_atom_count: owned_atom_count "
-        "exceeds atom capacity");
-  }
+  utl::require(static_cast<std::size_t>(dev) < this->owned_atom_count_.size(),
+               function_name, "Device index out of range");
+
+  utl::require(owned_atom_count <= this->atom_capacity_[dev], function_name,
+               "owned_atom_count exceeds atom capacity");
 
   this->owned_atom_count_[dev] = owned_atom_count;
 
@@ -607,11 +662,13 @@ void glst_workspace::clear(void) {
   this->max_cell_capacity_ = 0;
   this->tile_node_capacity_ = 0;
   this->max_sf_tile_buffer_capacity_ = 0;
+  this->max_sf_exchange_tile_buffer_capacity_ = 0;
   this->max_rmt_tile_buffer_capacity_ = 0;
 
   this->atom_capacity_.clear();
   this->cell_capacity_.clear();
   this->sf_tile_buffer_capacity_.clear();
+  this->sf_exchange_tile_buffer_capacity_.clear();
   this->rmt_tile_buffer_capacity_.clear();
   this->owned_atom_count_.clear();
   this->sr_source_cell_capacity_.clear();
@@ -640,6 +697,8 @@ void glst_workspace::clear(void) {
 
   this->sf_re_.clear();
   this->sf_im_.clear();
+  this->sf_exchange_re_.clear();
+  this->sf_exchange_im_.clear();
   this->rmt_sum_re_.clear();
   this->rmt_sum_im_.clear();
 
@@ -660,11 +719,10 @@ void glst_workspace::allocate_cub_for_device(const int dev) {
   if (atom_capacity == 0)
     return;
 
-  if (atom_capacity >
-      static_cast<std::size_t>(std::numeric_limits<int>::max())) {
-    throw std::runtime_error("FATAL ERROR: glst_workspace::allocate_cub: "
-                             "Atom capacity exceeds CUB int range");
-  }
+  utl::require(atom_capacity <=
+                   static_cast<std::size_t>(std::numeric_limits<int>::max()),
+               "glst_workspace::allocate_cub",
+               "Atom capacity exceeds CUB int range");
 
   const int num_items = static_cast<int>(atom_capacity);
 

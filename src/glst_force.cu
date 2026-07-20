@@ -11,6 +11,7 @@
 #include "glst_force.hcu"
 
 #include "cuda_utils.hcu"
+#include "error_utils.hpp"
 #include "reduce.hcu"
 
 #include <cub/cub.cuh>
@@ -23,7 +24,6 @@
 #include <cstddef>
 #include <iostream>
 #include <limits>
-#include <stdexcept>
 #include <string>
 
 static double
@@ -35,12 +35,14 @@ profile_elapsed_ms(const std::chrono::steady_clock::time_point &start,
 glst_force::glst_force(void)
     : plan_(nullptr), workspace_(nullptr),
       execution_mode_(GLST_EXECUTION_MODE::SINGLE_GPU_TILED),
-      cell_partition_count_(1), tile_partition_count_(1), dev_cell_partition_(),
-      dev_tile_partition_(), cuda_count_(-1), dev_cell_idx_(), comp_streams_(),
-      comm_streams_(), comp_events_(), comm_events_(), nccl_devs_(),
-      nccl_comms_(), cell_comm_devs_(), tile_comm_devs_(), cell_comms_(),
-      tile_comms_(), profiling_enabled_(false), profile_(),
-      gpu_layout_user_set_(false), cuda_initialized_(false) {}
+      sf_exchange_mode_(GLST_SF_EXCHANGE_MODE::LOCAL_CHUNK_BROADCAST),
+      sf_exchange_chunk_x_count_(0), cell_partition_count_(1),
+      tile_partition_count_(1), dev_cell_partition_(), dev_tile_partition_(),
+      cuda_count_(-1), dev_cell_idx_(), comp_streams_(), comm_streams_(),
+      comp_events_(), comm_events_(), nccl_devs_(), nccl_comms_(),
+      cell_comm_devs_(), tile_comm_devs_(), cell_comms_(), tile_comms_(),
+      profiling_enabled_(false), profile_(), gpu_layout_user_set_(false),
+      cuda_initialized_(false) {}
 
 glst_force::glst_force(const unsigned int natom, const double tol,
                        const double box_dim_x, const double box_dim_y,
@@ -103,15 +105,11 @@ void glst_force::get_ef(cuda_container<double> &fx, cuda_container<double> &fy,
                         cuda_container<double> &en) {
   constexpr std::string_view function_name = "glst_force::get_ef";
 
-  if (this->plan_ == nullptr) {
-    throw std::runtime_error("FATAL ERROR: " + std::string(function_name) +
-                             ": Plan is not initialized");
-  }
+  utl::require(this->plan_ != nullptr, function_name,
+               "Plan is not initialized");
 
-  if (this->workspace_ == nullptr) {
-    throw std::runtime_error("FATAL ERROR: " + std::string(function_name) +
-                             ": Workspace is not initialized");
-  }
+  utl::require(this->workspace_ != nullptr, function_name,
+               "Workspace is not initialized");
 
   const std::size_t natom = static_cast<std::size_t>(this->plan_->natom());
 
@@ -174,12 +172,11 @@ void glst_force::get_ef(cuda_container<double> &fx, cuda_container<double> &fy,
   // Multi-GPU path. There must be one tile communicator per cell partition.
   // Rank 0 of each communicator it tile partition 0 and owns the complete
   // reduced local result.
-  if (this->tile_comm_devs_.size() !=
-      static_cast<std::size_t>(this->cell_partition_count_)) {
-    throw std::runtime_error(
-        "FATAL ERROR: " + std::string(function_name) +
-        ": Tile communicator topology does not match cell partition count");
-  }
+  utl::require(
+      this->tile_comm_devs_.size() ==
+          static_cast<std::size_t>(this->cell_partition_count_),
+      function_name,
+      "Tile communicator topology does not match cell partition count");
 
   std::size_t total_owned_atom_count = 0;
   std::size_t max_owned_atom_count = 0;
@@ -189,43 +186,34 @@ void glst_force::get_ef(cuda_container<double> &fx, cuda_container<double> &fy,
        cell_partition < this->cell_partition_count_; cell_partition++) {
     const std::vector<int> &devs = this->tile_comm_devs_[cell_partition];
 
-    if (devs.size() != static_cast<std::size_t>(this->tile_partition_count_)) {
-      throw std::runtime_error("FATAL ERROR: " + std::string(function_name) +
-                               ": Tile communicator device count does not "
-                               "match tile partition count");
-    }
+    utl::require(
+        devs.size() == static_cast<std::size_t>(this->tile_partition_count_),
+        function_name,
+        "Tile communicator device count does not match tile partition count");
 
-    if (devs.empty()) {
-      throw std::runtime_error("FATAL ERROR: " + std::string(function_name) +
-                               ": Tile communicator has no root device");
-    }
+    utl::require(!devs.empty(), function_name,
+                 "Tile communicator has no root device");
 
     const int root_dev = devs[0];
 
-    if ((root_dev < 0) || (root_dev >= this->cuda_count_)) {
-      throw std::runtime_error("FATAL ERROR: " + std::string(function_name) +
-                               ": Root device is out of range");
-    }
+    utl::require((root_dev >= 0) && (root_dev < this->cuda_count_),
+                 function_name, "Root device is out of range");
 
-    if (this->dev_cell_partition_[root_dev] != cell_partition) {
-      throw std::runtime_error(
-          "FATAL ERROR: " + std::string(function_name) +
-          ": Root device belongs to the wrong cell partition");
-    }
+    utl::require(this->dev_cell_partition_[root_dev] == cell_partition,
+                 function_name,
+                 "Root device belongs to the wrong cell partition");
 
     const std::size_t owned_atom_count =
         this->workspace_->owned_atom_count(root_dev);
 
-    if (owned_atom_count > this->workspace_->atom_capacity(root_dev)) {
-      throw std::runtime_error(
-          "FATAL ERROR: " + std::string(function_name) +
-          ": Root owned atom count exceeds its atom capacity");
-    }
+    utl::require(owned_atom_count <= this->workspace_->atom_capacity(root_dev),
+                 function_name,
+                 "Root owned atom count exceeds its atom capacity");
 
     if ((total_owned_atom_count > natom) ||
         (owned_atom_count > natom - total_owned_atom_count)) {
-      throw std::runtime_error("FATAL ERROR: " + std::string(function_name) +
-                               ": Sum of root owned atom counts exceeds natom");
+      utl::throw_error(function_name,
+                       "Sum of root owned atom counts exceeds natom");
     }
 
     total_owned_atom_count += owned_atom_count;
@@ -234,10 +222,8 @@ void glst_force::get_ef(cuda_container<double> &fx, cuda_container<double> &fy,
       max_owned_atom_count = owned_atom_count;
   }
 
-  if (total_owned_atom_count != natom) {
-    throw std::runtime_error("FATAL ERROR: " + std::string(function_name) +
-                             ": Root owned atom coutns do not sum to natom");
-  }
+  utl::require(total_owned_atom_count == natom, function_name,
+               "Root owned atom counts do not sum to natom");
 
   // Allocate one reusable set of host staging arrays. Their size is the largest
   // cell partition, not natom, so the gather does not create another complete
@@ -306,16 +292,11 @@ void glst_force::get_ef(cuda_container<double> &fx, cuda_container<double> &fy,
          local_atom++) {
       const unsigned int global_atom = local_idx[local_atom];
 
-      if (static_cast<std::size_t>(global_atom) >= natom) {
-        throw std::runtime_error("FATAL ERROR: " + std::string(function_name) +
-                                 ": Original atom index is out of range");
-      }
+      utl::require(static_cast<std::size_t>(global_atom) < natom, function_name,
+                   "Original atom index is out of range");
 
-      if (atom_seen[global_atom] != 0u) {
-        throw std::runtime_error(
-            "FATAL ERROR: " + std::string(function_name) +
-            ": Original atom index was gathered more than once");
-      }
+      utl::require(atom_seen[global_atom] == 0u, function_name,
+                   "Original atom index was gathered more than once");
 
       atom_seen[global_atom] = 1u;
 
@@ -328,17 +309,12 @@ void glst_force::get_ef(cuda_container<double> &fx, cuda_container<double> &fy,
     total_owned_atom_count += owned_atom_count;
   }
 
-  if (total_owned_atom_count != natom) {
-    throw std::runtime_error("FATAL ERROR: " + std::string(function_name) +
-                             ": Gathered atom count does not equal natom");
-  }
+  utl::require(total_owned_atom_count == natom, function_name,
+               "Gathered atom count does not equal natom");
 
   for (std::size_t atom = 0; atom < natom; atom++) {
-    if (atom_seen[atom] == 0u) {
-      throw std::runtime_error(
-          "FATAL ERROR: " + std::string(function_name) +
-          ": At least one original atom index was not gathered");
-    }
+    utl::require(atom_seen[atom] != 0u, function_name,
+                 "At least one original atom index was not gathered");
   }
 
   // The host arrays are already complete. Synchronize the device side of the
@@ -356,6 +332,8 @@ void glst_force::get_ef(cuda_container<double> &fx, cuda_container<double> &fy,
 void glst_force::init(const unsigned int natom, const double tol,
                       const double box_dim_x, const double box_dim_y,
                       const double box_dim_z, const double rcut) {
+  constexpr std::string_view function_name = "glst_force::init";
+
   this->init_cuda_resources();
 
   this->plan_ = std::make_unique<glst_plan>();
@@ -366,8 +344,33 @@ void glst_force::init(const unsigned int natom, const double tol,
   this->plan_->init_tile_schedule(2048);
   this->plan_->init_tile_partitions(this->tile_partition_count_);
 
+  unsigned int max_partition_x_count = 0;
+
+  for (unsigned int partition = 0;
+       partition < this->plan_->cell_partition_count(); partition++) {
+    const unsigned int x_count =
+        this->plan_->cell_partition_x_count()[partition];
+
+    if (x_count > max_partition_x_count)
+      max_partition_x_count = x_count;
+  }
+
+  if ((this->sf_exchange_mode_ ==
+       GLST_SF_EXCHANGE_MODE::LOCAL_CHUNK_BROADCAST) &&
+      (this->cell_partition_count_ > 1)) {
+    this->sf_exchange_chunk_x_count_ = (max_partition_x_count + 1u) / 2u;
+
+    utl::require(this->sf_exchange_chunk_x_count_ > 0, function_name,
+                 "Could not select a positive S_tile exchange chunk size");
+  } else
+    this->sf_exchange_chunk_x_count_ = 0;
+
+  const bool use_full_sf_buffer =
+      (this->sf_exchange_mode_ == GLST_SF_EXCHANGE_MODE::FULL_GLOBAL_ALLREDUCE);
+
   this->workspace_ = std::make_unique<glst_workspace>(
-      *(this->plan_), this->dev_cell_partition_, this->cuda_count_);
+      *(this->plan_), this->dev_cell_partition_, this->cuda_count_,
+      use_full_sf_buffer, this->sf_exchange_chunk_x_count_);
 
   for (int dev = 0; dev < this->cuda_count_; dev++) {
     cudaCheck(cudaSetDevice(dev));
@@ -381,40 +384,28 @@ void glst_force::init(const unsigned int natom, const double tol,
   }
 
   // Layout validation
-  if (this->cell_partition_count_ == 0) {
-    throw std::runtime_error(
-        "FATAL ERROR: glst_force::init: cell_partition_count == 0");
-  }
+  utl::require(this->cell_partition_count_ > 0, function_name,
+               "cell_partition_count == 0");
 
-  if (this->tile_partition_count_ == 0) {
-    throw std::runtime_error(
-        "FATAL ERROR: glst_force::init: tile_partition_count == 0");
-  }
+  utl::require(this->tile_partition_count_ > 0, function_name,
+               "tile_partition_count == 0");
 
-  if (this->dev_cell_partition_.size() !=
-      static_cast<std::size_t>(this->cuda_count_)) {
-    throw std::runtime_error(
-        "FATAL ERROR: glst_force::init: dev_cell_partition size does not match "
-        "cuda_count");
-  }
+  utl::require(this->dev_cell_partition_.size() ==
+                   static_cast<std::size_t>(this->cuda_count_),
+               function_name,
+               "dev_cell_partition size does not match cuda_count");
 
-  if (this->dev_tile_partition_.size() !=
-      static_cast<std::size_t>(this->cuda_count_)) {
-    throw std::runtime_error(
-        "FATAL ERROR: glst_force::init: dev_tile_partition size does not match "
-        "cuda_count");
-  }
+  utl::require(this->dev_tile_partition_.size() ==
+                   static_cast<std::size_t>(this->cuda_count_),
+               function_name,
+               "dev_tile_partition size does not match cuda_count");
 
   for (int dev = 0; dev < this->cuda_count_; dev++) {
-    if (this->dev_cell_partition_[dev] >= this->cell_partition_count_) {
-      throw std::runtime_error("FATAL ERROR: glst_force::init: Device cell "
-                               "partition is out of range");
-    }
+    utl::require(this->dev_cell_partition_[dev] < this->cell_partition_count_,
+                 function_name, "Device cell partition is out of range");
 
-    if (this->dev_tile_partition_[dev] >= this->tile_partition_count_) {
-      throw std::runtime_error("FATAL ERROR: glst_force::init: Device tile "
-                               "partition is out of range");
-    }
+    utl::require(this->dev_tile_partition_[dev] < this->tile_partition_count_,
+                 function_name, "Device tile partition is out of range");
   }
 
   this->cells2dev();
@@ -469,6 +460,26 @@ void glst_force::init(const unsigned int natom, const double tol,
               << this->dev_tile_partition_[dev] << ", owned cells "
               << this->dev_cell_idx_[dev].size() << std::endl;
   }
+
+  std::string_view sf_exchange_mode_name = "UNKNOWN";
+
+  switch (this->sf_exchange_mode_) {
+  case GLST_SF_EXCHANGE_MODE::LOCAL_CHUNK_BROADCAST:
+    sf_exchange_mode_name = "LOCAL_CHUNK_BROADCAST";
+    break;
+  case GLST_SF_EXCHANGE_MODE::FULL_GLOBAL_ALLREDUCE:
+    sf_exchange_mode_name = "FULL_GLOBAL_ALLREDUCE";
+    break;
+  }
+
+  std::cout << "    S_tile exchange mode: " << sf_exchange_mode_name
+            << std::endl;
+
+  if (this->sf_exchange_chunk_x_count_ > 0) {
+    std::cout << "   S_tile exchange chunk: "
+              << this->sf_exchange_chunk_x_count_ << " x-planes" << std::endl;
+  }
+
   std::cout << " Cell partition x-ranges: " << std::endl;
   for (unsigned int partition = 0;
        partition < this->plan_->cell_partition_count(); partition++) {
@@ -525,20 +536,27 @@ void glst_force::init(const unsigned int natom, const double tol,
     const std::size_t cell_capacity = this->workspace_->cell_capacity(dev);
     const std::size_t sf_capacity =
         this->workspace_->sf_tile_buffer_capacity(dev);
+    const std::size_t sf_exchange_capacity =
+        this->workspace_->sf_exchange_tile_buffer_capacity(dev);
     const std::size_t rmt_capacity =
         this->workspace_->rmt_tile_buffer_capacity(dev);
 
     const double sf_mib =
         static_cast<double>(2 * sf_capacity * sizeof(double)) /
         (1024.0 * 1024.0);
+    const double sf_exchange_mib =
+        static_cast<double>(2 * sf_exchange_capacity * sizeof(double)) /
+        (1024.0 * 1024.0);
     const double rmt_mib =
         static_cast<double>(2 * rmt_capacity * sizeof(double)) /
         (1024.0 * 1024.0);
 
     std::cout << "    GPU " << dev << ": atom capacity " << atom_capacity
-              << ", local cells " << cell_capacity << ", sf tile entries "
-              << sf_capacity << " (" << sf_mib << " MiB), rmt tile entries "
-              << rmt_capacity << " (" << rmt_mib << " MiB)" << std::endl;
+              << ", local cells " << cell_capacity << ", local sf entries "
+              << sf_capacity << " (" << sf_mib << " MiB), sf exchange entries "
+              << sf_exchange_capacity << " (" << sf_exchange_mib
+              << " MiB), rmt tile entries " << rmt_capacity << " (" << rmt_mib
+              << " MiB)" << std::endl;
   }
 
   return;
@@ -546,19 +564,26 @@ void glst_force::init(const unsigned int natom, const double tol,
 
 void glst_force::set_gpu_layout(const unsigned int cell_partition_count,
                                 const unsigned int tile_partition_count) {
-  if (this->cuda_initialized_) {
-    throw std::runtime_error("FATAL ERROR: glst_force::set_gpu_layout: GPU "
-                             "layout must be set before init");
-  }
+  constexpr std::string_view function_name = "glst_force::set_gpu_layout";
 
-  if ((cell_partition_count == 0) || (tile_partition_count == 0)) {
-    throw std::runtime_error("FATAL ERROR: glst_force::set_gpu_layout: "
-                             "Partition counts must be positive");
-  }
+  utl::require(!this->cuda_initialized_, function_name,
+               "GPU layout must be set before init");
+
+  utl::require((cell_partition_count > 0) && (tile_partition_count > 0),
+               function_name, "Partition counts must be positive");
 
   this->cell_partition_count_ = cell_partition_count;
   this->tile_partition_count_ = tile_partition_count;
   this->gpu_layout_user_set_ = true;
+
+  return;
+}
+
+void glst_force::set_sf_exchange_mode(const GLST_SF_EXCHANGE_MODE mode) {
+  utl::require(!this->cuda_initialized_, "glst_force::set_sf_exchange_mode",
+               "S_tile exchange mode must be set before init");
+
+  this->sf_exchange_mode_ = mode;
 
   return;
 }
@@ -586,10 +611,8 @@ void glst_force::sum_rmt_sf(void) {
 }
 
 void glst_force::calc_lr_ef(void) {
-  if (this->plan_ == nullptr) {
-    throw std::runtime_error(
-        "FATAL ERROR: glst_force::calc_lr_ef: Plan is not initialized");
-  }
+  utl::require(this->plan_ != nullptr, "glst_force::calc_lr_ef",
+               "Plan is not initialized");
 
   this->require_single_gpu_runtime("calc_lr_ef");
 
@@ -597,8 +620,7 @@ void glst_force::calc_lr_ef(void) {
 
   for (unsigned int tile = 0; tile < this->plan_->tile_count(); tile++) {
     this->calc_sf_tile(tile);
-    this->exchange_sf_tile(tile);
-    this->sum_rmt_sf_tile(tile);
+    this->build_rmt_sum_tile(tile);
     this->calc_lr_ef_tile(tile);
   }
 
@@ -921,15 +943,13 @@ void glst_force::comm_ef(void) {
 
 void glst_force::calc_ener_force(const double *d_rx, const double *d_ry,
                                  const double *d_rz, const double *d_qc) {
-  if (this->plan_ == nullptr) {
-    throw std::runtime_error("FATAL ERROR: glst_force::calc_ener_force: "
-                             "Plan is not initialized");
-  }
+  constexpr std::string_view function_name = "glst_force::calc_ener_force";
 
-  if (this->workspace_ == nullptr) {
-    throw std::runtime_error("FATAL ERROR: glst_force::calc_ener_force: "
-                             "Workspace is not initialized");
-  }
+  utl::require(this->plan_ != nullptr, function_name,
+               "Plan is not initialized");
+
+  utl::require(this->workspace_ != nullptr, function_name,
+               "Workspace is not initialized");
 
   if (!this->profiling_enabled_) {
     // In multi-GPU mode, assign_atoms_multi_gpu also constructs and distributes
@@ -943,8 +963,7 @@ void glst_force::calc_ener_force(const double *d_rx, const double *d_ry,
     // filters execution to the devices that own the tile's tile partition.
     for (unsigned int tile = 0; tile < this->plan_->tile_count(); tile++) {
       this->calc_sf_tile(tile);
-      this->exchange_sf_tile(tile);
-      this->sum_rmt_sf_tile(tile);
+      this->build_rmt_sum_tile(tile);
       this->calc_lr_ef_tile(tile);
     }
 
@@ -984,27 +1003,11 @@ void glst_force::calc_ener_force(const double *d_rx, const double *d_ry,
     phase_end = std::chrono::steady_clock::now();
     this->profile_.calc_sf_ms += profile_elapsed_ms(phase_start, phase_end);
 
-    phase_start = std::chrono::steady_clock::now();
-    this->exchange_sf_tile(tile);
-    this->synchronize_tile_partition_compute_streams(tile_partition);
-    phase_end = std::chrono::steady_clock::now();
-    this->profile_.exchange_sf_ms += profile_elapsed_ms(phase_start, phase_end);
-
-    if (this->cell_partition_count_ > 1) {
-      const std::size_t entry_count =
-          static_cast<std::size_t>(this->plan_->ncell()) *
-          static_cast<std::size_t>(this->plan_->tile_node_count(tile));
-
-      this->profile_.sf_collective_input_bytes +=
-          2 * entry_count * sizeof(double) *
-          static_cast<std::size_t>(this->cell_partition_count_);
-    }
-
-    phase_start = std::chrono::steady_clock::now();
-    this->sum_rmt_sf_tile(tile);
-    this->synchronize_tile_partition_compute_streams(tile_partition);
-    phase_end = std::chrono::steady_clock::now();
-    this->profile_.sum_rmt_sf_ms += profile_elapsed_ms(phase_start, phase_end);
+    // build_rmt_sum_tile owns:
+    // - Full-buffer all-reduce timing and byte accounting in fallback mode
+    // - Chunk broadcast timing and byte accounting in local mode
+    // - Full or chunked remote-sum timing
+    this->build_rmt_sum_tile(tile);
 
     phase_start = std::chrono::steady_clock::now();
     this->calc_lr_ef_tile(tile);
@@ -1043,7 +1046,7 @@ calc_sf_kernel(double *__restrict__ sf_re, double *__restrict__ sf_im,
                const unsigned int *__restrict__ cell_atom_points,
                const unsigned int *__restrict__ cell_atom_counts,
                const unsigned int local_cell_count,
-               const unsigned int first_global_cell) {
+               const unsigned int sf_cell_point) {
   __shared__ double s_cache[ATOM_TILE * 4];
 
   const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1058,7 +1061,7 @@ calc_sf_kernel(double *__restrict__ sf_re, double *__restrict__ sf_im,
 
   for (unsigned int local_cell = blockIdx.y; local_cell < local_cell_count;
        local_cell += gridDim.y) {
-    const unsigned int global_cell = first_global_cell + local_cell;
+    const unsigned int sf_cell = sf_cell_point + local_cell;
     const unsigned int apnt = cell_atom_points[local_cell];
     const unsigned int acnt = cell_atom_counts[local_cell];
 
@@ -1092,8 +1095,8 @@ calc_sf_kernel(double *__restrict__ sf_re, double *__restrict__ sf_im,
     }
 
     if (active) {
-      sf_re[global_cell * nc + idx] = sf_re0;
-      sf_im[global_cell * nc + idx] = sf_im0;
+      sf_re[sf_cell * nc + idx] = sf_re0;
+      sf_im[sf_cell * nc + idx] = sf_im0;
     }
   }
 
@@ -1370,6 +1373,9 @@ void glst_force::assign_atoms_single_gpu(const double *d_rx, const double *d_ry,
 }
 
 void glst_force::validate_atom_scatter(void) const {
+  constexpr std::string_view function_name =
+      "glst_force::validate_atom_scatter";
+
   const unsigned int natom = this->plan_->natom();
 
   std::vector<unsigned int> replica_count(natom, 0);
@@ -1383,44 +1389,31 @@ void glst_force::validate_atom_scatter(void) const {
     const std::size_t owned_atom_count =
         this->workspace_->owned_atom_count(dev);
 
-    if (owned_atom_count > packets.size()) {
-      throw std::runtime_error(
-          "FATAL ERROR: glst_force::validate_atom_scatter: Owned atom count "
-          "exceeds source atom count");
-    }
+    utl::require(owned_atom_count <= packets.size(), function_name,
+                 "Owned atom count exceeds source atom count");
 
     for (std::size_t i = 0; i < packets.size(); i++) {
       const atom_packet &packet = packets[i];
 
-      if (packet.i >= natom) {
-        throw std::runtime_error(
-            "FATAL ERROR: glst_force::validate_atom_scatter: Original atom "
-            "index is out of range");
-      }
+      utl::require(packet.i < natom, function_name,
+                   "Original atom index is out of range");
 
-      if (packet.cell >= this->plan_->ncell()) {
-        throw std::runtime_error(
-            "FATAL ERROR: glst_force::validate_atom_scatter: Global cell index "
-            "is out of range");
-      }
+      utl::require(packet.cell < this->plan_->ncell(), function_name,
+                   "Global cell index is out of range");
 
       const unsigned int observed_cell_partition =
           this->plan_->cell_partition_idx(packet.cell);
 
       if (i < owned_atom_count) {
-        if (observed_cell_partition != expected_cell_partition) {
-          throw std::runtime_error(
-              "FATAL ERROR: glst_force::validate_atom_scatter: Owned atom is "
-              "stored on the wrong cell partition");
-        }
+        utl::require(observed_cell_partition == expected_cell_partition,
+                     function_name,
+                     "Owned atom is stored on the wrong cell partition");
 
         replica_count[packet.i]++;
       } else {
-        if (observed_cell_partition == expected_cell_partition) {
-          throw std::runtime_error(
-              "FATAL ERROR: glst_force::validate_atom_scatter: Halo atom is "
-              "owned by the target partition");
-        }
+        utl::require(observed_cell_partition != expected_cell_partition,
+                     function_name,
+                     "Halo atom is owned by the target partition");
       }
     }
 
@@ -1432,14 +1425,14 @@ void glst_force::validate_atom_scatter(void) const {
     std::size_t observed_source_atom_count = 0;
     std::size_t observed_owned_atom_count = 0;
 
-    if ((source_cells.size() !=
-         this->workspace_->sr_source_cell_atom_count()[dev].h_array().size()) ||
-        (source_cells.size() !=
-         this->workspace_->sr_source_cell_atom_point()[dev].h_array().size())) {
-      throw std::runtime_error(
-          "FATAL ERROR: glst_force::validate_atom_scatter: Source cell "
-          "metadata size mismatch");
-    }
+    utl::require(
+        (source_cells.size() ==
+         this->workspace_->sr_source_cell_atom_count()[dev].h_array().size()) &&
+            (source_cells.size() ==
+             this->workspace_->sr_source_cell_atom_point()[dev]
+                 .h_array()
+                 .size()),
+        function_name, "Source cell metadata size mismatch");
 
     for (std::size_t source_local_cell = 0;
          source_local_cell < source_cells.size(); source_local_cell++) {
@@ -1453,52 +1446,38 @@ void glst_force::validate_atom_scatter(void) const {
       if (source_local_cell < owned_cell_count)
         observed_owned_atom_count += static_cast<std::size_t>(count);
 
-      if (static_cast<std::size_t>(point) + static_cast<std::size_t>(count) >
-          packets.size()) {
-        throw std::runtime_error(
-            "FATAL ERROR: glst_force::validate_atom_scatter: Source cell atom "
-            "range is out of bounds");
-      }
+      utl::require(static_cast<std::size_t>(point) +
+                           static_cast<std::size_t>(count) <=
+                       packets.size(),
+                   function_name, "Source cell atom range is out of bounds");
 
       unsigned int last_atom = 0;
       for (unsigned int j = 0; j < count; j++) {
         const atom_packet &packet = packets[point + j];
 
-        if (packet.cell != expected_cell) {
-          throw std::runtime_error(
-              "FATAL ERROR: glst_force::validate_atom_scatter: Source cell "
-              "range contains an atom from the wrong global cell");
-        }
+        utl::require(
+            packet.cell == expected_cell, function_name,
+            "Source cell range contains an atom from the wrong global cell");
 
-        if ((j > 0) && (packet.i <= last_atom)) {
-          throw std::runtime_error(
-              "FATAL ERROR: glst_force::validate_atom_scatter: Source cell "
-              "atom order is not deterministic");
+        if (j > 0) {
+          utl::require(packet.i > last_atom, function_name,
+                       "Source cell atom order is not deterministic");
         }
 
         last_atom = packet.i;
       }
     }
 
-    if (observed_source_atom_count != packets.size()) {
-      throw std::runtime_error(
-          "FATAL ERROR: glst_force::validate_atom_scatter: Source cell counts "
-          "do not sum to source atoms");
-    }
+    utl::require(observed_source_atom_count == packets.size(), function_name,
+                 "Source cell counts do not sum to source atoms");
 
-    if (observed_owned_atom_count != owned_atom_count) {
-      throw std::runtime_error(
-          "FATAL ERROR: glst_force::validate_atom_scatter: Owned source cell "
-          "counts do not sum to owned atoms");
-    }
+    utl::require(observed_owned_atom_count == owned_atom_count, function_name,
+                 "Owned source cell counts do not sum to owned atoms");
   }
 
   for (unsigned int atom = 0; atom < natom; atom++) {
-    if (replica_count[atom] != this->tile_partition_count_) {
-      throw std::runtime_error(
-          "FATAL ERROR: glst_force::validate_atom_scatter: Atom replica count "
-          "does not equal G_tile");
-    }
+    utl::require(replica_count[atom] == this->tile_partition_count_,
+                 function_name, "Atom replica count does not equal G_tile");
   }
 
   for (unsigned int cell_partition = 0;
@@ -1519,20 +1498,16 @@ void glst_force::validate_atom_scatter(void) const {
       const std::vector<atom_packet> &rhs =
           this->workspace_->sorted_packets()[dev].h_array();
 
-      if (lhs.size() != rhs.size()) {
-        throw std::runtime_error(
-            "FATAL ERROR: glst_force::validate_atom_scatter: Tile ranks in a "
-            "cell partition have different atom counts");
-      }
+      utl::require(lhs.size() == rhs.size(), function_name,
+                   "Tile ranks in a cell partition have different atom counts");
 
       for (std::size_t i = 0; i < lhs.size(); i++) {
-        if ((lhs[i].i != rhs[i].i) || (lhs[i].cell != rhs[i].cell) ||
-            (lhs[i].x != rhs[i].x) || (lhs[i].y != rhs[i].y) ||
-            (lhs[i].z != rhs[i].z) || (lhs[i].q != rhs[i].q)) {
-          throw std::runtime_error(
-              "FATAL ERROR: glst_force::validate_atom_scatter: Tile ranks in a "
-              "cell partition have different atom ordering");
-        }
+        utl::require(
+            (lhs[i].i == rhs[i].i) && (lhs[i].cell == rhs[i].cell) &&
+                (lhs[i].x == rhs[i].x) && (lhs[i].y == rhs[i].y) &&
+                (lhs[i].z == rhs[i].z) && (lhs[i].q == rhs[i].q),
+            function_name,
+            "Tile ranks in a cell partition have different atom ordering");
       }
     }
   }
@@ -1543,10 +1518,14 @@ void glst_force::validate_atom_scatter(void) const {
 void glst_force::assign_atoms_multi_gpu(const double *d_rx, const double *d_ry,
                                         const double *d_rz,
                                         const double *d_qc) {
-  if (this->plan_ == nullptr) {
-    throw std::runtime_error("FATAL ERROR: glst_force::assign_atoms_multi_gpu: "
-                             "Plan is not initialized");
-  }
+  constexpr std::string_view function_name =
+      "glst_force::assign_atoms_multi_gpu";
+
+  utl::require(this->plan_ != nullptr, function_name,
+               "Plan is not initialized");
+
+  utl::require(this->workspace_ != nullptr, function_name,
+               "Workspace is not initialied");
 
   std::chrono::steady_clock::time_point assignment_start;
   if (this->profiling_enabled_)
@@ -1675,11 +1654,8 @@ void glst_force::assign_atoms_multi_gpu(const double *d_rx, const double *d_ry,
 
     if (this->profiling_enabled_) {
       this->profile_.owned_atom_replicas += owned_atom_count;
-      if (source_atom_count < owned_atom_count) {
-        throw std::runtime_error(
-            "FATAL ERROR: glst_force::assign_atoms_multi_gpu: Source atom "
-            "count is smaller than owned atom count");
-      }
+      utl::require(source_atom_count >= owned_atom_count, function_name,
+                   "Source atom count is smaller than owned atom count");
       this->profile_.halo_atom_replicas += source_atom_count - owned_atom_count;
     }
 
@@ -1690,11 +1666,9 @@ void glst_force::assign_atoms_multi_gpu(const double *d_rx, const double *d_ry,
         this->plan_->partition_sr_source_cell_idx(cell_partition);
     const std::size_t source_cell_count = source_cells.size();
 
-    if (source_cell_count != this->workspace_->sr_source_cell_capacity(dev)) {
-      throw std::runtime_error(
-          "FATAL ERROR: glst_force::assign_atoms_multi_gpu: Source cell count "
-          "does not match workspace capacity");
-    }
+    utl::require(
+        source_cell_count == this->workspace_->sr_source_cell_capacity(dev),
+        function_name, "Source cell count does not match workspace capacity");
 
     this->workspace_->resize_atom_storage(dev, source_atom_count);
     this->workspace_->set_owned_atom_count(dev, owned_atom_count);
@@ -1718,12 +1692,10 @@ void glst_force::assign_atoms_multi_gpu(const double *d_rx, const double *d_ry,
       const unsigned int global_cell = source_cells[source_local_cell];
       const std::vector<atom_packet> &cell_atoms = cell_packets[global_cell];
 
-      if (cell_atoms.size() >
-          static_cast<std::size_t>(std::numeric_limits<unsigned int>::max())) {
-        throw std::runtime_error(
-            "FATAL ERROR: glst_force::assign_atoms_multi_gpu: Cell atom count "
-            "exceeds unsigned int range");
-      }
+      utl::require(cell_atoms.size() <=
+                       static_cast<std::size_t>(
+                           std::numeric_limits<unsigned int>::max()),
+                   function_name, "Cell atom count exceeds unsigned int range");
 
       const unsigned int point = static_cast<unsigned int>(atom_point);
       const unsigned int count = static_cast<unsigned int>(cell_atoms.size());
@@ -1763,23 +1735,18 @@ void glst_force::assign_atoms_multi_gpu(const double *d_rx, const double *d_ry,
       }
     }
 
-    if (atom_point != source_atom_count) {
-      throw std::runtime_error(
-          "FATAL ERROR: glst_force::assign_atoms_multi_gpu: Source cell counts "
-          "do not sum to source atoms");
-    }
+    utl::require(atom_point == source_atom_count, function_name,
+                 "Source cell counts do not sum to source atoms");
 
     for (std::size_t i = 0; i < owned_atom_count; i++) {
-      if ((source_packets[i].i != owned_packets[i].i) ||
-          (source_packets[i].cell != owned_packets[i].cell) ||
-          (source_packets[i].x != owned_packets[i].x) ||
-          (source_packets[i].y != owned_packets[i].y) ||
-          (source_packets[i].z != owned_packets[i].z) ||
-          (source_packets[i].q != owned_packets[i].q)) {
-        throw std::runtime_error(
-            "FATAL ERROR: glst_force::assign_atoms_multi_gpu: Source packet "
-            "list does not start with owned packets");
-      }
+      utl::require((source_packets[i].i == owned_packets[i].i) &&
+                       (source_packets[i].cell == owned_packets[i].cell) &&
+                       (source_packets[i].x == owned_packets[i].x) &&
+                       (source_packets[i].y == owned_packets[i].y) &&
+                       (source_packets[i].z == owned_packets[i].z) &&
+                       (source_packets[i].q == owned_packets[i].q),
+                   function_name,
+                   "Source packet list does not start with owned packets");
     }
 
     if (source_atom_count > 0) {
@@ -1820,10 +1787,13 @@ void glst_force::assign_atoms_multi_gpu(const double *d_rx, const double *d_ry,
 }
 
 void glst_force::calc_sf_tile(const unsigned int tile) {
-  if (this->plan_ == nullptr) {
-    throw std::runtime_error(
-        "FATAL ERROR: glst_force::calc_sf_tile: Plan is not initialized");
-  }
+  constexpr std::string_view function_name = "glst_force::calc_sf_tile";
+
+  utl::require(this->plan_ != nullptr, function_name,
+               "Plan is not initialized");
+
+  utl::require(this->workspace_ != nullptr, function_name,
+               "Workspace is not initialized");
 
   const bool has_long_range_cells =
       ((this->plan_->ncell_x() > 2) && (this->plan_->ncell_y() > 2) &&
@@ -1831,34 +1801,21 @@ void glst_force::calc_sf_tile(const unsigned int tile) {
   if (!has_long_range_cells)
     return;
 
-  if (tile >= this->plan_->tile_count()) {
-    throw std::runtime_error(
-        "FATAL ERROR: glst_force::calc_sf_tile: Tile is out of bounds");
-  }
+  utl::require(tile < this->plan_->tile_count(), function_name,
+               "Tile is out of bounds");
 
   const unsigned int tile_node_point = this->plan_->tile_node_point(tile);
   const unsigned int tile_node_count = this->plan_->tile_node_count(tile);
 
-  if (tile_node_count == 0) {
-    throw std::runtime_error(
-        "FATAL ERROR: glst_force::calc_sf_tile: Tile node count is 0");
-  }
+  utl::require(tile_node_count > 0, function_name, "Tile node count is 0");
 
-  if (tile_node_count > this->plan_->max_tile_nodes()) {
-    throw std::runtime_error(
-        "FATAL ERROR: glst_force::calc_sf_tile: Tile exceeds buffer size");
-  }
+  utl::require(tile_node_count <= this->plan_->max_tile_nodes(), function_name,
+               "Tile exceeds buffer size");
 
   const unsigned int tile_partition = this->plan_->tile_partition_idx(tile);
 
   const unsigned int nc = tile_node_count;
   const unsigned int off = tile_node_point;
-
-  const std::size_t sf_entry_count =
-      static_cast<std::size_t>(this->plan_->ncell()) *
-      static_cast<std::size_t>(nc);
-
-  const std::size_t sf_bytes = sf_entry_count * sizeof(double);
 
   for (int dev = 0; dev < this->cuda_count_; dev++) {
     if (this->dev_tile_partition_[dev] != tile_partition)
@@ -1872,17 +1829,33 @@ void glst_force::calc_sf_tile(const unsigned int tile) {
     const unsigned int first_global_cell =
         this->plan_->first_global_cell(cell_partition);
 
-    if (sf_entry_count > this->workspace_->sf_tile_buffer_capacity(dev)) {
-      throw std::runtime_error("FATAL ERROR: glst_force::calc_sf_tile: Active "
-                               "SF tile exceeds workspace capacity");
-    }
+    const bool use_full_sf_buffer =
+        (this->sf_exchange_mode_ ==
+         GLST_SF_EXCHANGE_MODE::FULL_GLOBAL_ALLREDUCE);
 
-    cudaCheck(cudaMemsetAsync(
-        static_cast<void *>(this->workspace_->sf_re()[dev].d_array().data()), 0,
-        sf_bytes, this->comp_streams_[dev]));
-    cudaCheck(cudaMemsetAsync(
-        static_cast<void *>(this->workspace_->sf_im()[dev].d_array().data()), 0,
-        sf_bytes, this->comp_streams_[dev]));
+    const unsigned int sf_cell_count =
+        (use_full_sf_buffer) ? this->plan_->ncell() : local_cell_count;
+
+    const unsigned int sf_cell_point =
+        (use_full_sf_buffer) ? first_global_cell : 0u;
+
+    const std::size_t sf_entry_count =
+        static_cast<std::size_t>(sf_cell_count) * static_cast<std::size_t>(nc);
+
+    const std::size_t sf_bytes = sf_entry_count * sizeof(double);
+
+    utl::require(sf_entry_count <=
+                     this->workspace_->sf_tile_buffer_capacity(dev),
+                 function_name, "Active SF tile exceeds workspace capacity");
+
+    if (sf_entry_count > 0) {
+      cudaCheck(cudaMemsetAsync(
+          static_cast<void *>(this->workspace_->sf_re()[dev].d_array().data()),
+          0, sf_bytes, this->comp_streams_[dev]));
+      cudaCheck(cudaMemsetAsync(
+          static_cast<void *>(this->workspace_->sf_im()[dev].d_array().data()),
+          0, sf_bytes, this->comp_streams_[dev]));
+    }
 
     if (local_cell_count == 0)
       continue;
@@ -1903,7 +1876,7 @@ void glst_force::calc_sf_tile(const unsigned int tile) {
             this->workspace_->qc()[dev].d_array().data(),
             this->workspace_->cell_atom_point()[dev].d_array().data(),
             this->workspace_->cell_atom_count()[dev].d_array().data(),
-            local_cell_count, first_global_cell);
+            local_cell_count, sf_cell_point);
 
     cudaCheck(cudaGetLastError());
   }
@@ -1911,11 +1884,14 @@ void glst_force::calc_sf_tile(const unsigned int tile) {
   return;
 }
 
-void glst_force::exchange_sf_tile(const unsigned int tile) {
-  if (this->plan_ == nullptr) {
-    throw std::runtime_error(
-        "FATAL ERROR: glst_force::exchange_sf_tile: Plan is not initialized");
-  }
+void glst_force::zero_rmt_sum_tile(const unsigned int tile) {
+  constexpr std::string_view function_name = "glst_force::zero_rmt_sum_tile";
+
+  utl::require(this->plan_ != nullptr, function_name,
+               "Plan is not initialized");
+
+  utl::require(this->workspace_ != nullptr, function_name,
+               "Workspace is not initialized");
 
   const bool has_long_range_cells =
       ((this->plan_->ncell_x() > 2) && (this->plan_->ncell_y() > 2) &&
@@ -1923,51 +1899,101 @@ void glst_force::exchange_sf_tile(const unsigned int tile) {
   if (!has_long_range_cells)
     return;
 
-  if (tile >= this->plan_->tile_count()) {
-    throw std::runtime_error(
-        "FATAL ERROR: glst_force::exchange_sf_tile: Tile is out of bounds");
+  utl::require(tile < this->plan_->tile_count(), function_name,
+               "Tile is out of bounds");
+
+  const unsigned int nc = this->plan_->tile_node_count(tile);
+  const unsigned int tile_partition = this->plan_->tile_partition_idx(tile);
+
+  for (int dev = 0; dev < this->cuda_count_; dev++) {
+    if (this->dev_tile_partition_[dev] != tile_partition)
+      continue;
+
+    const unsigned int cell_partition = this->dev_cell_partition_[dev];
+    const unsigned int local_cell_count =
+        this->plan_->local_cell_count(cell_partition);
+
+    const std::size_t entry_count = static_cast<std::size_t>(local_cell_count) *
+                                    static_cast<std::size_t>(nc);
+
+    utl::require(entry_count <= this->workspace_->rmt_tile_buffer_capacity(dev),
+                 function_name, "Active rmt tile exceeds workspace capacity");
+
+    if (entry_count == 0)
+      continue;
+
+    const std::size_t byte_count = entry_count * sizeof(double);
+
+    cudaCheck(cudaSetDevice(dev));
+
+    cudaCheck(cudaMemsetAsync(
+        static_cast<void *>(
+            this->workspace_->rmt_sum_re()[dev].d_array().data()),
+        0, byte_count, this->comp_streams_[dev]));
+
+    cudaCheck(cudaMemsetAsync(
+        static_cast<void *>(
+            this->workspace_->rmt_sum_im()[dev].d_array().data()),
+        0, byte_count, this->comp_streams_[dev]));
   }
+
+  return;
+}
+
+void glst_force::exchange_sf_tile(const unsigned int tile) {
+  constexpr std::string_view function_name = "glst_force::exchange_sf_tile";
+
+  utl::require(this->plan_ != nullptr, function_name,
+               "Plan is not initialized");
+
+  utl::require(this->workspace_ != nullptr, function_name,
+               "Workspace is not initialized");
+
+  const bool has_long_range_cells =
+      ((this->plan_->ncell_x() > 2) && (this->plan_->ncell_y() > 2) &&
+       (this->plan_->ncell_z() > 2));
+  if (!has_long_range_cells)
+    return;
+
+  utl::require(tile < this->plan_->tile_count(), function_name,
+               "Tile is out of bounds");
 
   const unsigned int tile_node_count = this->plan_->tile_node_count(tile);
 
-  if (tile_node_count == 0) {
-    throw std::runtime_error(
-        "FATAL ERROR: glst_force::exchange_sf_tile: Tile node count is 0");
-  }
+  utl::require(tile_node_count > 0, function_name, "Tile node count is 0");
 
-  if (tile_node_count > this->plan_->max_tile_nodes()) {
-    throw std::runtime_error(
-        "FATAL ERROR: glst_force::exchange_sf_tile: Tile exceeds buffer size");
-  }
+  utl::require(tile_node_count <= this->plan_->max_tile_nodes(), function_name,
+               "Tile exceeds buffer size");
 
   // No cell-domain communication is required when there is only one cell
   // partition. This covers both single-GPU mode and pure tile decomposition.
   if (this->cell_partition_count_ == 1)
     return;
 
+  utl::require(this->sf_exchange_mode_ ==
+                   GLST_SF_EXCHANGE_MODE::FULL_GLOBAL_ALLREDUCE,
+               function_name,
+               "Full global S_tile exchange called while local chunk exchange "
+               "is selected");
+
   const unsigned int tile_partition = this->plan_->tile_partition_idx(tile);
 
-  if ((static_cast<std::size_t>(tile_partition) >=
-       this->cell_comm_devs_.size()) ||
-      (static_cast<std::size_t>(tile_partition) >= this->cell_comms_.size())) {
-    throw std::runtime_error("FATAL ERROR: glst_force::exchange_sf_tile: Tile "
-                             "partition does not have a cell communicator");
-  }
+  utl::require(
+      (static_cast<std::size_t>(tile_partition) <
+       this->cell_comm_devs_.size()) &&
+          (static_cast<std::size_t>(tile_partition) < this->cell_comms_.size()),
+      function_name, "Tile partition does not have a cell communicator");
 
   const std::vector<int> &devs = this->cell_comm_devs_[tile_partition];
   const std::vector<ncclComm_t> &comms = this->cell_comms_[tile_partition];
 
-  if (devs.size() != static_cast<std::size_t>(this->cell_partition_count_)) {
-    throw std::runtime_error(
-        "FATAL ERROR: glst_force::exchange_sf_tile: Cell communicator device "
-        "count does not match cell partition count");
-  }
+  utl::require(
+      devs.size() == static_cast<std::size_t>(this->cell_partition_count_),
+      function_name,
+      "Cell communicator device count does not match cell partition count");
 
-  if (comms.size() != devs.size()) {
-    throw std::runtime_error(
-        "FATAL ERROR: glst_force::exchange_sf_tile: Cell communicator handle "
-        "count does not match device count");
-  }
+  utl::require(comms.size() == devs.size(), function_name,
+               "Cell communicator handle count does not match device count");
 
   const std::size_t sf_entry_count =
       static_cast<std::size_t>(this->plan_->ncell()) *
@@ -1978,26 +2004,19 @@ void glst_force::exchange_sf_tile(const unsigned int tile) {
   for (std::size_t rank = 0; rank < devs.size(); rank++) {
     const int dev = devs[rank];
 
-    if ((dev < 0) || (dev >= this->cuda_count_)) {
-      throw std::runtime_error("FATAL ERROR: glst_force::exchange_sf_tile: "
-                               "Cell communicator device is out of range");
-    }
+    utl::require((dev >= 0) && (dev < this->cuda_count_), function_name,
+                 "Cell communicator device is out of range");
 
-    if (this->dev_tile_partition_[dev] != tile_partition) {
-      throw std::runtime_error("FATAL ERROR: glst_force::exchange_sf_tile: "
-                               "Device belongs to the wrong tile partition");
-    }
+    utl::require(this->dev_tile_partition_[dev] == tile_partition,
+                 function_name, "Device belongs to the wrong tile partition");
 
-    if (this->dev_cell_partition_[dev] != static_cast<unsigned int>(rank)) {
-      throw std::runtime_error(
-          "FATAL ERROR: glst_force::exchange_sf_tile: Cell communicator rank "
-          "does not match cell partition");
-    }
+    utl::require(
+        this->dev_cell_partition_[dev] == static_cast<unsigned int>(rank),
+        function_name, "Cell communicator rank does not match cell partition");
 
-    if (sf_entry_count > this->workspace_->sf_tile_buffer_capacity(dev)) {
-      throw std::runtime_error("FATAL ERROR: glst_force::exchange_sf_tile: "
-                               "Active SF tile exceeds workspace capacity");
-    }
+    utl::require(sf_entry_count <=
+                     this->workspace_->sf_tile_buffer_capacity(dev),
+                 function_name, "Active SF tile exceeds workspace capacity");
 
     cudaCheck(cudaSetDevice(dev));
     cudaCheck(
@@ -2034,6 +2053,159 @@ void glst_force::exchange_sf_tile(const unsigned int tile) {
 
   // Make subsequent prefix-sum and remote-sum kernels wait for both
   // all-reduces.
+  for (std::size_t rank = 0; rank < devs.size(); rank++) {
+    const int dev = devs[rank];
+
+    cudaCheck(cudaSetDevice(dev));
+    cudaCheck(
+        cudaEventRecord(this->comm_events_[dev], this->comm_streams_[dev]));
+    cudaCheck(cudaStreamWaitEvent(this->comp_streams_[dev],
+                                  this->comm_events_[dev], 0));
+  }
+
+  return;
+}
+
+void glst_force::exchange_sf_chunk_tile(const unsigned int tile,
+                                        const unsigned int source_partition,
+                                        const unsigned int source_x_offset,
+                                        const unsigned int chunk_x_count) {
+  constexpr std::string_view function_name =
+      "glst_force::exchange_sf_chunk_tile";
+
+  utl::require(this->plan_ != nullptr, function_name,
+               "Plan is not initialized");
+
+  utl::require(this->workspace_ != nullptr, function_name,
+               "Workspace is not initialized");
+
+  utl::require(this->sf_exchange_mode_ ==
+                   GLST_SF_EXCHANGE_MODE::LOCAL_CHUNK_BROADCAST,
+               function_name, "Local chunk exchange is not selected");
+
+  utl::require(tile < this->plan_->tile_count(), function_name,
+               "Tile is out of bounds");
+
+  utl::require(source_partition < this->cell_partition_count_, function_name,
+               "Source partition is out of bounds");
+
+  utl::require(chunk_x_count > 0, function_name, "Chunk x count is 0");
+
+  const unsigned int source_partition_x_count =
+      this->plan_->cell_partition_x_count()[source_partition];
+
+  utl::require(
+      (source_x_offset <= source_partition_x_count) &&
+          (chunk_x_count <= source_partition_x_count - source_x_offset),
+      function_name, "Source x chunk is out of bounds");
+
+  const unsigned int tile_partition = this->plan_->tile_partition_idx(tile);
+  const unsigned int nc = this->plan_->tile_node_count(tile);
+
+  utl::require(
+      (static_cast<std::size_t>(tile_partition) <
+       this->cell_comm_devs_.size()) &&
+          (static_cast<std::size_t>(tile_partition) < this->cell_comms_.size()),
+      function_name, "Tile partition has not cell communicator");
+
+  const std::vector<int> &devs = this->cell_comm_devs_[tile_partition];
+  const std::vector<ncclComm_t> &comms = this->cell_comms_[tile_partition];
+
+  utl::require(
+      devs.size() == static_cast<std::size_t>(this->cell_partition_count_),
+      function_name,
+      "Cell communicator device count does not match cell partition count");
+
+  utl::require(
+      comms.size() == devs.size(), function_name,
+      "Cell communicator handle count does not match cell partition count");
+
+  const std::size_t yz_cell_count =
+      static_cast<std::size_t>(this->plan_->ncell_y()) *
+      static_cast<std::size_t>(this->plan_->ncell_z());
+
+  const std::size_t chunk_cell_count =
+      static_cast<std::size_t>(chunk_x_count) * yz_cell_count;
+
+  const std::size_t entry_count =
+      chunk_cell_count * static_cast<std::size_t>(nc);
+
+  const std::size_t source_cell_offset =
+      static_cast<std::size_t>(source_x_offset) * yz_cell_count;
+
+  const std::size_t source_entry_offset =
+      source_cell_offset * static_cast<std::size_t>(nc);
+
+  for (std::size_t rank = 0; rank < devs.size(); rank++) {
+    const int dev = devs[rank];
+
+    utl::require((dev >= 0) && (dev < this->cuda_count_), function_name,
+                 "Communicator device is out of range");
+
+    utl::require(this->dev_tile_partition_[dev] == tile_partition,
+                 function_name, "Device belongs to the wrong tile partition");
+
+    utl::require(
+        this->dev_cell_partition_[dev] == static_cast<unsigned int>(rank),
+        function_name, "Communicator rank does not match cell partition");
+
+    if (static_cast<unsigned int>(rank) == source_partition) {
+      const std::size_t buffer_capacity =
+          this->workspace_->sf_tile_buffer_capacity(dev);
+
+      utl::require((source_entry_offset <= buffer_capacity) &&
+                       (entry_count <= buffer_capacity - source_entry_offset),
+                   function_name, "Source chunk exceeds SF exchange capacity");
+    } else {
+      utl::require(entry_count <=
+                       this->workspace_->sf_exchange_tile_buffer_capacity(dev),
+                   function_name,
+                   "Received chunk exceeds SF exchange capacity");
+    }
+
+    cudaCheck(cudaSetDevice(dev));
+
+    // Also protects the receive buffer from being overwritten before the
+    // previous chunk's prefix/shell kernels have finished reading it.
+    cudaCheck(
+        cudaEventRecord(this->comp_events_[dev], this->comp_streams_[dev]));
+    cudaCheck(cudaStreamWaitEvent(this->comm_streams_[dev],
+                                  this->comp_events_[dev], 0));
+  }
+
+  ncclCheck(ncclGroupStart());
+
+  for (std::size_t rank = 0; rank < devs.size(); rank++) {
+    const int dev = devs[rank];
+
+    cudaCheck(cudaSetDevice(dev));
+
+    double *active_re = nullptr;
+    double *active_im = nullptr;
+
+    if (static_cast<unsigned int>(rank) == source_partition) {
+      active_re =
+          this->workspace_->sf_re()[dev].d_array().data() + source_entry_offset;
+      active_im =
+          this->workspace_->sf_im()[dev].d_array().data() + source_entry_offset;
+    } else {
+      active_re = this->workspace_->sf_exchange_re()[dev].d_array().data();
+      active_im = this->workspace_->sf_exchange_im()[dev].d_array().data();
+    }
+
+    ncclCheck(ncclBroadcast(static_cast<const void *>(active_re),
+                            static_cast<void *>(active_re), entry_count,
+                            ncclDouble, static_cast<int>(source_partition),
+                            comms[rank], this->comm_streams_[dev]));
+
+    ncclCheck(ncclBroadcast(static_cast<const void *>(active_im),
+                            static_cast<void *>(active_im), entry_count,
+                            ncclDouble, static_cast<int>(source_partition),
+                            comms[rank], this->comm_streams_[dev]));
+  }
+
+  ncclCheck(ncclGroupEnd());
+
   for (std::size_t rank = 0; rank < devs.size(); rank++) {
     const int dev = devs[rank];
 
@@ -2166,45 +2338,73 @@ __device__ void box_sum(double &box_re, double &box_im,
   return;
 }
 
-__device__ void cube_sum(double &cube_re, double &cube_im,
-                         const double *__restrict__ P_re,
-                         const double *__restrict__ P_im, const unsigned int x,
-                         const unsigned int y, const unsigned int z,
-                         const unsigned int r, const unsigned int nx,
-                         const unsigned int ny, const unsigned int nz,
-                         const unsigned int idx, const unsigned int nc) {
+__device__ void
+cube_sum(double &cube_re, double &cube_im, const double *__restrict__ P_re,
+         const double *__restrict__ P_im, const unsigned int x,
+         const unsigned int y, const unsigned int z, const unsigned int r,
+         const unsigned int source_x_point, const unsigned int source_x_count,
+         const unsigned int global_nx, const unsigned int ny,
+         const unsigned int nz, const unsigned int idx, const unsigned int nc) {
+  cube_re = 0.0;
+  cube_im = 0.0;
+
+  if ((source_x_count == 0) || (global_nx == 0))
+    return;
+
   // Need to check if x-r, y-r, z-r is < 0
-  const unsigned int x0 = (x < r) ? 0 : x - r;
-  const unsigned int y0 = (y < r) ? 0 : y - r;
-  const unsigned int z0 = (z < r) ? 0 : z - r;
+  const unsigned int global_x0 = (x < r) ? 0u : x - r;
+  const unsigned int y0 = (y < r) ? 0u : y - r;
+  const unsigned int z0 = (z < r) ? 0u : z - r;
 
-  // Need to check if x+r, y+r, z+r is > nx-1, ny-1, nz-1
-  unsigned int x1 = x + r;
-  unsigned int y1 = y + r;
-  unsigned int z1 = z + r;
-  x1 = (x1 >= nx) ? nx - 1 : x1;
-  y1 = (y1 >= ny) ? ny - 1 : y1;
-  z1 = (z1 >= nz) ? nz - 1 : z1;
+  const unsigned int max_x_radius = global_nx - 1u - x;
+  const unsigned int max_y_radius = ny - 1u - y;
+  const unsigned int max_z_radius = nz - 1u - z;
 
-  box_sum(cube_re, cube_im, P_re, P_im, x0, y0, z0, x1, y1, z1, nx, ny, nz, idx,
-          nc);
+  const unsigned int global_x1 = (r > max_x_radius) ? global_nx - 1u : x + r;
+  const unsigned int y1 = (r > max_y_radius) ? ny - 1u : y + r;
+  const unsigned int z1 = (r > max_z_radius) ? nz - 1u : z + r;
+
+  const unsigned int source_x_end = source_x_point + source_x_count;
+
+  if ((global_x1 < source_x_point) || (global_x0 >= source_x_end))
+    return;
+
+  const unsigned int intersect_x0 =
+      (global_x0 > source_x_point) ? global_x0 : source_x_point;
+
+  const unsigned int source_x_last = source_x_end - 1u;
+
+  const unsigned int intersect_x1 =
+      (global_x1 < source_x_last) ? global_x1 : source_x_last;
+
+  const unsigned int local_x0 = intersect_x0 - source_x_point;
+  const unsigned int local_x1 = intersect_x1 - source_x_point;
+
+  box_sum(cube_re, cube_im, P_re, P_im, local_x0, y0, z0, local_x1, y1, z1,
+          source_x_count, ny, nz, idx, nc);
 
   return;
 }
 
-__device__ void shell_sum(double &shell_re, double &shell_im,
-                          const double *__restrict__ P_re,
-                          const double *__restrict__ P_im, const unsigned int x,
-                          const unsigned int y, const unsigned int z,
-                          const unsigned int inner, const unsigned int outer,
-                          const unsigned int nx, const unsigned int ny,
-                          const unsigned int nz, const unsigned int idx,
-                          const unsigned int nc) {
-  double osum_re = static_cast<double>(0.0), osum_im = static_cast<double>(0.0);
-  cube_sum(osum_re, osum_im, P_re, P_im, x, y, z, outer, nx, ny, nz, idx, nc);
+__device__ void
+shell_sum(double &shell_re, double &shell_im, const double *__restrict__ P_re,
+          const double *__restrict__ P_im, const unsigned int x,
+          const unsigned int y, const unsigned int z, const unsigned int inner,
+          const unsigned int outer, const unsigned int source_x_point,
+          const unsigned int source_x_count, const unsigned int global_nx,
+          const unsigned int ny, const unsigned int nz, const unsigned int idx,
+          const unsigned int nc) {
+  double osum_re = 0.0;
+  double osum_im = 0.0;
 
-  double isum_re = static_cast<double>(0.0), isum_im = static_cast<double>(0.0);
-  cube_sum(isum_re, isum_im, P_re, P_im, x, y, z, inner, nx, ny, nz, idx, nc);
+  cube_sum(osum_re, osum_im, P_re, P_im, x, y, z, outer, source_x_point,
+           source_x_count, global_nx, ny, nz, idx, nc);
+
+  double isum_re = 0.0;
+  double isum_im = 0.0;
+
+  cube_sum(isum_re, isum_im, P_re, P_im, x, y, z, inner, source_x_point,
+           source_x_count, global_nx, ny, nz, idx, nc);
 
   shell_re = osum_re - isum_re;
   shell_im = osum_im - isum_im;
@@ -2212,13 +2412,15 @@ __device__ void shell_sum(double &shell_re, double &shell_im,
   return;
 }
 
+template <bool ACCUMULATE>
 __global__ static void calc_rmt_sum_kernel(
     double *__restrict__ rmt_sum_re, double *__restrict__ rmt_sum_im,
     const double *__restrict__ sf_re, const double *__restrict__ sf_im,
     const double *__restrict__ cw, const unsigned int *__restrict__ groups,
     const unsigned int nc, const unsigned int *__restrict__ grp_r_in,
-    const unsigned int *__restrict__ grp_r_out, const unsigned int nx,
-    const unsigned int ny, const unsigned int nz,
+    const unsigned int *__restrict__ grp_r_out,
+    const unsigned int source_x_point, const unsigned int source_x_count,
+    const unsigned int global_nx, const unsigned int ny, const unsigned int nz,
     const unsigned int local_cell_count, const unsigned int first_global_cell) {
   const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
 
@@ -2226,7 +2428,7 @@ __global__ static void calc_rmt_sum_kernel(
     return;
 
   const double wc = cw[idx];
-  const unsigned int grp = groups[idx];
+  const unsigned int group = groups[idx];
 
   for (unsigned int local_cell = blockIdx.y; local_cell < local_cell_count;
        local_cell += gridDim.y) {
@@ -2236,28 +2438,42 @@ __global__ static void calc_rmt_sum_kernel(
     const unsigned int y = (global_cell / nz) % ny;
     const unsigned int z = global_cell % nz;
 
-    const unsigned int inner = grp_r_in[grp];
-    const unsigned int outer = grp_r_out[grp];
+    const unsigned int inner = grp_r_in[group];
+    const unsigned int outer = grp_r_out[group];
 
-    double shell_re = 0.0, shell_im = 0.0;
-    shell_sum(shell_re, shell_im, sf_re, sf_im, x, y, z, inner, outer, nx, ny,
-              nz, idx, nc);
+    double shell_re = 0.0;
+    double shell_im = 0.0;
+
+    shell_sum(shell_re, shell_im, sf_re, sf_im, x, y, z, inner, outer,
+              source_x_point, source_x_count, global_nx, ny, nz, idx, nc);
 
     shell_re *= wc;
     shell_im *= wc;
 
-    rmt_sum_re[local_cell * nc + idx] = shell_re;
-    rmt_sum_im[local_cell * nc + idx] = shell_im;
+    const std::size_t output =
+        static_cast<std::size_t>(local_cell) * static_cast<std::size_t>(nc) +
+        static_cast<std::size_t>(idx);
+
+    if constexpr (ACCUMULATE) {
+      rmt_sum_re[output] += shell_re;
+      rmt_sum_im[output] += shell_im;
+    } else {
+      rmt_sum_re[output] = shell_re;
+      rmt_sum_im[output] = shell_im;
+    }
   }
 
   return;
 }
 
 void glst_force::sum_rmt_sf_tile(const unsigned int tile) {
-  if (this->plan_ == nullptr) {
-    throw std::runtime_error("FATAL ERROR: glst_force::sum_rmt_sf_tile: "
-                             "Plan is not initialized");
-  }
+  constexpr std::string_view function_name = "glst_force::sum_rmt_sf_tile";
+
+  utl::require(this->plan_ != nullptr, function_name,
+               "Plan is not initialized");
+
+  utl::require(this->workspace_ != nullptr, function_name,
+               "Workspace is not initialized");
 
   const bool has_long_range_cells =
       ((this->plan_->ncell_x() > 2) && (this->plan_->ncell_y() > 2) &&
@@ -2265,22 +2481,22 @@ void glst_force::sum_rmt_sf_tile(const unsigned int tile) {
   if (!has_long_range_cells)
     return;
 
-  if (tile >= this->plan_->tile_count()) {
-    throw std::runtime_error(
-        "FATAL ERROR: glst_force::sum_rmt_sf_tile: Tile is out of bounds");
-  }
+  utl::require(tile < this->plan_->tile_count(), function_name,
+               "Tile is out of bounds");
 
   const unsigned int tile_node_point = this->plan_->tile_node_point(tile);
   const unsigned int tile_node_count = this->plan_->tile_node_count(tile);
 
-  if (tile_node_count == 0) {
-    throw std::runtime_error(
-        "FATAL ERROR: glst_force::sum_rmt_sf_tile: Tile node count is 0");
-  }
+  utl::require(tile_node_count > 0, function_name, "Tile node count is 0");
 
-  if (tile_node_count > this->plan_->max_tile_nodes()) {
-    throw std::runtime_error("FATAL ERROR: glst_force::sum_rmt_sf_tile: "
-                             "Tile exceeds buffer size");
+  utl::require(tile_node_count <= this->plan_->max_tile_nodes(), function_name,
+               "Tile exceeds buffer size");
+
+  if (this->cell_partition_count_ > 1) {
+    utl::require(
+        this->sf_exchange_mode_ == GLST_SF_EXCHANGE_MODE::FULL_GLOBAL_ALLREDUCE,
+        function_name,
+        "Full global S_tile sum called while local chunk exchange is selected");
   }
 
   const unsigned int tile_partition = this->plan_->tile_partition_idx(tile);
@@ -2302,21 +2518,18 @@ void glst_force::sum_rmt_sf_tile(const unsigned int tile) {
     const unsigned int first_global_cell =
         this->plan_->first_global_cell(cell_partition);
 
-    if (static_cast<std::size_t>(local_cell_count) !=
-        this->workspace_->cell_capacity(dev)) {
-      throw std::runtime_error(
-          "FATAL ERROR: glst_force::sum_rmt_sf_tile: Local cell count does not "
-          "match workspace capacity");
-    }
+    utl::require(static_cast<std::size_t>(local_cell_count) ==
+                     this->workspace_->cell_capacity(dev),
+                 function_name,
+                 "Local cell count does not match workspace capacity");
 
     const std::size_t rmt_entry_count =
         static_cast<std::size_t>(local_cell_count) *
         static_cast<std::size_t>(nc);
 
-    if (rmt_entry_count > this->workspace_->rmt_tile_buffer_capacity(dev)) {
-      throw std::runtime_error("FATAL ERROR: glst_force::sum_rmt_sf_tile: "
-                               "Active rmt tile exceeds workspace capacity");
-    }
+    utl::require(rmt_entry_count <=
+                     this->workspace_->rmt_tile_buffer_capacity(dev),
+                 function_name, "Active rmt tile exceeds workspace capacity");
 
     if (local_cell_count == 0)
       continue;
@@ -2375,20 +2588,344 @@ void glst_force::sum_rmt_sf_tile(const unsigned int tile) {
       const dim3 num_blocks((nc + num_threads.x - 1) / num_threads.x,
                             std::min(65535u, local_cell_count), 1);
 
-      calc_rmt_sum_kernel<<<num_blocks, num_threads, 0,
-                            this->comp_streams_[dev]>>>(
-          this->workspace_->rmt_sum_re()[dev].d_array().data(),
-          this->workspace_->rmt_sum_im()[dev].d_array().data(),
-          this->workspace_->sf_re()[dev].d_array().data(),
-          this->workspace_->sf_im()[dev].d_array().data(),
-          this->plan_->w()[dev].d_array().data() + off,
-          this->plan_->group()[dev].d_array().data() + off, nc,
-          this->plan_->grp_r_in()[dev].d_array().data(),
-          this->plan_->grp_r_out()[dev].d_array().data(),
-          this->plan_->ncell_x(), this->plan_->ncell_y(),
-          this->plan_->ncell_z(), local_cell_count, first_global_cell);
+      calc_rmt_sum_kernel<false>
+          <<<num_blocks, num_threads, 0, this->comp_streams_[dev]>>>(
+              this->workspace_->rmt_sum_re()[dev].d_array().data(),
+              this->workspace_->rmt_sum_im()[dev].d_array().data(),
+              this->workspace_->sf_re()[dev].d_array().data(),
+              this->workspace_->sf_im()[dev].d_array().data(),
+              this->plan_->w()[dev].d_array().data() + off,
+              this->plan_->group()[dev].d_array().data() + off, nc,
+              this->plan_->grp_r_in()[dev].d_array().data(),
+              this->plan_->grp_r_out()[dev].d_array().data(), 0u,
+              this->plan_->ncell_x(), this->plan_->ncell_x(),
+              this->plan_->ncell_y(), this->plan_->ncell_z(), local_cell_count,
+              first_global_cell);
 
       cudaCheck(cudaGetLastError());
+    }
+  }
+
+  return;
+}
+
+void glst_force::sum_rmt_sf_chunk_tile(const unsigned int tile,
+                                       const unsigned int source_partition,
+                                       const unsigned int source_x_offset,
+                                       const unsigned int chunk_x_count) {
+  constexpr std::string_view function_name =
+      "glst_force::sum_rmt_sf_chunk_tile";
+
+  utl::require(this->plan_ != nullptr, function_name,
+               "Plan is not initialized");
+
+  utl::require(this->workspace_ != nullptr, function_name,
+               "Workspace is not initialized");
+
+  utl::require(this->sf_exchange_mode_ ==
+                   GLST_SF_EXCHANGE_MODE::LOCAL_CHUNK_BROADCAST,
+               function_name, "Local chunk exchange is not selected");
+
+  utl::require(tile < this->plan_->tile_count(), function_name,
+               "Tile is out of bounds");
+
+  utl::require(source_partition < this->cell_partition_count_, function_name,
+               "Source partition is out of bounds");
+
+  utl::require(chunk_x_count > 0, function_name, "Chunk x count is 0");
+
+  const unsigned int source_partition_x_count =
+      this->plan_->cell_partition_x_count()[source_partition];
+
+  utl::require(
+      (source_x_offset <= source_partition_x_count) &&
+          (chunk_x_count <= source_partition_x_count - source_x_offset),
+      function_name, "Source x chunk is out of bounds");
+
+  const unsigned int tile_partition = this->plan_->tile_partition_idx(tile);
+  const unsigned int nc = this->plan_->tile_node_count(tile);
+  const unsigned int off = this->plan_->tile_node_point(tile);
+
+  const std::vector<int> &devs = this->cell_comm_devs_[tile_partition];
+
+  utl::require(
+      devs.size() == static_cast<std::size_t>(this->cell_partition_count_),
+      function_name,
+      "Cell communicator device count does not match cell partition count");
+
+  const std::size_t yz_cell_count =
+      static_cast<std::size_t>(this->plan_->ncell_y()) *
+      static_cast<std::size_t>(this->plan_->ncell_z());
+
+  const std::size_t chunk_cell_count =
+      static_cast<std::size_t>(chunk_x_count) * yz_cell_count;
+
+  const std::size_t chunk_entry_count =
+      chunk_cell_count * static_cast<std::size_t>(nc);
+
+  const std::size_t source_cell_offset =
+      static_cast<std::size_t>(source_x_offset) * yz_cell_count;
+
+  const std::size_t source_entry_offset =
+      source_cell_offset * static_cast<std::size_t>(nc);
+
+  const unsigned int source_global_x_point =
+      this->plan_->cell_partition_x_point()[source_partition] + source_x_offset;
+
+  for (std::size_t rank = 0; rank < devs.size(); rank++) {
+    const int dev = devs[rank];
+    const unsigned int cell_partition = this->dev_cell_partition_[dev];
+
+    const unsigned int local_cell_count =
+        this->plan_->local_cell_count(cell_partition);
+
+    const unsigned int first_global_cell =
+        this->plan_->first_global_cell(cell_partition);
+
+    const std::size_t rmt_entry_count =
+        static_cast<std::size_t>(local_cell_count) *
+        static_cast<std::size_t>(nc);
+
+    utl::require(rmt_entry_count <=
+                     this->workspace_->rmt_tile_buffer_capacity(dev),
+                 function_name, "Active rmt tile exceeds workspace capacity");
+
+    if (cell_partition == source_partition) {
+      const std::size_t buffer_capacity =
+          this->workspace_->sf_tile_buffer_capacity(dev);
+
+      utl::require(
+          (source_entry_offset <= buffer_capacity) &&
+              (chunk_entry_count <= buffer_capacity - source_entry_offset),
+          function_name, "Source chunk exceeds local SF capacity");
+    } else {
+      utl::require(chunk_entry_count <=
+                       this->workspace_->sf_exchange_tile_buffer_capacity(dev),
+                   function_name,
+                   "Received chunk exceeds SF exchange capacity");
+    }
+
+    if (local_cell_count == 0)
+      continue;
+
+    cudaCheck(cudaSetDevice(dev));
+
+    double *active_re = nullptr;
+    double *active_im = nullptr;
+
+    if (cell_partition == source_partition) {
+      active_re =
+          this->workspace_->sf_re()[dev].d_array().data() + source_entry_offset;
+      active_im =
+          this->workspace_->sf_im()[dev].d_array().data() + source_entry_offset;
+    } else {
+      active_re = this->workspace_->sf_exchange_re()[dev].d_array().data();
+      active_im = this->workspace_->sf_exchange_im()[dev].d_array().data();
+    }
+
+    {
+      constexpr dim3 num_threads(512, 1, 1);
+
+      const dim3 num_blocks((nc + num_threads.x - 1) / num_threads.x,
+                            chunk_x_count * this->plan_->ncell_y(), 1);
+
+      calc_prefix_sum_z_kernel<<<num_blocks, num_threads, 0,
+                                 this->comp_streams_[dev]>>>(
+          active_re, active_im, nc, chunk_x_count, this->plan_->ncell_y(),
+          this->plan_->ncell_z());
+
+      cudaCheck(cudaGetLastError());
+    }
+
+    {
+      constexpr dim3 num_threads(512, 1, 1);
+
+      const dim3 num_blocks((nc + num_threads.x - 1) / num_threads.x,
+                            chunk_x_count * this->plan_->ncell_z(), 1);
+
+      calc_prefix_sum_y_kernel<<<num_blocks, num_threads, 0,
+                                 this->comp_streams_[dev]>>>(
+          active_re, active_im, nc, chunk_x_count, this->plan_->ncell_y(),
+          this->plan_->ncell_z());
+
+      cudaCheck(cudaGetLastError());
+    }
+
+    {
+      constexpr dim3 num_threads(512, 1, 1);
+
+      const dim3 num_blocks((nc + num_threads.x - 1) / num_threads.x,
+                            this->plan_->ncell_y() * this->plan_->ncell_z(), 1);
+
+      calc_prefix_sum_x_kernel<<<num_blocks, num_threads, 0,
+                                 this->comp_streams_[dev]>>>(
+          active_re, active_im, nc, chunk_x_count, this->plan_->ncell_y(),
+          this->plan_->ncell_z());
+
+      cudaCheck(cudaGetLastError());
+    }
+
+    {
+#ifdef __GLST_DEBUG__
+      constexpr dim3 num_threads(256, 1, 1);
+#else
+      constexpr dim3 num_threads(512, 1, 1);
+#endif
+
+      const dim3 num_blocks((nc + num_threads.x - 1) / num_threads.x,
+                            std::min(65535u, local_cell_count), 1);
+
+      calc_rmt_sum_kernel<true>
+          <<<num_blocks, num_threads, 0, this->comp_streams_[dev]>>>(
+              this->workspace_->rmt_sum_re()[dev].d_array().data(),
+              this->workspace_->rmt_sum_im()[dev].d_array().data(), active_re,
+              active_im, this->plan_->w()[dev].d_array().data() + off,
+              this->plan_->group()[dev].d_array().data() + off, nc,
+              this->plan_->grp_r_in()[dev].d_array().data(),
+              this->plan_->grp_r_out()[dev].d_array().data(),
+              source_global_x_point, chunk_x_count, this->plan_->ncell_x(),
+              this->plan_->ncell_y(), this->plan_->ncell_z(), local_cell_count,
+              first_global_cell);
+
+      cudaCheck(cudaGetLastError());
+    }
+  }
+
+  return;
+}
+
+void glst_force::build_rmt_sum_tile(const unsigned int tile) {
+  constexpr std::string_view function_name = "glst_force::build_rmt_sum_tile";
+
+  utl::require(this->plan_ != nullptr, function_name,
+               "Plan is not initialized");
+
+  utl::require(tile < this->plan_->tile_count(), function_name,
+               "Tile is out of bounds");
+
+  const unsigned int tile_partition = this->plan_->tile_partition_idx(tile);
+
+  if ((this->sf_exchange_mode_ ==
+       GLST_SF_EXCHANGE_MODE::FULL_GLOBAL_ALLREDUCE) ||
+      (this->cell_partition_count_ == 1)) {
+    if (!this->profiling_enabled_) {
+      this->exchange_sf_tile(tile);
+      this->sum_rmt_sf_tile(tile);
+      return;
+    }
+
+    std::chrono::steady_clock::time_point phase_start =
+        std::chrono::steady_clock::now();
+
+    this->exchange_sf_tile(tile);
+    this->synchronize_tile_partition_compute_streams(tile_partition);
+
+    std::chrono::steady_clock::time_point phase_end =
+        std::chrono::steady_clock::now();
+
+    this->profile_.exchange_sf_ms += profile_elapsed_ms(phase_start, phase_end);
+
+    if (this->cell_partition_count_ > 1) {
+      const std::size_t entry_count =
+          static_cast<std::size_t>(this->plan_->ncell()) *
+          static_cast<std::size_t>(this->plan_->tile_node_count(tile));
+
+      this->profile_.sf_collective_input_bytes +=
+          2 * entry_count * sizeof(double) *
+          static_cast<std::size_t>(this->cell_partition_count_);
+    }
+
+    phase_start = std::chrono::steady_clock::now();
+
+    this->sum_rmt_sf_tile(tile);
+    this->synchronize_tile_partition_compute_streams(tile_partition);
+
+    phase_end = std::chrono::steady_clock::now();
+
+    this->profile_.sum_rmt_sf_ms += profile_elapsed_ms(phase_start, phase_end);
+
+    return;
+  }
+
+  utl::require(this->sf_exchange_chunk_x_count_ > 0, function_name,
+               "Local exchange chunk size is 0");
+
+  if (!this->profiling_enabled_)
+    this->zero_rmt_sum_tile(tile);
+  else {
+    const std::chrono::steady_clock::time_point phase_start =
+        std::chrono::steady_clock::now();
+
+    this->zero_rmt_sum_tile(tile);
+    this->synchronize_tile_partition_compute_streams(tile_partition);
+
+    const std::chrono::steady_clock::time_point phase_end =
+        std::chrono::steady_clock::now();
+
+    this->profile_.sum_rmt_sf_ms += profile_elapsed_ms(phase_start, phase_end);
+  }
+
+  for (unsigned int source_partition = 0;
+       source_partition < this->cell_partition_count_; source_partition++) {
+    const unsigned int source_x_count =
+        this->plan_->cell_partition_x_count()[source_partition];
+
+    for (unsigned int source_x_offset = 0; source_x_offset < source_x_count;
+         source_x_offset += this->sf_exchange_chunk_x_count_) {
+      const unsigned int remaining = source_x_count - source_x_offset;
+
+      const unsigned int chunk_x_count =
+          std::min(this->sf_exchange_chunk_x_count_, remaining);
+
+      if (!this->profiling_enabled_) {
+        this->exchange_sf_chunk_tile(tile, source_partition, source_x_offset,
+                                     chunk_x_count);
+
+        this->sum_rmt_sf_chunk_tile(tile, source_partition, source_x_offset,
+                                    chunk_x_count);
+
+        continue;
+      }
+
+      std::chrono::steady_clock::time_point phase_start =
+          std::chrono::steady_clock::now();
+
+      this->exchange_sf_chunk_tile(tile, source_partition, source_x_offset,
+                                   chunk_x_count);
+
+      this->synchronize_tile_partition_compute_streams(tile_partition);
+
+      std::chrono::steady_clock::time_point phase_end =
+          std::chrono::steady_clock::now();
+
+      this->profile_.exchange_sf_ms +=
+          profile_elapsed_ms(phase_start, phase_end);
+
+      const std::size_t chunk_cell_count =
+          static_cast<std::size_t>(chunk_x_count) *
+          static_cast<std::size_t>(this->plan_->ncell_y()) *
+          static_cast<std::size_t>(this->plan_->ncell_z());
+
+      const std::size_t chunk_entry_count =
+          chunk_cell_count *
+          static_cast<std::size_t>(this->plan_->tile_node_count(tile));
+
+      // One real and one imaginary source payload. This deliberately does not
+      // multiply by G_cell; The receivers can be reported separately.
+      this->profile_.sf_collective_input_bytes +=
+          2 * chunk_entry_count * sizeof(double);
+
+      phase_start = std::chrono::steady_clock::now();
+
+      this->sum_rmt_sf_chunk_tile(tile, source_partition, source_x_offset,
+                                  chunk_x_count);
+
+      this->synchronize_tile_partition_compute_streams(tile_partition);
+
+      phase_end = std::chrono::steady_clock::now();
+
+      this->profile_.sum_rmt_sf_ms +=
+          profile_elapsed_ms(phase_start, phase_end);
     }
   }
 
@@ -2479,10 +3016,13 @@ calc_lr_ef_kernel(double *__restrict__ fx, double *__restrict__ fy,
 }
 
 void glst_force::calc_lr_ef_tile(const unsigned int tile) {
-  if (this->plan_ == nullptr) {
-    throw std::runtime_error("FATAL ERROR: glst_force::calc_lr_ef_tile: "
-                             "Plan is not initialized");
-  }
+  constexpr std::string_view function_name = "glst_force::calc_lr_ef_tile";
+
+  utl::require(this->plan_ != nullptr, function_name,
+               "Plan is not initialized");
+
+  utl::require(this->workspace_ != nullptr, function_name,
+               "Workspace is not initialized");
 
   const bool has_long_range_cells =
       ((this->plan_->ncell_x() > 2) && (this->plan_->ncell_y() > 2) &&
@@ -2490,23 +3030,16 @@ void glst_force::calc_lr_ef_tile(const unsigned int tile) {
   if (!has_long_range_cells)
     return;
 
-  if (tile >= this->plan_->tile_count()) {
-    throw std::runtime_error(
-        "FATAL ERROR: glst_force::calc_lr_ef_tile: Tile is out of bounds");
-  }
+  utl::require(tile < this->plan_->tile_count(), function_name,
+               "Tile is out of bounds");
 
   const unsigned int tile_node_point = this->plan_->tile_node_point(tile);
   const unsigned int tile_node_count = this->plan_->tile_node_count(tile);
 
-  if (tile_node_count == 0) {
-    throw std::runtime_error(
-        "FATAL ERROR: glst_force::calc_lr_ef_tile: Tile node count is 0");
-  }
+  utl::require(tile_node_count > 0, function_name, "Tile node count is 0");
 
-  if (tile_node_count > this->plan_->max_tile_nodes()) {
-    throw std::runtime_error("FATAL ERROR: glst_force::calc_lr_ef_tile: "
-                             "Tile exceeds buffer size");
-  }
+  utl::require(tile_node_count <= this->plan_->max_tile_nodes(), function_name,
+               "Tile exceeds buffer size");
 
   const unsigned int tile_partition = this->plan_->tile_partition_idx(tile);
 
@@ -2524,21 +3057,18 @@ void glst_force::calc_lr_ef_tile(const unsigned int tile) {
     const unsigned int local_cell_count =
         this->plan_->local_cell_count(cell_partition);
 
-    if (static_cast<std::size_t>(local_cell_count) !=
-        this->workspace_->cell_capacity(dev)) {
-      throw std::runtime_error(
-          "FATAL ERROR: glst_force::calc_lr_ef_tile: Local ell count does not "
-          "match workspace capacity");
-    }
+    utl::require(static_cast<std::size_t>(local_cell_count) ==
+                     this->workspace_->cell_capacity(dev),
+                 function_name,
+                 "Local ell count does not match workspace capacity");
 
     const std::size_t rmt_entry_count =
         static_cast<std::size_t>(local_cell_count) *
         static_cast<std::size_t>(nc);
 
-    if (rmt_entry_count > this->workspace_->rmt_tile_buffer_capacity(dev)) {
-      throw std::runtime_error("FATAL ERROR: glst_force::calc_lr_ef_tile: "
-                               "Active rmt tile exceeds workspace capacity");
-    }
+    utl::require(rmt_entry_count <=
+                     this->workspace_->rmt_tile_buffer_capacity(dev),
+                 function_name, "Active rmt tile exceeds workspace capacity");
 
     if (local_cell_count == 0)
       continue;
@@ -2581,50 +3111,40 @@ void glst_force::reduce_tile_partition_ef(void) {
   constexpr std::string_view function_name =
       "glst_force::reduce_tile_partition_ef";
 
-  if (this->plan_ == nullptr) {
-    throw std::runtime_error("FATAL ERROR: " + std::string(function_name) +
-                             ": Plan is not initialized");
-  }
+  utl::require(this->plan_ != nullptr, function_name,
+               "Plan is not initialized");
 
-  if (this->workspace_ == nullptr) {
-    throw std::runtime_error("FATAL ERROR: " + std::string(function_name) +
-                             ": Workspace is not initialized");
-  }
+  utl::require(this->workspace_ != nullptr, function_name,
+               "Workspace is not initialized");
 
   // This covers single-GPU mode and pure cell decomposition.
   if (this->tile_partition_count_ == 1)
     return;
 
-  if (this->tile_comm_devs_.size() !=
-      static_cast<std::size_t>(this->cell_partition_count_)) {
-    throw std::runtime_error("FATAL ERROR: " + std::string(function_name) +
-                             ": Tile communicator device topology does not "
-                             "match cell partition count");
-  }
+  utl::require(
+      this->tile_comm_devs_.size() ==
+          static_cast<std::size_t>(this->cell_partition_count_),
+      function_name,
+      "Tile communicator device topology does not match cell partition count");
 
-  if (this->tile_comms_.size() !=
-      static_cast<std::size_t>(this->cell_partition_count_)) {
-    throw std::runtime_error(
-        "FATAL ERROR: " + std::string(function_name) +
-        ": Tile communicator topology does not match cell partition count");
-  }
+  utl::require(
+      this->tile_comms_.size() ==
+          static_cast<std::size_t>(this->cell_partition_count_),
+      function_name,
+      "Tile communicator topology does not match cell partition count");
 
   for (unsigned int cell_partition = 0;
        cell_partition < this->cell_partition_count_; cell_partition++) {
     const std::vector<int> &devs = this->tile_comm_devs_[cell_partition];
     const std::vector<ncclComm_t> &comms = this->tile_comms_[cell_partition];
 
-    if (devs.size() != static_cast<std::size_t>(this->tile_partition_count_)) {
-      throw std::runtime_error("FATAL ERROR: " + std::string(function_name) +
-                               ": Tile communicator device count does not "
-                               "match tile partition count");
-    }
+    utl::require(
+        devs.size() == static_cast<std::size_t>(this->tile_partition_count_),
+        function_name,
+        "Tile communicator device count does not match tile partition count");
 
-    if (comms.size() != devs.size()) {
-      throw std::runtime_error(
-          "FATAL ERROR: " + std::string(function_name) +
-          ": Tile communicator handle count does not match device count");
-    }
+    utl::require(comms.size() == devs.size(), function_name,
+                 "Tile communicator handle count does not match device count");
 
     // Validate every rank before beginning the collective. This is important:
     // Every rank in a NCCL collective must use the same count and datatype.
@@ -2633,39 +3153,31 @@ void glst_force::reduce_tile_partition_ef(void) {
     for (std::size_t rank = 0; rank < devs.size(); rank++) {
       const int dev = devs[rank];
 
-      if ((dev < 0) || (dev >= this->cuda_count_)) {
-        throw std::runtime_error("FATAL ERROR: " + std::string(function_name) +
-                                 ": Tile communicator device is out of range");
-      }
+      utl::require((dev >= 0) && (dev < this->cuda_count_), function_name,
+                   "Tile communicator device is out of range");
 
-      if (this->dev_cell_partition_[dev] != cell_partition) {
-        throw std::runtime_error(
-            "FATAL ERROR: " + std::string(function_name) +
-            ": Device belongs to the wrong cell partition");
-      }
+      utl::require(this->dev_cell_partition_[dev] == cell_partition,
+                   function_name, "Device belongs to the wrong cell partition");
 
-      if (this->dev_tile_partition_[dev] != static_cast<unsigned int>(rank)) {
-        throw std::runtime_error(
-            "FATAL ERROR: " + std::string(function_name) +
-            ": Tile communicator rank does not match tile partition");
-      }
+      utl::require(this->dev_tile_partition_[dev] ==
+                       static_cast<unsigned int>(rank),
+                   function_name,
+                   "Tile communicator rank does not match tile partition");
 
       const std::size_t dev_owned_atom_count =
           this->workspace_->owned_atom_count(dev);
 
       if (rank == 0)
         owned_atom_count = dev_owned_atom_count;
-      else if (dev_owned_atom_count != owned_atom_count) {
-        throw std::runtime_error("FATAL ERROR: " + std::string(function_name) +
-                                 ": Tile ranks in one cell partition have "
-                                 "different owned atom counts");
+      else {
+        utl::require(dev_owned_atom_count == owned_atom_count, function_name,
+                     "Tile ranks in one cell partition have different owned "
+                     "atom counts");
       }
 
-      if (dev_owned_atom_count > this->workspace_->atom_capacity(dev)) {
-        throw std::runtime_error(
-            "FATAL ERROR: " + std::string(function_name) +
-            ": Owned atom count exceeds workspace atom capacity");
-      }
+      utl::require(dev_owned_atom_count <= this->workspace_->atom_capacity(dev),
+                   function_name,
+                   "Owned atom count exceeds workspace atom capacity");
     }
 
     if (owned_atom_count == 0)
@@ -2881,6 +3393,8 @@ void glst_force::init_cuda_resources(void) {
 }
 
 void glst_force::init_nccl_topology(void) {
+  constexpr std::string_view function_name = "glst_force::init_nccl_topology";
+
   this->nccl_devs_.clear();
   this->nccl_comms_.clear();
   this->cell_comm_devs_.clear();
@@ -2911,16 +3425,12 @@ void glst_force::init_nccl_topology(void) {
       const unsigned int udev =
           cell_part * this->tile_partition_count_ + tile_part;
 
-      if (udev >= static_cast<unsigned int>(this->cuda_count_)) {
-        throw std::runtime_error("FATAL ERROR: glst_force::init_nccl_topology: "
-                                 "Cell communicator device is out of range");
-      }
+      utl::require(udev < static_cast<unsigned int>(this->cuda_count_),
+                   function_name, "Cell communicator device is out of range");
 
-      if ((this->dev_cell_partition_[udev] != cell_part) ||
-          (this->dev_tile_partition_[udev] != tile_part)) {
-        throw std::runtime_error("FATAL ERROR: glst_force::init_nccl_topology: "
-                                 "Cell communicator layout mismatch");
-      }
+      utl::require((this->dev_cell_partition_[udev] == cell_part) &&
+                       (this->dev_tile_partition_[udev] == tile_part),
+                   function_name, "Cell communicator layout mismatch");
 
       devs[cell_part] = static_cast<int>(udev);
     }
@@ -2946,16 +3456,12 @@ void glst_force::init_nccl_topology(void) {
       const unsigned int udev =
           cell_part * this->tile_partition_count_ + tile_part;
 
-      if (udev >= static_cast<unsigned int>(this->cuda_count_)) {
-        throw std::runtime_error("FATAL ERROR: glst_force::init_nccl_topology: "
-                                 "Tile communicator device is out of range");
-      }
+      utl::require(udev < static_cast<unsigned int>(this->cuda_count_),
+                   function_name, "Tile communicator device is out of range");
 
-      if ((this->dev_cell_partition_[udev] != cell_part) ||
-          (this->dev_tile_partition_[udev] != tile_part)) {
-        throw std::runtime_error("FATAL ERROR: glst_force::init_nccl_topology: "
-                                 "Tile communicator layout mismatch");
-      }
+      utl::require((this->dev_cell_partition_[udev] == cell_part) &&
+                       (this->dev_tile_partition_[udev] == tile_part),
+                   function_name, "Tile communicator layout mismatch");
 
       devs[tile_part] = static_cast<int>(udev);
     }
@@ -3052,10 +3558,10 @@ void glst_force::print_nccl_topology(std::ostream &os) const {
 }
 
 void glst_force::init_gpu_layout(const int device_count) {
-  if (device_count < 1) {
-    throw std::runtime_error("FATAL ERROR: glst_force::init_gpu_layout: Could "
-                             "not find any CUDA capable devices");
-  }
+  constexpr std::string_view function_name = "glst_force::init_gpu_layout";
+
+  utl::require(device_count >= 1, function_name,
+               "Could not find any CUDA capable devices");
 
   unsigned int cell_partition_count = this->cell_partition_count_;
   unsigned int tile_partition_count = this->tile_partition_count_;
@@ -3075,12 +3581,12 @@ void glst_force::init_gpu_layout(const int device_count) {
       static_cast<unsigned long long int>(tile_partition_count);
 
   if (product != static_cast<unsigned long long int>(device_count)) {
-    throw std::runtime_error("FATAL ERROR: glst_force::init_gpu_layout: "
-                             "GLST_CELL_PARTITION * GLST_TILE_PARTITION must "
-                             "equal the visible CUDA device count; observed " +
-                             std::to_string(cell_partition_count) + " * " +
-                             std::to_string(tile_partition_count) +
-                             " != " + std::to_string(device_count));
+    utl::throw_error(function_name,
+                     "GLST_CELL_PARTITION * GLST_TILE_PARTITION must equal the "
+                     "visible CUDA device count; observed " +
+                         std::to_string(cell_partition_count) + " * " +
+                         std::to_string(tile_partition_count) +
+                         " != " + std::to_string(device_count));
   }
 
   this->cuda_count_ = device_count;
@@ -3109,20 +3615,18 @@ void glst_force::init_gpu_layout(const int device_count) {
 }
 
 void glst_force::cells2dev(void) {
-  if (this->plan_ == nullptr) {
-    throw std::runtime_error(
-        "FATAL ERROR: glst_force::cells2dev: Plan is not initialized");
-  }
+  constexpr std::string_view function_name = "glst_force::cells2dev";
+
+  utl::require(this->plan_ != nullptr, function_name,
+               "Plan is not initialized");
 
   this->dev_cell_idx_.resize(this->cuda_count_);
 
   for (int dev = 0; dev < this->cuda_count_; dev++) {
     const unsigned int partition = this->dev_cell_partition_[dev];
 
-    if (partition >= this->plan_->cell_partition_count()) {
-      throw std::runtime_error("FATAL ERROR: glst_force::cells2dev: Device "
-                               "cell partition is out of range");
-    }
+    utl::require(partition < this->plan_->cell_partition_count(), function_name,
+                 "Device cell partition is out of range");
 
     cudaCheck(cudaSetDevice(dev));
     this->dev_cell_idx_[dev] = this->plan_->partition_cell_idx(partition);
@@ -3134,9 +3638,9 @@ void glst_force::cells2dev(void) {
 void glst_force::require_single_gpu_runtime(
     const std::string_view method) const {
   if (this->execution_mode_ != GLST_EXECUTION_MODE::SINGLE_GPU_TILED) {
-    throw std::runtime_error(
-        "FATAL ERROR: glst_force::" + std::string(method) +
-        ": Multi-GPU local-workspace runtime is not implemented yet");
+    utl::throw_error(
+        "glst_force::" + std::string(method),
+        "Multi-GPU local-workspace runtime is not implemented yet");
   }
   return;
 }

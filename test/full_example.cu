@@ -197,6 +197,8 @@ int main(int argc, char **argv) {
 
   auto glst = std::make_unique<glst_force>();
   glst->set_gpu_layout(cell_partition_count, tile_partition_count);
+  // glst->set_sf_exchange_mode(GLST_SF_EXCHANGE_MODE::FULL_GLOBAL_ALLREDUCE);
+  glst->set_sf_exchange_mode(GLST_SF_EXCHANGE_MODE::LOCAL_CHUNK_BROADCAST);
   glst->init(natom, tol, box_dim_x, box_dim_y, box_dim_z, rcut);
 
   glst_force_test_access::enable_profiling(*glst, false);

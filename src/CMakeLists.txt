@@ -7,6 +7,7 @@ add_library(GLST
   ${GLST_SOURCE_DIR}/src/cuda_utils.cu
   ${GLST_SOURCE_DIR}/src/device_comm.cu
   ${GLST_SOURCE_DIR}/src/device_vector.cu
+  ${GLST_SOURCE_DIR}/src/error_utils.cpp
   ${GLST_SOURCE_DIR}/src/glst_force.cu
   ${GLST_SOURCE_DIR}/src/glst_plan.cu
   ${GLST_SOURCE_DIR}/src/glst_workspace.cu

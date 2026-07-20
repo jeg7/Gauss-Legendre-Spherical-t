@@ -25,7 +25,8 @@ public:
   glst_workspace(const glst_plan &plan, const int device_count = 1);
   glst_workspace(const glst_plan &plan,
                  const std::vector<unsigned int> &dev_cell_partition,
-                 const int device_count = 1);
+                 const int device_count = 1, const bool full_sf_buffer = true,
+                 const unsigned int sf_exchange_chunk_x_count = 0);
   ~glst_workspace(void);
 
 public:
@@ -33,11 +34,13 @@ public:
   std::size_t max_cell_capacity(void) const;
   std::size_t tile_node_capacity(void) const;
   std::size_t max_sf_tile_buffer_capacity(void) const;
+  std::size_t max_sf_exchange_tile_buffer_capacity(void) const;
   std::size_t max_rmt_tile_buffer_capacity(void) const;
 
   std::size_t atom_capacity(const int dev) const;
   std::size_t cell_capacity(const int dev) const;
   std::size_t sf_tile_buffer_capacity(const int dev) const;
+  std::size_t sf_exchange_tile_buffer_capacity(const int dev) const;
   std::size_t rmt_tile_buffer_capacity(const int dev) const;
   std::size_t owned_atom_count(const int dev) const;
   std::size_t sr_source_cell_capacity(const int dev) const;
@@ -72,6 +75,8 @@ public:
 
   const std::vector<cuda_container<double>> &sf_re(void) const;
   const std::vector<cuda_container<double>> &sf_im(void) const;
+  const std::vector<cuda_container<double>> &sf_exchange_re(void) const;
+  const std::vector<cuda_container<double>> &sf_exchange_im(void) const;
   const std::vector<cuda_container<double>> &rmt_sum_re(void) const;
   const std::vector<cuda_container<double>> &rmt_sum_im(void) const;
 
@@ -102,6 +107,8 @@ public:
 
   std::vector<cuda_container<double>> &sf_re(void);
   std::vector<cuda_container<double>> &sf_im(void);
+  std::vector<cuda_container<double>> &sf_exchange_re(void);
+  std::vector<cuda_container<double>> &sf_exchange_im(void);
   std::vector<cuda_container<double>> &rmt_sum_re(void);
   std::vector<cuda_container<double>> &rmt_sum_im(void);
 
@@ -112,7 +119,8 @@ public:
   void init(const glst_plan &plan, const int device_count = 1);
   void init(const glst_plan &plan,
             const std::vector<unsigned int> &dev_cell_partition,
-            const int device_count = 1);
+            const int device_count = 1, const bool full_sf_buffer = true,
+            const unsigned int sf_exchange_chunk_x_count = 0);
   void resize_atom_storage(const int dev, const std::size_t atom_capacity);
   void set_owned_atom_count(const int dev, const std::size_t owned_atom_count);
   void clear(void);
@@ -128,11 +136,13 @@ private:
   std::size_t max_cell_capacity_;
   std::size_t tile_node_capacity_;
   std::size_t max_sf_tile_buffer_capacity_;
+  std::size_t max_sf_exchange_tile_buffer_capacity_;
   std::size_t max_rmt_tile_buffer_capacity_;
 
   std::vector<std::size_t> atom_capacity_;
   std::vector<std::size_t> cell_capacity_;
   std::vector<std::size_t> sf_tile_buffer_capacity_;
+  std::vector<std::size_t> sf_exchange_tile_buffer_capacity_;
   std::vector<std::size_t> rmt_tile_buffer_capacity_;
   std::vector<std::size_t> owned_atom_count_;
   std::vector<std::size_t> sr_source_cell_capacity_;
@@ -163,12 +173,21 @@ private:
   std::vector<cuda_container<unsigned int>> sr_source_cell_atom_count_;
 
   // Tile-sized GLST buffers.
-  // sf_re/sf_im use global-cell indexing for the first baseline S_tile
-  // communication path: ncell * max_tile_nodes.
-  // rmt_sum_re/rmt_sum_im use local target-cell indexing: local_cell_count *
-  // max_tile_nodes.
+  //
+  // FULL_GLOBAL_ALLREDUCE:
+  //   sf_re/sf_im: ncell * max_tile_nodes
+  //   sf_exchange_re/sf_exchange_im: empty
+  //
+  // LOCAL_CHUNK_BROADCAST:
+  //   sf_re/sf_im: local_cell_count * max_tile_nodes
+  //   sf_exchange_re/sf_exchange_im:
+  //       exchange_chunk_cell_capacity * max_tile_nodes
+  //
+  // rmt_sum_re/rmt_sum_im: local_cell_count * max_tile_nodes
   std::vector<cuda_container<double>> sf_re_;
   std::vector<cuda_container<double>> sf_im_;
+  std::vector<cuda_container<double>> sf_exchange_re_;
+  std::vector<cuda_container<double>> sf_exchange_im_;
   std::vector<cuda_container<double>> rmt_sum_re_;
   std::vector<cuda_container<double>> rmt_sum_im_;
 

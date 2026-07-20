@@ -31,6 +31,11 @@ enum class GLST_EXECUTION_MODE {
   MULTI_GPU_CELL_TILE
 };
 
+enum class GLST_SF_EXCHANGE_MODE {
+  LOCAL_CHUNK_BROADCAST,
+  FULL_GLOBAL_ALLREDUCE
+};
+
 struct glst_profile {
   double atom_assignment_scatter_ms = 0.0;
   double owned_halo_source_scatter_ms = 0.0;
@@ -83,6 +88,8 @@ public: // Initialization
   void set_gpu_layout(const unsigned int cell_partition_count,
                       const unsigned int tile_partition_count);
 
+  void set_sf_exchange_mode(const GLST_SF_EXCHANGE_MODE mode);
+
 public: // Energy and force calculation
   void assign_atoms(const double *d_rx, const double *d_ry, const double *d_rz,
                     const double *d_qc);
@@ -104,8 +111,22 @@ private:
   void assign_atoms_multi_gpu(const double *d_rx, const double *d_ry,
                               const double *d_rz, const double *d_qc);
   void calc_sf_tile(const unsigned int tile);
+
+  void zero_rmt_sum_tile(const unsigned int tile);
+
   void exchange_sf_tile(const unsigned int tile);
+  void exchange_sf_chunk_tile(const unsigned int tile,
+                              const unsigned int source_partition,
+                              const unsigned int source_x_offset,
+                              const unsigned int chunk_x_count);
+
   void sum_rmt_sf_tile(const unsigned int tile);
+  void sum_rmt_sf_chunk_tile(const unsigned int tile,
+                             const unsigned int source_partition,
+                             const unsigned int source_x_offset,
+                             const unsigned int chunk_x_count);
+  void build_rmt_sum_tile(const unsigned int tile);
+
   void calc_lr_ef_tile(const unsigned int tile);
   void reduce_tile_partition_ef(void);
   void zero_ef(void);
@@ -133,6 +154,8 @@ private:
   std::unique_ptr<glst_workspace> workspace_;
 
   GLST_EXECUTION_MODE execution_mode_;
+  GLST_SF_EXCHANGE_MODE sf_exchange_mode_;
+  unsigned int sf_exchange_chunk_x_count_;
 
   unsigned int cell_partition_count_;
   unsigned int tile_partition_count_;

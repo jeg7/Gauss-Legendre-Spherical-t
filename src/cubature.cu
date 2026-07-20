@@ -11,22 +11,22 @@
 #include "cubature.hcu"
 
 #include "cuda_utils.hcu"
+#include "error_utils.hpp"
 
 #include <cassert>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <limits>
-#include <stdexcept>
+#include <string_view>
 
 cubature::cubature(void)
     : num_cubatures_(0), tot_num_nodes_(0), points_(), num_nodes_(), x_(), y_(),
       z_(), w_(), group_(), cuda_count_(-1) {
   cudaCheck(cudaGetDeviceCount(&this->cuda_count_));
-  if (this->cuda_count_ < 1) {
-    throw std::runtime_error(
-        "glst_force::init: Could not find any CUDA capable devices");
-  }
+  utl::require(this->cuda_count_ >= 1, "cubature::cubature",
+               "Could not find any CUDA capable devices");
+
   this->points_.resize(this->cuda_count_);
   this->num_nodes_.resize(this->cuda_count_);
   this->x_.resize(this->cuda_count_);
@@ -240,8 +240,7 @@ void cubature::get_xgl(std::vector<double> &xgl, const unsigned int n) {
 
   xgl.clear();
 
-  if (n == 0)
-    throw std::runtime_error("No roots for n == 0");
+  utl::require(n > 0, "cubature::get_xgl", "No roots for n == 0");
 
   if (n == 1) {
     xgl.push_back(0.0);
@@ -368,10 +367,8 @@ void cubature::get_gauss_legendre(unsigned int &ngl, unsigned int &ngl0,
       break;
   }
 
-  if (!flag) {
-    throw std::runtime_error(
-        "Suitable Gauss-Legendre quadrature could not be found");
-  }
+  utl::require(flag, "cubature::get_gauss_legendre",
+               "Suitable Gauss-Legendre quadrature could not be found");
 
   ngl0 = ngl;
   ngl = (ngl0 % 2 == 0) ? (ngl0 / 2) : ((ngl0 + 1) / 2);
@@ -400,8 +397,10 @@ void cubature::read_tdesign(std::vector<std::array<double, 3>> &sm,
                             const std::string &tfname) {
   std::ifstream fs(tfname);
 
-  if (!fs.is_open())
-    throw std::runtime_error("Failed to open file \"" + tfname + "\"");
+  if (!fs.is_open()) {
+    utl::throw_error("cubature::read_tdesign",
+                     "Failed to open file \"" + tfname + "\"");
+  }
 
   for (std::size_t i = 0; i < sm.size(); i++) {
     std::string line = "";
@@ -489,8 +488,8 @@ void cubature::get_spherical_tdesign(std::vector<std::array<double, 3>> &sm,
     }
   }
 
-  if (nmin > 0)
-    throw std::runtime_error("Suitable t-design could not be found");
+  utl::require(nmin <= 0, "cubature::get_spherical_tdesign",
+               "Suitable t-design could not be found");
 
   return;
 }

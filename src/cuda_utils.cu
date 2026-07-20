@@ -10,6 +10,8 @@
 
 #include "cuda_utils.hcu"
 
+#include "error_utils.hpp"
+
 void enable_p2p(const int cuda_count) {
   for (int device = 0; device < cuda_count; device++) {
     cudaCheck(cudaSetDevice(device));
@@ -21,9 +23,10 @@ void enable_p2p(const int cuda_count) {
       int can_access_peer = -1;
       cudaCheck(cudaDeviceCanAccessPeer(&can_access_peer, device, peer_device));
       if (can_access_peer != 1) {
-        throw std::runtime_error(
-            "Peer-peer access is not available between devices " +
-            std::to_string(device) + " and " + std::to_string(peer_device));
+        utl::throw_error("enable_p2p",
+                         "Peer-peer access is not available between devices " +
+                             std::to_string(device) + " and " +
+                             std::to_string(peer_device));
       }
 
       // Enable peer-peer access
