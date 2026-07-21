@@ -98,6 +98,14 @@ public:
   partition_cell_idx(const unsigned int cell_partition) const;
   unsigned int local_cell_count(const unsigned int cell_partition) const;
 
+  const std::vector<unsigned int> &
+  partition_group_prefix_x(const unsigned int cell_partition,
+                           const unsigned int group) const;
+  const std::vector<unsigned int> &
+  partition_prefix_slot_by_group_x(const unsigned int cell_partition) const;
+  unsigned int
+  partition_max_prefix_plane_count(const unsigned int cell_partition) const;
+
   const std::vector<std::vector<unsigned int>> &
   partition_left_halo_cell_idx(void) const;
   const std::vector<std::vector<unsigned int>> &
@@ -146,6 +154,7 @@ public:
 
 private:
   void init_short_range_halo_plan(void);
+  void init_distributed_prefix_plan(void);
 
 private:
   unsigned int natom_;
@@ -195,6 +204,10 @@ private:
   std::vector<std::vector<unsigned int>> partition_right_halo_cell_idx_;
   std::vector<std::vector<unsigned int>> partition_halo_cell_idx_;
   std::vector<std::vector<unsigned int>> partition_sr_source_cell_idx_;
+
+  std::vector<std::vector<std::vector<unsigned int>>> partition_group_prefix_x_;
+  std::vector<std::vector<unsigned int>> partition_prefix_slot_by_group_x_;
+  std::vector<unsigned int> partition_max_prefix_plane_count_;
 };
 
 #endif

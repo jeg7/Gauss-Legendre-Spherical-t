@@ -198,7 +198,8 @@ int main(int argc, char **argv) {
   auto glst = std::make_unique<glst_force>();
   glst->set_gpu_layout(cell_partition_count, tile_partition_count);
   // glst->set_sf_exchange_mode(GLST_SF_EXCHANGE_MODE::FULL_GLOBAL_ALLREDUCE);
-  glst->set_sf_exchange_mode(GLST_SF_EXCHANGE_MODE::LOCAL_CHUNK_BROADCAST);
+  // glst->set_sf_exchange_mode(GLST_SF_EXCHANGE_MODE::LOCAL_CHUNK_BROADCAST);
+  glst->set_sf_exchange_mode(GLST_SF_EXCHANGE_MODE::DISTRIBUTED_PREFIX);
   glst->init(natom, tol, box_dim_x, box_dim_y, box_dim_z, rcut);
 
   glst_force_test_access::enable_profiling(*glst, false);
@@ -258,6 +259,9 @@ int main(int argc, char **argv) {
     std::vector<double> profiling_residual_times(profile_iterations);
 
     std::size_t sf_collective_input_bytes = 0;
+    std::size_t prefix_base_input_bytes = 0;
+    std::size_t prefix_plane_input_bytes = 0;
+    std::size_t prefix_plane_import_count = 0;
     std::size_t owned_atom_replicas = 0;
     std::size_t halo_atom_replicas = 0;
 
@@ -325,10 +329,18 @@ int main(int argc, char **argv) {
       // remain constant because full_example repeats the same coordinates.
       if (iter == 0) {
         sf_collective_input_bytes = profile.sf_collective_input_bytes;
+        prefix_base_input_bytes = profile.prefix_base_input_bytes;
+        prefix_plane_input_bytes = profile.prefix_plane_input_bytes;
+        prefix_plane_import_count = profile.prefix_plane_import_count;
         owned_atom_replicas = profile.owned_atom_replicas;
         halo_atom_replicas = profile.halo_atom_replicas;
       } else if ((sf_collective_input_bytes !=
                   profile.sf_collective_input_bytes) ||
+                 (prefix_base_input_bytes != profile.prefix_base_input_bytes) ||
+                 (prefix_plane_input_bytes !=
+                  profile.prefix_plane_input_bytes) ||
+                 (prefix_plane_import_count !=
+                  profile.prefix_plane_import_count) ||
                  (owned_atom_replicas != profile.owned_atom_replicas) ||
                  (halo_atom_replicas != profile.halo_atom_replicas)) {
         throw std::runtime_error(
@@ -400,11 +412,15 @@ int main(int argc, char **argv) {
 
     const double sf_collective_input_mib =
         static_cast<double>(sf_collective_input_bytes) / (1024.0 * 1024.0);
+    const double prefix_base_input_mib =
+        static_cast<double>(prefix_base_input_bytes) / (1024.0 * 1024.0);
+    const double prefix_plane_input_mib =
+        static_cast<double>(prefix_plane_input_bytes) / (1024.0 * 1024.0);
     const std::size_t total_atom_replicas =
         owned_atom_replicas + halo_atom_replicas;
 
     std::cout << std::endl;
-    std::cout << " Aggregate logical S_tile collective input: "
+    std::cout << " Aggregate logical long-range communication input: "
               << sf_collective_input_mib << " MiB ("
               << sf_collective_input_bytes << " bytes)" << std::endl;
     std::cout << "             Owned atom replicas: " << owned_atom_replicas
@@ -413,6 +429,12 @@ int main(int argc, char **argv) {
               << std::endl;
     std::cout << "             Total atom replicas: " << total_atom_replicas
               << std::endl;
+    std::cout << "    Prefix-base all-gather input: " << prefix_base_input_mib
+              << " MiB (" << prefix_base_input_bytes << " bytes)" << std::endl;
+    std::cout << "     Imported prefix-plane input: " << prefix_plane_input_mib
+              << " MiB (" << prefix_plane_input_bytes << " bytes)" << std::endl;
+    std::cout << "     Imported prefix-plane count: "
+              << prefix_plane_import_count << std::endl;
   }
 
   // The final profiling iteration already called get_ef(). When profiling is

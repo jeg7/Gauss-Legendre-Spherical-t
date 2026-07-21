@@ -30,16 +30,21 @@ inline static std::size_t checked_mul(const std::size_t a, const std::size_t b,
 glst_workspace::glst_workspace(void)
     : max_atom_capacity_(0), max_cell_capacity_(0), tile_node_capacity_(0),
       max_sf_tile_buffer_capacity_(0), max_sf_exchange_tile_buffer_capacity_(0),
-      max_rmt_tile_buffer_capacity_(0), atom_capacity_(), cell_capacity_(),
+      max_rmt_tile_buffer_capacity_(0),
+      max_prefix_partition_total_buffer_capacity_(0),
+      max_prefix_base_buffer_capacity_(0), atom_capacity_(), cell_capacity_(),
       sf_tile_buffer_capacity_(), sf_exchange_tile_buffer_capacity_(),
-      rmt_tile_buffer_capacity_(), owned_atom_count_(),
-      sr_source_cell_capacity_(), idx_(), sorted_idx_(), rx_(), ry_(), rz_(),
-      qc_(), packets_(), sorted_packets_(), atom_cell_idx_(),
-      atom_cell_sorted_idx_(), fx_(), fy_(), fz_(), en_(), cell_atom_point_(),
-      cell_atom_count_(), max_atoms_cell_(), sr_source_cell_atom_point_(),
-      sr_source_cell_atom_count_(), sf_re_(), sf_im_(), sf_exchange_re_(),
-      sf_exchange_im_(), rmt_sum_re_(), rmt_sum_im_(), cub_work_buffer_(),
-      cub_work_buffer_size_() {}
+      rmt_tile_buffer_capacity_(), prefix_partition_total_buffer_capacity_(),
+      prefix_base_buffer_capacity_(), prefix_plane_slot_capacity_(),
+      owned_atom_count_(), sr_source_cell_capacity_(), idx_(), sorted_idx_(),
+      rx_(), ry_(), rz_(), qc_(), packets_(), sorted_packets_(),
+      atom_cell_idx_(), atom_cell_sorted_idx_(), fx_(), fy_(), fz_(), en_(),
+      cell_atom_point_(), cell_atom_count_(), max_atoms_cell_(),
+      sr_source_cell_atom_point_(), sr_source_cell_atom_count_(), sf_re_(),
+      sf_im_(), sf_exchange_re_(), sf_exchange_im_(),
+      prefix_partition_total_re_(), prefix_partition_total_im_(),
+      prefix_base_re_(), prefix_base_im_(), prefix_plane_slot_(), rmt_sum_re_(),
+      rmt_sum_im_(), cub_work_buffer_(), cub_work_buffer_size_() {}
 
 glst_workspace::glst_workspace(const glst_plan &plan, const int device_count)
     : glst_workspace() {
@@ -49,10 +54,11 @@ glst_workspace::glst_workspace(const glst_plan &plan, const int device_count)
 glst_workspace::glst_workspace(
     const glst_plan &plan, const std::vector<unsigned int> &dev_cell_partition,
     const int device_count, const bool use_full_sf_buffer,
+    const bool use_distributed_prefix,
     const unsigned int sf_exchange_chunk_x_count)
     : glst_workspace() {
   this->init(plan, dev_cell_partition, device_count, use_full_sf_buffer,
-             sf_exchange_chunk_x_count);
+             use_distributed_prefix, sf_exchange_chunk_x_count);
 }
 
 glst_workspace::~glst_workspace(void) { this->deallocate_cub(); }
@@ -79,6 +85,15 @@ std::size_t glst_workspace::max_sf_exchange_tile_buffer_capacity(void) const {
 
 std::size_t glst_workspace::max_rmt_tile_buffer_capacity(void) const {
   return this->max_rmt_tile_buffer_capacity_;
+}
+
+std::size_t
+glst_workspace::max_prefix_partition_total_buffer_capacity(void) const {
+  return this->max_prefix_partition_total_buffer_capacity_;
+}
+
+std::size_t glst_workspace::max_prefix_base_buffer_capacity(void) const {
+  return this->max_prefix_base_buffer_capacity_;
 }
 
 std::size_t glst_workspace::atom_capacity(const int dev) const {
@@ -119,6 +134,34 @@ std::size_t glst_workspace::rmt_tile_buffer_capacity(const int dev) const {
       "glst_workspace::rmt_tile_buffer_capacity", "Device index out of range");
 
   return this->rmt_tile_buffer_capacity_[dev];
+}
+
+std::size_t
+glst_workspace::prefix_partition_total_buffer_capacity(const int dev) const {
+  utl::require(static_cast<std::size_t>(dev) <
+                   this->prefix_partition_total_buffer_capacity_.size(),
+               "glst_workspace::prefix_partition_total_buffer_capacity",
+               "Device index out of range");
+
+  return this->prefix_partition_total_buffer_capacity_[dev];
+}
+
+std::size_t glst_workspace::prefix_base_buffer_capacity(const int dev) const {
+  utl::require(static_cast<std::size_t>(dev) <
+                   this->prefix_base_buffer_capacity_.size(),
+               "glst_workspace::prefix_base_buffer_capacity",
+               "Device index out of range");
+
+  return this->prefix_base_buffer_capacity_[dev];
+}
+
+std::size_t glst_workspace::prefix_plane_slot_capacity(const int dev) const {
+  utl::require(static_cast<std::size_t>(dev) <
+                   this->prefix_plane_slot_capacity_.size(),
+               "glst_workspace::prefix_plane_slot_capacity",
+               "Device index out of range");
+
+  return this->prefix_plane_slot_capacity_[dev];
 }
 
 std::size_t glst_workspace::owned_atom_count(const int dev) const {
@@ -250,6 +293,31 @@ glst_workspace::sf_exchange_im(void) const {
 }
 
 const std::vector<cuda_container<double>> &
+glst_workspace::prefix_partition_total_re(void) const {
+  return this->prefix_partition_total_re_;
+}
+
+const std::vector<cuda_container<double>> &
+glst_workspace::prefix_partition_total_im(void) const {
+  return this->prefix_partition_total_im_;
+}
+
+const std::vector<cuda_container<double>> &
+glst_workspace::prefix_base_re(void) const {
+  return this->prefix_base_re_;
+}
+
+const std::vector<cuda_container<double>> &
+glst_workspace::prefix_base_im(void) const {
+  return this->prefix_base_im_;
+}
+
+const std::vector<cuda_container<unsigned int>> &
+glst_workspace::prefix_plane_slot(void) const {
+  return this->prefix_plane_slot_;
+}
+
+const std::vector<cuda_container<double>> &
 glst_workspace::rmt_sum_re(void) const {
   return this->rmt_sum_re_;
 }
@@ -365,6 +433,29 @@ std::vector<cuda_container<double>> &glst_workspace::sf_exchange_im(void) {
   return this->sf_exchange_im_;
 }
 
+std::vector<cuda_container<double>> &
+glst_workspace::prefix_partition_total_re(void) {
+  return this->prefix_partition_total_re_;
+}
+
+std::vector<cuda_container<double>> &
+glst_workspace::prefix_partition_total_im(void) {
+  return this->prefix_partition_total_im_;
+}
+
+std::vector<cuda_container<double>> &glst_workspace::prefix_base_re(void) {
+  return this->prefix_base_re_;
+}
+
+std::vector<cuda_container<double>> &glst_workspace::prefix_base_im(void) {
+  return this->prefix_base_im_;
+}
+
+std::vector<cuda_container<unsigned int>> &
+glst_workspace::prefix_plane_slot(void) {
+  return this->prefix_plane_slot_;
+}
+
 std::vector<cuda_container<double>> &glst_workspace::rmt_sum_re(void) {
   return this->rmt_sum_re_;
 }
@@ -390,7 +481,7 @@ void glst_workspace::init(const glst_plan &plan, const int device_count) {
       dev_cell_partition[dev] = static_cast<unsigned int>(dev);
   }
 
-  this->init(plan, dev_cell_partition, device_count, true, 0);
+  this->init(plan, dev_cell_partition, device_count, true, false, 0);
 
   return;
 }
@@ -398,6 +489,7 @@ void glst_workspace::init(const glst_plan &plan, const int device_count) {
 void glst_workspace::init(const glst_plan &plan,
                           const std::vector<unsigned int> &dev_cell_partition,
                           const int device_count, const bool use_full_sf_buffer,
+                          const bool use_distributed_prefix,
                           const unsigned int sf_exchange_chunk_x_count) {
   constexpr std::string_view function_name = "glst_workspace::init";
 
@@ -420,9 +512,21 @@ void glst_workspace::init(const glst_plan &plan,
 
   utl::require(max_tile_nodes > 0, function_name, "max_tile_nodes is 0");
 
-  std::size_t sf_exchange_capacity = 0;
+  utl::require(
+      !(use_full_sf_buffer && use_distributed_prefix), function_name,
+      "Full SF storage and distributed prefix storage cannot both be selected");
 
-  if ((!use_full_sf_buffer) && (plan.cell_partition_count() > 1)) {
+  const std::size_t yz_cell_count = checked_mul(
+      static_cast<std::size_t>(plan.ncell_y()),
+      static_cast<std::size_t>(plan.ncell_z()), "Prefix plane yz-cell count");
+
+  const std::size_t prefix_plane_capacity =
+      checked_mul(yz_cell_count, max_tile_nodes, "Prefix plane entry capacity");
+
+  std::size_t chunk_sf_exchange_capacity = 0;
+
+  if ((!use_full_sf_buffer) && (!use_distributed_prefix) &&
+      (plan.cell_partition_count() > 1)) {
     utl::require(
         sf_exchange_chunk_x_count > 0, function_name,
         "Local S_tile exchange requires a positive x-plane chunk count");
@@ -430,17 +534,13 @@ void glst_workspace::init(const glst_plan &plan,
     utl::require(sf_exchange_chunk_x_count <= plan.ncell_x(), function_name,
                  "S_tile exchange chunk exceeds ncell_x");
 
-    const std::size_t yz_cell_count =
-        checked_mul(static_cast<std::size_t>(plan.ncell_y()),
-                    static_cast<std::size_t>(plan.ncell_z()),
-                    "S_tile exchange yz-cell count");
-
     const std::size_t sf_exchange_cell_count =
         checked_mul(static_cast<std::size_t>(sf_exchange_chunk_x_count),
                     yz_cell_count, "S_tile exchange buffer capacity");
 
-    sf_exchange_capacity = checked_mul(sf_exchange_cell_count, max_tile_nodes,
-                                       "S_tile exchange tile buffer capacity");
+    chunk_sf_exchange_capacity =
+        checked_mul(sf_exchange_cell_count, max_tile_nodes,
+                    "S_tile exchange tile buffer capacity");
   }
 
   this->max_atom_capacity_ = 0;
@@ -449,12 +549,17 @@ void glst_workspace::init(const glst_plan &plan,
   this->max_sf_tile_buffer_capacity_ = 0;
   this->max_sf_exchange_tile_buffer_capacity_ = 0;
   this->max_rmt_tile_buffer_capacity_ = 0;
+  this->max_prefix_partition_total_buffer_capacity_ = 0;
+  this->max_prefix_base_buffer_capacity_ = 0;
 
   this->atom_capacity_.assign(device_count, 0);
   this->cell_capacity_.assign(device_count, 0);
   this->sf_tile_buffer_capacity_.assign(device_count, 0);
   this->sf_exchange_tile_buffer_capacity_.assign(device_count, 0);
   this->rmt_tile_buffer_capacity_.assign(device_count, 0);
+  this->prefix_partition_total_buffer_capacity_.assign(device_count, 0);
+  this->prefix_base_buffer_capacity_.assign(device_count, 0);
+  this->prefix_plane_slot_capacity_.assign(device_count, 0);
   this->owned_atom_count_.assign(device_count, 0);
   this->sr_source_cell_capacity_.assign(device_count, 0);
 
@@ -501,11 +606,41 @@ void glst_workspace::init(const glst_plan &plan,
     const std::size_t rmt_capacity = checked_mul(
         local_cell_count, max_tile_nodes, "rmt_sum tile buffer capacity");
 
+    std::size_t sf_exchange_capacity = chunk_sf_exchange_capacity;
+
+    std::size_t prefix_partition_total_capacity = 0;
+    std::size_t prefix_base_capacity = 0;
+    std::size_t prefix_plane_slot_capacity = 0;
+
+    if (use_distributed_prefix && (plan.cell_partition_count() > 1)) {
+      const std::size_t imported_plane_capacity = static_cast<std::size_t>(
+          plan.partition_max_prefix_plane_count(cell_partition));
+
+      sf_exchange_capacity =
+          checked_mul(imported_plane_capacity, prefix_plane_capacity,
+                      "Imported prefix-plane buffer capacity");
+
+      prefix_partition_total_capacity = checked_mul(
+          static_cast<std::size_t>(plan.cell_partition_count()),
+          prefix_plane_capacity, "Partition-total prefix buffer capacity");
+
+      prefix_base_capacity = prefix_plane_capacity;
+
+      prefix_plane_slot_capacity =
+          checked_mul(static_cast<std::size_t>(plan.ngroup()),
+                      static_cast<std::size_t>(plan.ncell_x()),
+                      "Prefix-plane slot-map capacity");
+    }
+
     this->atom_capacity_[dev] = local_atom_capacity;
     this->cell_capacity_[dev] = local_cell_count;
     this->sf_tile_buffer_capacity_[dev] = sf_capacity;
     this->sf_exchange_tile_buffer_capacity_[dev] = sf_exchange_capacity;
     this->rmt_tile_buffer_capacity_[dev] = rmt_capacity;
+    this->prefix_partition_total_buffer_capacity_[dev] =
+        prefix_partition_total_capacity;
+    this->prefix_base_buffer_capacity_[dev] = prefix_base_capacity;
+    this->prefix_plane_slot_capacity_[dev] = prefix_plane_slot_capacity;
     this->owned_atom_count_[dev] = local_atom_capacity;
     this->sr_source_cell_capacity_[dev] = sr_source_cell_count;
 
@@ -523,6 +658,15 @@ void glst_workspace::init(const glst_plan &plan,
 
     if (rmt_capacity > this->max_rmt_tile_buffer_capacity_)
       this->max_rmt_tile_buffer_capacity_ = rmt_capacity;
+
+    if (prefix_partition_total_capacity >
+        this->max_prefix_partition_total_buffer_capacity_) {
+      this->max_prefix_partition_total_buffer_capacity_ =
+          prefix_partition_total_capacity;
+    }
+
+    if (prefix_base_capacity > this->max_prefix_base_buffer_capacity_)
+      this->max_prefix_base_buffer_capacity_ = prefix_base_capacity;
   }
 
   this->idx_.resize(device_count);
@@ -551,6 +695,11 @@ void glst_workspace::init(const glst_plan &plan,
   this->sf_im_.resize(device_count);
   this->sf_exchange_re_.resize(device_count);
   this->sf_exchange_im_.resize(device_count);
+  this->prefix_partition_total_re_.resize(device_count);
+  this->prefix_partition_total_im_.resize(device_count);
+  this->prefix_base_re_.resize(device_count);
+  this->prefix_base_im_.resize(device_count);
+  this->prefix_plane_slot_.resize(device_count);
   this->rmt_sum_re_.resize(device_count);
   this->rmt_sum_im_.resize(device_count);
 
@@ -588,6 +737,21 @@ void glst_workspace::init(const glst_plan &plan,
         this->sf_exchange_tile_buffer_capacity_[dev]);
     this->sf_exchange_im_[dev].resize(
         this->sf_exchange_tile_buffer_capacity_[dev]);
+
+    this->prefix_partition_total_re_[dev].resize(
+        this->prefix_partition_total_buffer_capacity_[dev]);
+    this->prefix_partition_total_im_[dev].resize(
+        this->prefix_partition_total_buffer_capacity_[dev]);
+
+    this->prefix_base_re_[dev].resize(this->prefix_base_buffer_capacity_[dev]);
+    this->prefix_base_im_[dev].resize(this->prefix_base_buffer_capacity_[dev]);
+
+    if (this->prefix_plane_slot_capacity_[dev] > 0) {
+      const unsigned int cell_partition = dev_cell_partition[dev];
+      this->prefix_plane_slot_[dev] =
+          plan.partition_prefix_slot_by_group_x(cell_partition);
+    } else
+      this->prefix_plane_slot_[dev].clear();
 
     this->rmt_sum_re_[dev].resize(this->rmt_tile_buffer_capacity_[dev]);
     this->rmt_sum_im_[dev].resize(this->rmt_tile_buffer_capacity_[dev]);
@@ -664,12 +828,17 @@ void glst_workspace::clear(void) {
   this->max_sf_tile_buffer_capacity_ = 0;
   this->max_sf_exchange_tile_buffer_capacity_ = 0;
   this->max_rmt_tile_buffer_capacity_ = 0;
+  this->max_prefix_partition_total_buffer_capacity_ = 0;
+  this->max_prefix_base_buffer_capacity_ = 0;
 
   this->atom_capacity_.clear();
   this->cell_capacity_.clear();
   this->sf_tile_buffer_capacity_.clear();
   this->sf_exchange_tile_buffer_capacity_.clear();
   this->rmt_tile_buffer_capacity_.clear();
+  this->prefix_partition_total_buffer_capacity_.clear();
+  this->prefix_base_buffer_capacity_.clear();
+  this->prefix_plane_slot_capacity_.clear();
   this->owned_atom_count_.clear();
   this->sr_source_cell_capacity_.clear();
 
@@ -699,6 +868,11 @@ void glst_workspace::clear(void) {
   this->sf_im_.clear();
   this->sf_exchange_re_.clear();
   this->sf_exchange_im_.clear();
+  this->prefix_partition_total_re_.clear();
+  this->prefix_partition_total_im_.clear();
+  this->prefix_base_re_.clear();
+  this->prefix_base_im_.clear();
+  this->prefix_plane_slot_.clear();
   this->rmt_sum_re_.clear();
   this->rmt_sum_im_.clear();
 

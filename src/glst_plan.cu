@@ -14,6 +14,7 @@
 #include "error_utils.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <iostream>
@@ -59,7 +60,9 @@ glst_plan::glst_plan(void)
       cell_partition_x_point_(), cell_partition_x_count_(),
       partition_cell_idx_(), partition_left_halo_cell_idx_(),
       partition_right_halo_cell_idx_(), partition_halo_cell_idx_(),
-      partition_sr_source_cell_idx_() {}
+      partition_sr_source_cell_idx_(), partition_group_prefix_x_(),
+      partition_prefix_slot_by_group_x_(), partition_max_prefix_plane_count_() {
+}
 
 glst_plan::~glst_plan(void) {}
 
@@ -279,6 +282,39 @@ unsigned int
 glst_plan::local_cell_count(const unsigned int cell_partition) const {
   return static_cast<unsigned int>(
       this->partition_cell_idx(cell_partition).size());
+}
+
+const std::vector<unsigned int> &
+glst_plan::partition_group_prefix_x(const unsigned int cell_partition,
+                                    const unsigned int group) const {
+  constexpr std::string_view function_name =
+      "glst_plan::partition_group_prefix_x";
+
+  utl::require(cell_partition < this->cell_partition_count_, function_name,
+               "Cell partition index out of range");
+
+  utl::require(group < this->ngroup_, function_name,
+               "Alpha-group index out of range");
+
+  return this->partition_group_prefix_x_[cell_partition][group];
+}
+
+const std::vector<unsigned int> &glst_plan::partition_prefix_slot_by_group_x(
+    const unsigned int cell_partition) const {
+  utl::require(cell_partition < this->cell_partition_count_,
+               "glst_plan::partition_prefix_slot_by_group_x",
+               "Cell partition index out of range");
+
+  return this->partition_prefix_slot_by_group_x_[cell_partition];
+}
+
+unsigned int glst_plan::partition_max_prefix_plane_count(
+    const unsigned int cell_partition) const {
+  utl::require(cell_partition < this->cell_partition_count_,
+               "glst_plan::partition_max_prefix_plane_count",
+               "Cell partition index out of range");
+
+  return this->partition_max_prefix_plane_count_[cell_partition];
 }
 
 const std::vector<std::vector<unsigned int>> &
@@ -532,6 +568,8 @@ void glst_plan::init_alpha_groups(const double tol) {
     this->grp_r_out_[dev] = grp_r_out;
   }
 
+  this->init_distributed_prefix_plan();
+
   return;
 }
 
@@ -694,6 +732,9 @@ void glst_plan::init_cell_partitions(const unsigned int cell_partition_count) {
   }
 
   this->init_short_range_halo_plan();
+
+  if (this->ngroup_ > 0)
+    this->init_distributed_prefix_plan();
 
   return;
 }
@@ -1123,6 +1164,167 @@ void glst_plan::validate(void) const {
     }
   }
 
+  const unsigned int invalid_slot = std::numeric_limits<unsigned int>::max();
+
+  utl::require(this->partition_group_prefix_x_.size() ==
+                   static_cast<std::size_t>(this->cell_partition_count_),
+               function_name,
+               "Distributed-prefix group metadata size does not match cell "
+               "partition count");
+
+  utl::require(this->partition_prefix_slot_by_group_x_.size() ==
+                   static_cast<std::size_t>(this->cell_partition_count_),
+               function_name,
+               "Distributed-prefix slot metadata size does not match cell "
+               "partition count");
+
+  utl::require(this->partition_max_prefix_plane_count_.size() ==
+                   static_cast<std::size_t>(this->cell_partition_count_),
+               function_name,
+               "Distributed-prefix maximum-count metadata size does not match "
+               "cell partition count");
+
+  const std::size_t expected_slot_count =
+      static_cast<std::size_t>(this->ngroup_) *
+      static_cast<std::size_t>(this->ncell_x_);
+
+  for (unsigned int cell_partition = 0;
+       cell_partition < this->cell_partition_count_; cell_partition++) {
+    utl::require(this->partition_group_prefix_x_[cell_partition].size() ==
+                     static_cast<std::size_t>(this->ngroup_),
+                 function_name,
+                 "Distributed-prefix group does not match ngroup");
+
+    const std::vector<unsigned int> &slot_map =
+        this->partition_prefix_slot_by_group_x_[cell_partition];
+
+    utl::require(slot_map.size() == expected_slot_count, function_name,
+                 "Distributed-prefix slot-map size is incorrect");
+
+    const unsigned int x_point = this->cell_partition_x_point_[cell_partition];
+    const unsigned int x_count = this->cell_partition_x_count_[cell_partition];
+
+    unsigned int observed_max_plane_count = 0;
+
+    for (unsigned int group = 0; group < this->ngroup_; group++) {
+      const std::vector<unsigned int> &prefix_x =
+          this->partition_group_prefix_x_[cell_partition][group];
+
+      utl::require(
+          prefix_x.size() <= static_cast<std::size_t>(
+                                 std::numeric_limits<unsigned int>::max()),
+          function_name, "Distributed-prefix group contains too many planes");
+
+      if (prefix_x.size() >
+          static_cast<std::size_t>(observed_max_plane_count)) {
+        observed_max_plane_count = static_cast<unsigned int>(prefix_x.size());
+      }
+
+      for (std::size_t slot = 0; slot < prefix_x.size(); slot++) {
+        const unsigned int global_x = prefix_x[slot];
+
+        utl::require(global_x < this->ncell_x_, function_name,
+                     "Imported prefix x-plane is out of range");
+
+        if (slot > 0) {
+          utl::require(prefix_x[slot] > prefix_x[slot - 1], function_name,
+                       "Imported prefix x-planes are not strictly ordered");
+        }
+
+        const std::size_t representative_cell =
+            static_cast<std::size_t>(global_x) *
+            static_cast<std::size_t>(this->ncell_y_) *
+            static_cast<std::size_t>(this->ncell_z_);
+
+        utl::require(this->cell_partition_idx_[representative_cell] !=
+                         cell_partition,
+                     function_name, "Imported x-plane is locally owned");
+
+        const std::size_t map_index =
+            static_cast<std::size_t>(group) *
+                static_cast<std::size_t>(this->ncell_x_) +
+            static_cast<std::size_t>(global_x);
+
+        utl::require(slot_map[map_index] == static_cast<unsigned int>(slot),
+                     function_name,
+                     "Imported prefix x-plane has the wrong slot");
+      }
+
+      for (unsigned int global_x = 0; global_x < this->ncell_x_; global_x++) {
+        const std::size_t map_index =
+            static_cast<std::size_t>(group) *
+                static_cast<std::size_t>(this->ncell_x_) +
+            static_cast<std::size_t>(global_x);
+
+        const unsigned int slot = slot_map[map_index];
+
+        if (slot == invalid_slot)
+          continue;
+
+        utl::require(static_cast<std::size_t>(slot) < prefix_x.size(),
+                     function_name, "Distributed-prefix slot is out of range");
+
+        utl::require(prefix_x[slot] == global_x, function_name,
+                     "Distributed-prefix slot points to the wrong x-plane");
+      }
+
+      const unsigned int inner = this->grp_r_in_[0][group];
+      const unsigned int outer = this->grp_r_out_[0][group];
+
+      for (unsigned int local_x = 0; local_x < x_count; local_x++) {
+        const unsigned int x = x_point + local_x;
+        const unsigned int max_right = this->ncell_x_ - 1u - x;
+
+        std::array<unsigned int, 4> candidate = {0u, 0u, 0u, 0u};
+        unsigned int candidate_count = 0;
+
+        candidate[candidate_count++] = x + std::min(outer, max_right);
+        if (x > outer)
+          candidate[candidate_count++] = x - outer - 1u;
+
+        candidate[candidate_count++] = x + std::min(inner, max_right);
+        if (x > inner)
+          candidate[candidate_count++] = x - inner - 1u;
+
+        for (unsigned int i = 0; i < candidate_count; i++) {
+          const unsigned int global_x = candidate[i];
+
+          const unsigned int representative_cell =
+              global_x * this->ncell_y_ * this->ncell_z_;
+          const unsigned int owner =
+              this->cell_partition_idx_[representative_cell];
+
+          const std::size_t map_index =
+              static_cast<std::size_t>(group) *
+                  static_cast<std::size_t>(this->ncell_x_) +
+              static_cast<std::size_t>(global_x);
+
+          const unsigned int slot = slot_map[map_index];
+
+          if (owner == cell_partition) {
+            utl::require(slot == invalid_slot, function_name,
+                         "Locally owned prefix x-plane has an import slot");
+          } else {
+            utl::require(slot != invalid_slot, function_name,
+                         "Required remote prefix x-plane has no import slot");
+
+            utl::require(static_cast<std::size_t>(slot) < prefix_x.size(),
+                         function_name,
+                         "Required remote prefix x-plane slot is out of range");
+
+            utl::require(prefix_x[slot] == global_x, function_name,
+                         "Required remote prefix x-plane slot is incorrect");
+          }
+        }
+      }
+    }
+
+    utl::require(observed_max_plane_count ==
+                     this->partition_max_prefix_plane_count_[cell_partition],
+                 function_name,
+                 "Maximum imported prefix-plane count is inconsistent");
+  }
+
   return;
 }
 
@@ -1145,6 +1347,21 @@ void glst_plan::print_tile_diagnostics(std::ostream &os) const {
     os << "        Number of tiles in tile partition " << partition << ": "
        << this->partition_tile_idx_[partition].size() << " ("
        << this->partition_tile_node_count_[partition] << " nodes)" << std::endl;
+  }
+
+  os << "      Distributed prefix schedule:" << std::endl;
+
+  for (unsigned int cell_partition = 0;
+       cell_partition < this->cell_partition_count_; cell_partition++) {
+    os << "        Cell partition " << cell_partition
+       << ": Maximum imported x-planes "
+       << this->partition_max_prefix_plane_count_[cell_partition] << std::endl;
+
+    for (unsigned int group = 0; group < this->ngroup_; group++) {
+      os << "          Group " << group << ": "
+         << this->partition_group_prefix_x_[cell_partition][group].size()
+         << " imported x-planes" << std::endl;
+    }
   }
 
   return;
@@ -1212,6 +1429,141 @@ void glst_plan::init_short_range_halo_plan(void) {
                         owned_cells.end());
     source_cells.insert(source_cells.end(), halo_cells.begin(),
                         halo_cells.end());
+  }
+
+  return;
+}
+
+void glst_plan::init_distributed_prefix_plan(void) {
+  constexpr std::string_view function_name =
+      "glst_plan::init_distributed_prefix_plan";
+
+  const unsigned int invalid_slot = std::numeric_limits<unsigned int>::max();
+
+  const std::size_t slot_count = static_cast<std::size_t>(this->ngroup_) *
+                                 static_cast<std::size_t>(this->ncell_x_);
+
+  if (this->ncell_x_ > 0) {
+    utl::require(slot_count / static_cast<std::size_t>(this->ncell_x_) ==
+                     static_cast<std::size_t>(this->ngroup_),
+                 function_name, "Prefix-plane slot-map size overflow");
+  }
+
+  this->partition_group_prefix_x_.assign(
+      this->cell_partition_count_,
+      std::vector<std::vector<unsigned int>>(this->ngroup_));
+
+  this->partition_prefix_slot_by_group_x_.assign(
+      this->cell_partition_count_,
+      std::vector<unsigned int>(slot_count, invalid_slot));
+
+  this->partition_max_prefix_plane_count_.assign(this->cell_partition_count_,
+                                                 0u);
+
+  if (this->ngroup_ == 0)
+    return;
+
+  utl::require(!this->grp_r_in_.empty(), function_name,
+               "Inner alpha-group radii are not initialized");
+
+  utl::require(!this->grp_r_out_.empty(), function_name,
+               "Outer alpha-group radii are not initialized");
+
+  utl::require(
+      this->grp_r_in_[0].size() == static_cast<std::size_t>(this->ngroup_),
+      function_name, "Inner alpha-group radius count does not match ngroup");
+
+  utl::require(
+      this->grp_r_out_[0].size() == static_cast<std::size_t>(this->ngroup_),
+      function_name, "Outer alpha-group radius count does not match ngroup");
+
+  const std::size_t yz_cell_count = static_cast<std::size_t>(this->ncell_y_) *
+                                    static_cast<std::size_t>(this->ncell_z_);
+
+  utl::require(yz_cell_count > 0, function_name,
+               "Prefix plane has zero yz-cell count");
+
+  for (unsigned int cell_partition = 0;
+       cell_partition < this->cell_partition_count_; cell_partition++) {
+    const unsigned int x_point = this->cell_partition_x_point_[cell_partition];
+    const unsigned int x_count = this->cell_partition_x_count_[cell_partition];
+
+    for (unsigned int group = 0; group < this->ngroup_; group++) {
+      const unsigned int inner = this->grp_r_in_[0][group];
+      const unsigned int outer = this->grp_r_out_[0][group];
+
+      std::vector<unsigned int> &prefix_x =
+          this->partition_group_prefix_x_[cell_partition][group];
+
+      for (unsigned int local_x = 0; local_x < x_count; local_x++) {
+        const unsigned int x = x_point + local_x;
+        const unsigned int max_right = this->ncell_x_ - 1u - x;
+
+        std::array<unsigned int, 4> candidate = {0u, 0u, 0u, 0u};
+        unsigned int candidate_count = 0;
+
+        candidate[candidate_count++] = x + std::min(outer, max_right);
+        if (x > outer)
+          candidate[candidate_count++] = x - outer - 1u;
+
+        candidate[candidate_count++] = x + std::min(inner, max_right);
+        if (x > inner)
+          candidate[candidate_count++] = x - inner - 1u;
+
+        for (unsigned int i = 0; i < candidate_count; i++) {
+          const unsigned int prefix_plane_x = candidate[i];
+
+          utl::require(prefix_plane_x < this->ncell_x_, function_name,
+                       "Required prefix x-plane is out of range");
+
+          const std::size_t representative_cell =
+              static_cast<std::size_t>(prefix_plane_x) * yz_cell_count;
+
+          utl::require(representative_cell < this->cell_partition_idx_.size(),
+                       function_name,
+                       "Required prefix x-plane has no cell owner");
+
+          const unsigned int owner =
+              this->cell_partition_idx_[representative_cell];
+
+          if (owner != cell_partition)
+            prefix_x.push_back(prefix_plane_x);
+        }
+      }
+
+      std::sort(prefix_x.begin(), prefix_x.end());
+
+      prefix_x.erase(std::unique(prefix_x.begin(), prefix_x.end()),
+                     prefix_x.end());
+
+      utl::require(prefix_x.size() <=
+                       static_cast<std::size_t>(
+                           std::numeric_limits<unsigned int>::max()),
+                   function_name,
+                   "Imported prefix-plane count exceeds unsigned int range");
+
+      std::vector<unsigned int> &slot_map =
+          this->partition_prefix_slot_by_group_x_[cell_partition];
+
+      for (std::size_t slot = 0; slot < prefix_x.size(); slot++) {
+        const unsigned int global_x = prefix_x[slot];
+
+        const std::size_t map_index =
+            static_cast<std::size_t>(group) *
+                static_cast<std::size_t>(this->ncell_x_) +
+            static_cast<std::size_t>(global_x);
+
+        slot_map[map_index] = static_cast<unsigned int>(slot);
+      }
+
+      const unsigned int plane_count =
+          static_cast<unsigned int>(prefix_x.size());
+
+      if (plane_count >
+          this->partition_max_prefix_plane_count_[cell_partition]) {
+        this->partition_max_prefix_plane_count_[cell_partition] = plane_count;
+      }
+    }
   }
 
   return;

@@ -33,7 +33,8 @@ enum class GLST_EXECUTION_MODE {
 
 enum class GLST_SF_EXCHANGE_MODE {
   LOCAL_CHUNK_BROADCAST,
-  FULL_GLOBAL_ALLREDUCE
+  FULL_GLOBAL_ALLREDUCE,
+  DISTRIBUTED_PREFIX
 };
 
 struct glst_profile {
@@ -52,6 +53,9 @@ struct glst_profile {
   double instrumented_compute_ms = 0.0;
 
   std::size_t sf_collective_input_bytes = 0;
+  std::size_t prefix_base_input_bytes = 0;
+  std::size_t prefix_plane_input_bytes = 0;
+  std::size_t prefix_plane_import_count = 0;
   std::size_t owned_atom_replicas = 0;
   std::size_t halo_atom_replicas = 0;
 };
@@ -125,6 +129,8 @@ private:
                              const unsigned int source_partition,
                              const unsigned int source_x_offset,
                              const unsigned int chunk_x_count);
+  void build_distributed_prefix_tile(const unsigned int tile);
+  void sum_rmt_sf_prefix_tile(const unsigned int tile);
   void build_rmt_sum_tile(const unsigned int tile);
 
   void calc_lr_ef_tile(const unsigned int tile);

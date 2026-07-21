@@ -368,9 +368,13 @@ void glst_force::init(const unsigned int natom, const double tol,
   const bool use_full_sf_buffer =
       (this->sf_exchange_mode_ == GLST_SF_EXCHANGE_MODE::FULL_GLOBAL_ALLREDUCE);
 
+  const bool use_distributed_prefix =
+      (this->sf_exchange_mode_ == GLST_SF_EXCHANGE_MODE::DISTRIBUTED_PREFIX);
+
   this->workspace_ = std::make_unique<glst_workspace>(
       *(this->plan_), this->dev_cell_partition_, this->cuda_count_,
-      use_full_sf_buffer, this->sf_exchange_chunk_x_count_);
+      use_full_sf_buffer, use_distributed_prefix,
+      this->sf_exchange_chunk_x_count_);
 
   for (int dev = 0; dev < this->cuda_count_; dev++) {
     cudaCheck(cudaSetDevice(dev));
@@ -464,6 +468,9 @@ void glst_force::init(const unsigned int natom, const double tol,
   std::string_view sf_exchange_mode_name = "UNKNOWN";
 
   switch (this->sf_exchange_mode_) {
+  case GLST_SF_EXCHANGE_MODE::DISTRIBUTED_PREFIX:
+    sf_exchange_mode_name = "DISTRIBUTED_PREFIX";
+    break;
   case GLST_SF_EXCHANGE_MODE::LOCAL_CHUNK_BROADCAST:
     sf_exchange_mode_name = "LOCAL_CHUNK_BROADCAST";
     break;
@@ -540,6 +547,12 @@ void glst_force::init(const unsigned int natom, const double tol,
         this->workspace_->sf_exchange_tile_buffer_capacity(dev);
     const std::size_t rmt_capacity =
         this->workspace_->rmt_tile_buffer_capacity(dev);
+    const std::size_t prefix_partition_total_capacity =
+        this->workspace_->prefix_partition_total_buffer_capacity(dev);
+    const std::size_t prefix_base_capacity =
+        this->workspace_->prefix_base_buffer_capacity(dev);
+    const std::size_t prefix_slot_capacity =
+        this->workspace_->prefix_plane_slot_capacity(dev);
 
     const double sf_mib =
         static_cast<double>(2 * sf_capacity * sizeof(double)) /
@@ -550,12 +563,31 @@ void glst_force::init(const unsigned int natom, const double tol,
     const double rmt_mib =
         static_cast<double>(2 * rmt_capacity * sizeof(double)) /
         (1024.0 * 1024.0);
+    const double prefix_partition_total_mib =
+        static_cast<double>(2 * prefix_partition_total_capacity *
+                            sizeof(double)) /
+        (1024.0 * 1024.0);
+    const double prefix_base_mib =
+        static_cast<double>(2 * prefix_base_capacity * sizeof(double)) /
+        (1024.0 * 1024.0);
+    const double prefix_slot_mib =
+        static_cast<double>(prefix_slot_capacity * sizeof(unsigned int)) /
+        (1024.0 * 1024.0);
 
     std::cout << "    GPU " << dev << ": atom capacity " << atom_capacity
-              << ", local cells " << cell_capacity << ", local sf entries "
-              << sf_capacity << " (" << sf_mib << " MiB), sf exchange entries "
-              << sf_exchange_capacity << " (" << sf_exchange_mib
-              << " MiB), rmt tile entries " << rmt_capacity << " (" << rmt_mib
+              << ", local cells " << cell_capacity << std::endl;
+    std::cout << "      local sf entries " << sf_capacity << " (" << sf_mib
+              << " MiB)"
+              << ", exchange entries " << sf_exchange_capacity << " ("
+              << sf_exchange_mib << " MiB)" << std::endl;
+    std::cout << "      prefix partition-total entries "
+              << prefix_partition_total_capacity << " ("
+              << prefix_partition_total_mib << " MiB)"
+              << ", prefix base entries " << prefix_base_capacity << " ("
+              << prefix_base_mib << " MiB)" << std::endl;
+    std::cout << "      prefix slot entries " << prefix_slot_capacity << " ("
+              << prefix_slot_mib << " MiB)"
+              << ", rmt tile entries " << rmt_capacity << " (" << rmt_mib
               << " MiB)" << std::endl;
   }
 
@@ -1004,9 +1036,10 @@ void glst_force::calc_ener_force(const double *d_rx, const double *d_ry,
     this->profile_.calc_sf_ms += profile_elapsed_ms(phase_start, phase_end);
 
     // build_rmt_sum_tile owns:
-    // - Full-buffer all-reduce timing and byte accounting in fallback mode
-    // - Chunk broadcast timing and byte accounting in local mode
-    // - Full or chunked remote-sum timing
+    // - Full-buffer all-reduce timing and byte accounting
+    // - Local chunk-broadcast timing and byte accounting
+    // - Distributed-prefix timing and byte accounting
+    // - Remote-sum timing and byte accounting
     this->build_rmt_sum_tile(tile);
 
     phase_start = std::chrono::steady_clock::now();
@@ -1973,8 +2006,8 @@ void glst_force::exchange_sf_tile(const unsigned int tile) {
   utl::require(this->sf_exchange_mode_ ==
                    GLST_SF_EXCHANGE_MODE::FULL_GLOBAL_ALLREDUCE,
                function_name,
-               "Full global S_tile exchange called while local chunk exchange "
-               "is selected");
+               "Full global S_tile exchange called while FULL_GLOBAL_ALLREDUCE "
+               "is not selected");
 
   const unsigned int tile_partition = this->plan_->tile_partition_idx(tile);
 
@@ -2233,10 +2266,13 @@ calc_prefix_sum_z_kernel(double *__restrict__ sf_re, double *__restrict__ sf_im,
   double sum_re = 0.0, sum_im = 0.0;
   for (unsigned int z = 0; z < nz; z++) {
     const unsigned int cell = (x * ny + y) * nz + z;
-    sum_re += sf_re[cell * nc + idx];
-    sum_im += sf_im[cell * nc + idx];
-    sf_re[cell * nc + idx] = sum_re;
-    sf_im[cell * nc + idx] = sum_im;
+    const std::size_t point =
+        static_cast<std::size_t>(cell) * static_cast<std::size_t>(nc) +
+        static_cast<std::size_t>(idx);
+    sum_re += sf_re[point];
+    sum_im += sf_im[point];
+    sf_re[point] = sum_re;
+    sf_im[point] = sum_im;
   }
 
   return;
@@ -2256,10 +2292,13 @@ calc_prefix_sum_y_kernel(double *__restrict__ sf_re, double *__restrict__ sf_im,
   double sum_re = 0.0, sum_im = 0.0;
   for (unsigned int y = 0; y < ny; y++) {
     const unsigned int cell = (x * ny + y) * nz + z;
-    sum_re += sf_re[cell * nc + idx];
-    sum_im += sf_im[cell * nc + idx];
-    sf_re[cell * nc + idx] = sum_re;
-    sf_im[cell * nc + idx] = sum_im;
+    const std::size_t point =
+        static_cast<std::size_t>(cell) * static_cast<std::size_t>(nc) +
+        static_cast<std::size_t>(idx);
+    sum_re += sf_re[point];
+    sum_im += sf_im[point];
+    sf_re[point] = sum_re;
+    sf_im[point] = sum_im;
   }
 
   return;
@@ -2279,10 +2318,72 @@ calc_prefix_sum_x_kernel(double *__restrict__ sf_re, double *__restrict__ sf_im,
   double sum_re = 0.0, sum_im = 0.0;
   for (unsigned int x = 0; x < nx; x++) {
     const unsigned int cell = (x * ny + y) * nz + z;
-    sum_re += sf_re[cell * nc + idx];
-    sum_im += sf_im[cell * nc + idx];
-    sf_re[cell * nc + idx] = sum_re;
-    sf_im[cell * nc + idx] = sum_im;
+    const std::size_t point =
+        static_cast<std::size_t>(cell) * static_cast<std::size_t>(nc) +
+        static_cast<std::size_t>(idx);
+    sum_re += sf_re[point];
+    sum_im += sf_im[point];
+    sf_re[point] = sum_re;
+    sf_im[point] = sum_im;
+  }
+
+  return;
+}
+
+__global__ static void calc_prefix_base_kernel(
+    double *__restrict__ prefix_base_re, double *__restrict__ prefix_base_im,
+    const double *__restrict__ partition_total_re,
+    const double *__restrict__ partition_total_im,
+    const std::size_t plane_entry_count, const unsigned int cell_partition) {
+  const std::size_t idx = static_cast<std::size_t>(blockIdx.x) *
+                              static_cast<std::size_t>(blockDim.x) +
+                          static_cast<std::size_t>(threadIdx.x);
+  const std::size_t stride = static_cast<std::size_t>(blockDim.x) *
+                             static_cast<std::size_t>(gridDim.x);
+
+  for (std::size_t i = idx; i < plane_entry_count; i += stride) {
+    double base_re = 0.0;
+    double base_im = 0.0;
+
+    for (unsigned int source_partition = 0; source_partition < cell_partition;
+         source_partition++) {
+      const std::size_t source =
+          static_cast<std::size_t>(source_partition) * plane_entry_count + i;
+
+      base_re += partition_total_re[source];
+      base_im += partition_total_im[source];
+    }
+
+    prefix_base_re[i] = base_re;
+    prefix_base_im[i] = base_im;
+  }
+
+  return;
+}
+
+__global__ static void
+add_prefix_base_kernel(double *__restrict__ sf_re, double *__restrict__ sf_im,
+                       const double *__restrict__ prefix_base_re,
+                       const double *__restrict__ prefix_base_im,
+                       const unsigned int nc, const unsigned int yz_cell_count,
+                       const unsigned int local_cell_count) {
+  const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+  if (idx >= nc)
+    return;
+
+  for (unsigned int local_cell = blockIdx.y; local_cell < local_cell_count;
+       local_cell += gridDim.y) {
+    const unsigned int yz_cell = local_cell % yz_cell_count;
+    const std::size_t local_point =
+        static_cast<std::size_t>(local_cell) * static_cast<std::size_t>(nc) +
+        static_cast<std::size_t>(idx);
+    const std::size_t base_point =
+        static_cast<std::size_t>(yz_cell) * static_cast<std::size_t>(nc) +
+        static_cast<std::size_t>(idx);
+
+    sf_re[local_point] += prefix_base_re[base_point];
+    sf_im[local_point] += prefix_base_im[base_point];
   }
 
   return;
@@ -2412,6 +2513,217 @@ shell_sum(double &shell_re, double &shell_im, const double *__restrict__ P_re,
   return;
 }
 
+__device__ __forceinline__ static void
+distributed_prefix_value(double &value_re, double &value_im,
+                         const double *__restrict__ local_prefix_re,
+                         const double *__restrict__ local_prefix_im,
+                         const double *__restrict__ remote_prefix_re,
+                         const double *__restrict__ remote_prefix_im,
+                         const unsigned int *__restrict__ remote_slot_by_x,
+                         const unsigned int global_x, const unsigned int y,
+                         const unsigned int z, const unsigned int local_x_point,
+                         const unsigned int local_x_count,
+                         const unsigned int ny, const unsigned int nz,
+                         const unsigned int idx, const unsigned int nc) {
+  constexpr unsigned int invalid_slot =
+      ~0u; // Device-safe invalid-slot sentinel
+
+  value_re = 0.0;
+  value_im = 0.0;
+
+  const unsigned int local_x_end = local_x_point + local_x_count;
+
+  if ((global_x >= local_x_point) && (global_x < local_x_end)) {
+    const unsigned int local_x = global_x - local_x_point;
+    const std::size_t local_cell =
+        (static_cast<std::size_t>(local_x) * static_cast<std::size_t>(ny) +
+         static_cast<std::size_t>(y)) *
+            static_cast<std::size_t>(nz) +
+        static_cast<std::size_t>(z);
+    const std::size_t point =
+        static_cast<std::size_t>(local_cell) * static_cast<std::size_t>(nc) +
+        static_cast<std::size_t>(idx);
+
+    value_re = local_prefix_re[point];
+    value_im = local_prefix_im[point];
+
+    return;
+  }
+
+  const unsigned int slot = remote_slot_by_x[global_x];
+
+  if (slot == invalid_slot)
+    return;
+
+  const std::size_t remote_cell =
+      (static_cast<std::size_t>(slot) * static_cast<std::size_t>(ny) +
+       static_cast<std::size_t>(y)) *
+          static_cast<std::size_t>(nz) +
+      static_cast<std::size_t>(z);
+  const std::size_t point =
+      static_cast<std::size_t>(remote_cell) * static_cast<std::size_t>(nc) +
+      static_cast<std::size_t>(idx);
+
+  value_re = remote_prefix_re[point];
+  value_im = remote_prefix_im[point];
+
+  return;
+}
+
+__device__ __forceinline__ static void distributed_box_sum(
+    double &box_re, double &box_im, const double *__restrict__ local_prefix_re,
+    const double *__restrict__ local_prefix_im,
+    const double *__restrict__ remote_prefix_re,
+    const double *__restrict__ remote_prefix_im,
+    const unsigned int *__restrict__ remote_slot_by_x, const unsigned int x0,
+    const unsigned int y0, const unsigned int z0, const unsigned int x1,
+    const unsigned int y1, const unsigned int z1,
+    const unsigned int local_x_point, const unsigned int local_x_count,
+    const unsigned int ny, const unsigned int nz, const unsigned int idx,
+    const unsigned int nc) {
+  const bool xb = (x0 == 0);
+  const bool yb = (y0 == 0);
+  const bool zb = (z0 == 0);
+
+  const unsigned int xm = (xb) ? 0u : x0 - 1u;
+  const unsigned int ym = (yb) ? 0u : y0 - 1u;
+  const unsigned int zm = (zb) ? 0u : z0 - 1u;
+
+  double g0_re = 0.0, g0_im = 0.0;
+  double g1_re = 0.0, g1_im = 0.0;
+  double g2_re = 0.0, g2_im = 0.0;
+  double g3_re = 0.0, g3_im = 0.0;
+  double g4_re = 0.0, g4_im = 0.0;
+  double g5_re = 0.0, g5_im = 0.0;
+  double g6_re = 0.0, g6_im = 0.0;
+  double g7_re = 0.0, g7_im = 0.0;
+
+  // (x1, y1, z1) | Include
+  distributed_prefix_value(g0_re, g0_im, local_prefix_re, local_prefix_im,
+                           remote_prefix_re, remote_prefix_im, remote_slot_by_x,
+                           x1, y1, z1, local_x_point, local_x_count, ny, nz,
+                           idx, nc);
+
+  if (!xb) { // (x0 - 1, y1, z1) | Exclude
+    distributed_prefix_value(g1_re, g1_im, local_prefix_re, local_prefix_im,
+                             remote_prefix_re, remote_prefix_im,
+                             remote_slot_by_x, xm, y1, z1, local_x_point,
+                             local_x_count, ny, nz, idx, nc);
+  }
+
+  if (!yb) { // (x1, y0 - 1, z1) | Exclude
+    distributed_prefix_value(g2_re, g2_im, local_prefix_re, local_prefix_im,
+                             remote_prefix_re, remote_prefix_im,
+                             remote_slot_by_x, x1, ym, z1, local_x_point,
+                             local_x_count, ny, nz, idx, nc);
+  }
+
+  if (!zb) { // (x1, y1, z0 - 1) | Exclude
+    distributed_prefix_value(g3_re, g3_im, local_prefix_re, local_prefix_im,
+                             remote_prefix_re, remote_prefix_im,
+                             remote_slot_by_x, x1, y1, zm, local_x_point,
+                             local_x_count, ny, nz, idx, nc);
+  }
+
+  if (!xb && !yb) { // (x0 - 1, y0 - 1, z1) | Include
+    distributed_prefix_value(g4_re, g4_im, local_prefix_re, local_prefix_im,
+                             remote_prefix_re, remote_prefix_im,
+                             remote_slot_by_x, xm, ym, z1, local_x_point,
+                             local_x_count, ny, nz, idx, nc);
+  }
+
+  if (!xb && !zb) { // (x0 - 1, y1, z0 - 1) | Include
+    distributed_prefix_value(g5_re, g5_im, local_prefix_re, local_prefix_im,
+                             remote_prefix_re, remote_prefix_im,
+                             remote_slot_by_x, xm, y1, zm, local_x_point,
+                             local_x_count, ny, nz, idx, nc);
+  }
+
+  if (!yb && !zb) { //(x1, y0 - 1, z0 - 1) | Include
+    distributed_prefix_value(g6_re, g6_im, local_prefix_re, local_prefix_im,
+                             remote_prefix_re, remote_prefix_im,
+                             remote_slot_by_x, x1, ym, zm, local_x_point,
+                             local_x_count, ny, nz, idx, nc);
+  }
+
+  if (!xb && !yb && !zb) { //(x0 - 1, y0 - 1, z0 - 1) | Exclude
+    distributed_prefix_value(g7_re, g7_im, local_prefix_re, local_prefix_im,
+                             remote_prefix_re, remote_prefix_im,
+                             remote_slot_by_x, xm, ym, zm, local_x_point,
+                             local_x_count, ny, nz, idx, nc);
+  }
+
+  box_re = g0_re - g1_re - g2_re - g3_re + g4_re + g5_re + g6_re - g7_re;
+  box_im = g0_im - g1_im - g2_im - g3_im + g4_im + g5_im + g6_im - g7_im;
+
+  return;
+}
+
+__device__ __forceinline__ static void distributed_cube_sum(
+    double &cube_re, double &cube_im,
+    const double *__restrict__ local_prefix_re,
+    const double *__restrict__ local_prefix_im,
+    const double *__restrict__ remote_prefix_re,
+    const double *__restrict__ remote_prefix_im,
+    const unsigned int *__restrict__ remote_slot_by_x, const unsigned int x,
+    const unsigned int y, const unsigned int z, const unsigned int radius,
+    const unsigned int local_x_point, const unsigned int local_x_count,
+    const unsigned int global_nx, const unsigned int ny, const unsigned int nz,
+    const unsigned int idx, const unsigned int nc) {
+  const unsigned int x0 = (x < radius) ? 0u : x - radius;
+  const unsigned int y0 = (y < radius) ? 0u : y - radius;
+  const unsigned int z0 = (z < radius) ? 0u : z - radius;
+
+  const unsigned int max_x_radius = global_nx - 1u - x;
+  const unsigned int max_y_radius = ny - 1u - y;
+  const unsigned int max_z_radius = nz - 1u - z;
+
+  const unsigned int x1 = (radius > max_x_radius) ? global_nx - 1u : x + radius;
+  const unsigned int y1 = (radius > max_y_radius) ? ny - 1u : y + radius;
+  const unsigned int z1 = (radius > max_z_radius) ? nz - 1u : z + radius;
+
+  distributed_box_sum(cube_re, cube_im, local_prefix_re, local_prefix_im,
+                      remote_prefix_re, remote_prefix_im, remote_slot_by_x, x0,
+                      y0, z0, x1, y1, z1, local_x_point, local_x_count, ny, nz,
+                      idx, nc);
+
+  return;
+}
+
+__device__ __forceinline__ static void distributed_shell_sum(
+    double &shell_re, double &shell_im,
+    const double *__restrict__ local_prefix_re,
+    const double *__restrict__ local_prefix_im,
+    const double *__restrict__ remote_prefix_re,
+    const double *__restrict__ remote_prefix_im,
+    const unsigned int *__restrict__ remote_slot_by_x, const unsigned int x,
+    const unsigned int y, const unsigned int z, const unsigned int inner,
+    const unsigned int outer, const unsigned int local_x_point,
+    const unsigned int local_x_count, const unsigned int global_nx,
+    const unsigned int ny, const unsigned int nz, const unsigned int idx,
+    const unsigned int nc) {
+  double outer_re = 0.0;
+  double outer_im = 0.0;
+
+  distributed_cube_sum(outer_re, outer_im, local_prefix_re, local_prefix_im,
+                       remote_prefix_re, remote_prefix_im, remote_slot_by_x, x,
+                       y, z, outer, local_x_point, local_x_count, global_nx, ny,
+                       nz, idx, nc);
+
+  double inner_re = 0.0;
+  double inner_im = 0.0;
+
+  distributed_cube_sum(inner_re, inner_im, local_prefix_re, local_prefix_im,
+                       remote_prefix_re, remote_prefix_im, remote_slot_by_x, x,
+                       y, z, inner, local_x_point, local_x_count, global_nx, ny,
+                       nz, idx, nc);
+
+  shell_re = outer_re - inner_re;
+  shell_im = outer_im - inner_im;
+
+  return;
+}
+
 template <bool ACCUMULATE>
 __global__ static void calc_rmt_sum_kernel(
     double *__restrict__ rmt_sum_re, double *__restrict__ rmt_sum_im,
@@ -2466,6 +2778,52 @@ __global__ static void calc_rmt_sum_kernel(
   return;
 }
 
+__global__ static void calc_rmt_sum_distributed_kernel(
+    double *__restrict__ rmt_sum_re, double *__restrict__ rmt_sum_im,
+    const double *__restrict__ local_prefix_re,
+    const double *__restrict__ local_prefix_im,
+    const double *__restrict__ remote_prefix_re,
+    const double *__restrict__ remote_prefix_im,
+    const unsigned int *__restrict__ remote_slot_by_x,
+    const double *__restrict__ cw, const unsigned int nc,
+    const unsigned int inner, const unsigned int outer,
+    const unsigned int local_x_point, const unsigned int local_x_count,
+    const unsigned int global_nx, const unsigned int ny, const unsigned int nz,
+    const unsigned int local_cell_count, const unsigned int first_global_cell) {
+  const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+  if (idx >= nc)
+    return;
+
+  const double wc = cw[idx];
+
+  for (unsigned int local_cell = blockIdx.y; local_cell < local_cell_count;
+       local_cell += gridDim.y) {
+    const unsigned int global_cell = first_global_cell + local_cell;
+
+    const unsigned int x = global_cell / (ny * nz);
+    const unsigned int y = (global_cell / nz) % ny;
+    const unsigned int z = global_cell % nz;
+
+    double shell_re = 0.0;
+    double shell_im = 0.0;
+
+    distributed_shell_sum(shell_re, shell_im, local_prefix_re, local_prefix_im,
+                          remote_prefix_re, remote_prefix_im, remote_slot_by_x,
+                          x, y, z, inner, outer, local_x_point, local_x_count,
+                          global_nx, ny, nz, idx, nc);
+
+    const std::size_t output =
+        static_cast<std::size_t>(local_cell) * static_cast<std::size_t>(nc) +
+        static_cast<std::size_t>(idx);
+
+    rmt_sum_re[output] = wc * shell_re;
+    rmt_sum_im[output] = wc * shell_im;
+  }
+
+  return;
+}
+
 void glst_force::sum_rmt_sf_tile(const unsigned int tile) {
   constexpr std::string_view function_name = "glst_force::sum_rmt_sf_tile";
 
@@ -2493,10 +2851,11 @@ void glst_force::sum_rmt_sf_tile(const unsigned int tile) {
                "Tile exceeds buffer size");
 
   if (this->cell_partition_count_ > 1) {
-    utl::require(
-        this->sf_exchange_mode_ == GLST_SF_EXCHANGE_MODE::FULL_GLOBAL_ALLREDUCE,
-        function_name,
-        "Full global S_tile sum called while local chunk exchange is selected");
+    utl::require(this->sf_exchange_mode_ ==
+                     GLST_SF_EXCHANGE_MODE::FULL_GLOBAL_ALLREDUCE,
+                 function_name,
+                 "Full global S_tile sum called while FULL_GLOBAL_ALLREDUCE is "
+                 "not selected");
   }
 
   const unsigned int tile_partition = this->plan_->tile_partition_idx(tile);
@@ -2794,6 +3153,490 @@ void glst_force::sum_rmt_sf_chunk_tile(const unsigned int tile,
   return;
 }
 
+void glst_force::build_distributed_prefix_tile(const unsigned int tile) {
+  constexpr std::string_view function_name =
+      "glst_force::build_distributed_prefix_tile";
+
+  utl::require(this->plan_ != nullptr, function_name,
+               "Plan is not initialized");
+
+  utl::require(this->workspace_ != nullptr, function_name,
+               "Workspace is not initialized");
+
+  utl::require(this->sf_exchange_mode_ ==
+                   GLST_SF_EXCHANGE_MODE::DISTRIBUTED_PREFIX,
+               function_name, "Distributed prefix exchange is not selected");
+
+  utl::require(this->cell_partition_count_ > 1, function_name,
+               "Distributed prefix exchange requires multiple cell partitions");
+
+  utl::require(tile < this->plan_->tile_count(), function_name,
+               "Tile is out of bounds");
+
+  const bool has_long_range_cells =
+      ((this->plan_->ncell_x() > 2) && (this->plan_->ncell_y() > 2) &&
+       (this->plan_->ncell_z() > 2));
+  if (!has_long_range_cells)
+    return;
+
+  const unsigned int tile_partition = this->plan_->tile_partition_idx(tile);
+  const unsigned int group = this->plan_->tile_group(tile);
+  const unsigned int nc = this->plan_->tile_node_count(tile);
+  const unsigned int ny = this->plan_->ncell_y();
+  const unsigned int nz = this->plan_->ncell_z();
+  const unsigned int yz_cell_count = ny * nz;
+  const std::size_t plane_entry_count =
+      static_cast<std::size_t>(yz_cell_count) * static_cast<std::size_t>(nc);
+  const std::size_t plane_byte_count = plane_entry_count * sizeof(double);
+
+  utl::require(
+      static_cast<std::size_t>(tile_partition) < this->cell_comm_devs_.size(),
+      function_name, "Tile partition has no cell-communicator devices");
+
+  utl::require(static_cast<std::size_t>(tile_partition) <
+                   this->cell_comms_.size(),
+               function_name, "Tile partition has no cell communicators");
+
+  const std::vector<int> &devs = this->cell_comm_devs_[tile_partition];
+  const std::vector<ncclComm_t> &comms = this->cell_comms_[tile_partition];
+
+  utl::require(
+      devs.size() == static_cast<std::size_t>(this->cell_partition_count_),
+      function_name,
+      "Cell communicator device count does not match cell partition count");
+
+  utl::require(comms.size() == devs.size(), function_name,
+               "Cell communicator handle count does not match device count");
+
+  // Build local z, y, and x prefixes. The final local x-plane is the total
+  // contribution of this cell partition.
+  for (std::size_t rank = 0; rank < devs.size(); rank++) {
+    const int dev = devs[rank];
+
+    utl::require((dev >= 0) && (dev < this->cuda_count_), function_name,
+                 "Cell communicator device is out of range");
+
+    const unsigned int cell_partition = static_cast<unsigned int>(rank);
+
+    utl::require(this->dev_cell_partition_[dev] == cell_partition,
+                 function_name,
+                 "Cell communicator rank does not match cell partition");
+
+    utl::require(this->dev_tile_partition_[dev] == tile_partition,
+                 function_name, "Device belongs to the wrong tile partition");
+
+    const unsigned int local_x_count =
+        this->plan_->cell_partition_x_count()[cell_partition];
+    const unsigned int local_cell_count =
+        this->plan_->local_cell_count(cell_partition);
+    const std::size_t local_entry_count =
+        static_cast<std::size_t>(local_cell_count) *
+        static_cast<std::size_t>(nc);
+
+    utl::require(local_entry_count <=
+                     this->workspace_->sf_tile_buffer_capacity(dev),
+                 function_name, "Local prefix exceeds SF workspace capacity");
+
+    const std::size_t partition_total_entry_count =
+        static_cast<std::size_t>(this->cell_partition_count_) *
+        plane_entry_count;
+
+    utl::require(
+        partition_total_entry_count <=
+            this->workspace_->prefix_partition_total_buffer_capacity(dev),
+        function_name,
+        "Partition-total prefix data exceeds workspace capacity");
+
+    utl::require(plane_entry_count <=
+                     this->workspace_->prefix_base_buffer_capacity(dev),
+                 function_name, "Prefix base exceeds workspace capacity");
+
+    const std::vector<unsigned int> &prefix_x =
+        this->plan_->partition_group_prefix_x(cell_partition, group);
+    const std::size_t imported_entry_count =
+        prefix_x.size() * plane_entry_count;
+
+    utl::require(imported_entry_count <=
+                     this->workspace_->sf_exchange_tile_buffer_capacity(dev),
+                 function_name,
+                 "Imported prefix planes exceed exchange capacity");
+
+    cudaCheck(cudaSetDevice(dev));
+
+    if (local_x_count > 0) {
+      {
+        constexpr dim3 num_threads(512, 1, 1);
+        const dim3 num_blocks((nc + num_threads.x - 1) / num_threads.x,
+                              local_x_count * ny, 1);
+
+        calc_prefix_sum_z_kernel<<<num_blocks, num_threads, 0,
+                                   this->comp_streams_[dev]>>>(
+            this->workspace_->sf_re()[dev].d_array().data(),
+            this->workspace_->sf_im()[dev].d_array().data(), nc, local_x_count,
+            ny, nz);
+        cudaCheck(cudaGetLastError());
+      }
+
+      {
+        constexpr dim3 num_threads(512, 1, 1);
+        const dim3 num_blocks((nc + num_threads.x - 1) / num_threads.x,
+                              local_x_count * nz, 1);
+
+        calc_prefix_sum_y_kernel<<<num_blocks, num_threads, 0,
+                                   this->comp_streams_[dev]>>>(
+            this->workspace_->sf_re()[dev].d_array().data(),
+            this->workspace_->sf_im()[dev].d_array().data(), nc, local_x_count,
+            ny, nz);
+        cudaCheck(cudaGetLastError());
+      }
+
+      {
+        constexpr dim3 num_threads(512, 1, 1);
+        const dim3 num_blocks((nc + num_threads.x - 1) / num_threads.x,
+                              yz_cell_count, 1);
+
+        calc_prefix_sum_x_kernel<<<num_blocks, num_threads, 0,
+                                   this->comp_streams_[dev]>>>(
+            this->workspace_->sf_re()[dev].d_array().data(),
+            this->workspace_->sf_im()[dev].d_array().data(), nc, local_x_count,
+            ny, nz);
+        cudaCheck(cudaGetLastError());
+      }
+    } else {
+      // A zero-width partition contributes a zero slab total. prefix_base is
+      // reused temporarily as its all-gather send buffer.
+      cudaCheck(cudaMemsetAsync(
+          static_cast<void *>(
+              this->workspace_->prefix_base_re()[dev].d_array().data()),
+          0, plane_byte_count, this->comp_streams_[dev]));
+
+      cudaCheck(cudaMemsetAsync(
+          static_cast<void *>(
+              this->workspace_->prefix_base_im()[dev].d_array().data()),
+          0, plane_byte_count, this->comp_streams_[dev]));
+    }
+
+    cudaCheck(
+        cudaEventRecord(this->comp_events_[dev], this->comp_streams_[dev]));
+
+    cudaCheck(cudaStreamWaitEvent(this->comm_streams_[dev],
+                                  this->comp_events_[dev], 0));
+  }
+
+  // All-gather each slab's final local x-prefix plane.
+  ncclCheck(ncclGroupStart());
+
+  for (std::size_t rank = 0; rank < devs.size(); rank++) {
+    const int dev = devs[rank];
+
+    const unsigned int cell_partition = static_cast<unsigned int>(rank);
+    const unsigned int local_x_count =
+        this->plan_->cell_partition_x_count()[cell_partition];
+
+    cudaCheck(cudaSetDevice(dev));
+
+    const double *send_re = nullptr;
+    const double *send_im = nullptr;
+
+    if (local_x_count > 0) {
+      const std::size_t last_plane_offset =
+          static_cast<std::size_t>(local_x_count - 1u) * plane_entry_count;
+
+      send_re =
+          this->workspace_->sf_re()[dev].d_array().data() + last_plane_offset;
+      send_im =
+          this->workspace_->sf_im()[dev].d_array().data() + last_plane_offset;
+    } else {
+      send_re = this->workspace_->prefix_base_re()[dev].d_array().data();
+      send_im = this->workspace_->prefix_base_im()[dev].d_array().data();
+    }
+
+    ncclCheck(ncclAllGather(
+        static_cast<const void *>(send_re),
+        static_cast<void *>(this->workspace_->prefix_partition_total_re()[dev]
+                                .d_array()
+                                .data()),
+        plane_entry_count, ncclDouble, comms[rank], this->comm_streams_[dev]));
+
+    ncclCheck(ncclAllGather(
+        static_cast<const void *>(send_im),
+        static_cast<void *>(this->workspace_->prefix_partition_total_im()[dev]
+                                .d_array()
+                                .data()),
+        plane_entry_count, ncclDouble, comms[rank], this->comm_streams_[dev]));
+  }
+
+  ncclCheck(ncclGroupEnd());
+
+  for (std::size_t rank = 0; rank < devs.size(); rank++) {
+    const int dev = devs[rank];
+
+    cudaCheck(cudaSetDevice(dev));
+
+    cudaCheck(
+        cudaEventRecord(this->comm_events_[dev], this->comm_streams_[dev]));
+
+    cudaCheck(cudaStreamWaitEvent(this->comp_streams_[dev],
+                                  this->comm_events_[dev], 0));
+  }
+
+  // Construct the exclusive prefix base for each partition and add it to every
+  // locally stored x-plane
+  for (std::size_t rank = 0; rank < devs.size(); rank++) {
+    const int dev = devs[rank];
+
+    const unsigned int cell_partition = static_cast<unsigned int>(rank);
+    const unsigned int local_cell_count =
+        this->plan_->local_cell_count(cell_partition);
+
+    cudaCheck(cudaSetDevice(dev));
+
+    {
+      constexpr unsigned int num_threads = 256;
+      const std::size_t required_blocks =
+          (plane_entry_count + static_cast<std::size_t>(num_threads) - 1) /
+          static_cast<std::size_t>(num_threads);
+      const unsigned int num_blocks = static_cast<unsigned int>(
+          std::min<std::size_t>(required_blocks, 65535u));
+
+      calc_prefix_base_kernel<<<num_blocks, num_threads, 0,
+                                this->comp_streams_[dev]>>>(
+          this->workspace_->prefix_base_re()[dev].d_array().data(),
+          this->workspace_->prefix_base_im()[dev].d_array().data(),
+          this->workspace_->prefix_partition_total_re()[dev].d_array().data(),
+          this->workspace_->prefix_partition_total_im()[dev].d_array().data(),
+          plane_entry_count, cell_partition);
+      cudaCheck(cudaGetLastError());
+    }
+
+    if (local_cell_count > 0) {
+      constexpr dim3 num_threads(512, 1, 1);
+      const dim3 num_blocks((nc + num_threads.x - 1) / num_threads.x,
+                            std::min(65535u, local_cell_count), 1);
+
+      add_prefix_base_kernel<<<num_blocks, num_threads, 0,
+                               this->comp_streams_[dev]>>>(
+          this->workspace_->sf_re()[dev].d_array().data(),
+          this->workspace_->sf_im()[dev].d_array().data(),
+          this->workspace_->prefix_base_re()[dev].d_array().data(),
+          this->workspace_->prefix_base_im()[dev].d_array().data(), nc,
+          yz_cell_count, local_cell_count);
+      cudaCheck(cudaGetLastError());
+    }
+
+    cudaCheck(
+        cudaEventRecord(this->comp_events_[dev], this->comp_streams_[dev]));
+
+    cudaCheck(cudaStreamWaitEvent(this->comm_streams_[dev],
+                                  this->comp_events_[dev], 0));
+  }
+
+  std::size_t imported_plane_count = 0;
+
+  for (unsigned int target_partition = 0;
+       target_partition < this->cell_partition_count_; target_partition++) {
+    const std::vector<unsigned int> &prefix_x =
+        this->plan_->partition_group_prefix_x(target_partition, group);
+
+    utl::require(prefix_x.size() <= std::numeric_limits<std::size_t>::max() -
+                                        imported_plane_count,
+                 function_name, "Imported prefix-plane count overflow");
+
+    imported_plane_count += prefix_x.size();
+  }
+
+  if (imported_plane_count == 0)
+    return;
+
+  // Import the required global-prefix x-planes. Ordering is receiving
+  // partition, then increasing global x.
+  ncclCheck(ncclGroupStart());
+
+  for (unsigned int recv_partition = 0;
+       recv_partition < this->cell_partition_count_; recv_partition++) {
+    const int recv_dev = devs[recv_partition];
+
+    const std::vector<unsigned int> &prefix_x =
+        this->plan_->partition_group_prefix_x(recv_partition, group);
+
+    for (std::size_t slot = 0; slot < prefix_x.size(); slot++) {
+      const unsigned int global_x = prefix_x[slot];
+
+      const unsigned int representative_cell = global_x * yz_cell_count;
+      const unsigned int send_partition =
+          this->plan_->cell_partition_idx(representative_cell);
+
+      utl::require(send_partition != recv_partition, function_name,
+                   "Imported prefix plane is locally owned");
+
+      const int send_dev = devs[send_partition];
+
+      const unsigned int send_x_point =
+          this->plan_->cell_partition_x_point()[send_partition];
+      const unsigned int send_x_count =
+          this->plan_->cell_partition_x_count()[send_partition];
+
+      utl::require(global_x >= send_x_point, function_name,
+                   "Prefix-plane owner begins after the plane");
+
+      const unsigned int send_local_x = global_x - send_x_point;
+
+      utl::require(send_local_x < send_x_count, function_name,
+                   "Prefix plane is outside its owner partition");
+
+      const std::size_t send_offset =
+          static_cast<std::size_t>(send_local_x) * plane_entry_count;
+      const std::size_t recv_offset = slot * plane_entry_count;
+
+      cudaCheck(cudaSetDevice(send_dev));
+
+      ncclCheck(ncclSend(
+          static_cast<const void *>(
+              this->workspace_->sf_re()[send_dev].d_array().data() +
+              send_offset),
+          plane_entry_count, ncclDouble, static_cast<int>(recv_partition),
+          comms[send_partition], this->comm_streams_[send_dev]));
+
+      ncclCheck(ncclSend(
+          static_cast<const void *>(
+              this->workspace_->sf_im()[send_dev].d_array().data() +
+              send_offset),
+          plane_entry_count, ncclDouble, static_cast<int>(recv_partition),
+          comms[send_partition], this->comm_streams_[send_dev]));
+
+      cudaCheck(cudaSetDevice(recv_dev));
+
+      ncclCheck(ncclRecv(
+          static_cast<void *>(
+              this->workspace_->sf_exchange_re()[recv_dev].d_array().data() +
+              recv_offset),
+          plane_entry_count, ncclDouble, static_cast<int>(send_partition),
+          comms[recv_partition], this->comm_streams_[recv_dev]));
+
+      ncclCheck(ncclRecv(
+          static_cast<void *>(
+              this->workspace_->sf_exchange_im()[recv_dev].d_array().data() +
+              recv_offset),
+          plane_entry_count, ncclDouble, static_cast<int>(send_partition),
+          comms[recv_partition], this->comm_streams_[recv_dev]));
+    }
+  }
+
+  ncclCheck(ncclGroupEnd());
+
+  for (std::size_t rank = 0; rank < devs.size(); rank++) {
+    const int dev = devs[rank];
+
+    cudaCheck(cudaSetDevice(dev));
+
+    cudaCheck(
+        cudaEventRecord(this->comm_events_[dev], this->comm_streams_[dev]));
+
+    cudaCheck(cudaStreamWaitEvent(this->comp_streams_[dev],
+                                  this->comm_events_[dev], 0));
+  }
+
+  return;
+}
+
+void glst_force::sum_rmt_sf_prefix_tile(const unsigned int tile) {
+  constexpr std::string_view function_name =
+      "glst_force::sum_rmt_sf_prefix_tile";
+
+  utl::require(this->plan_ != nullptr, function_name,
+               "Plan is not initialized");
+
+  utl::require(this->workspace_ != nullptr, function_name,
+               "Workspace is not initialized");
+
+  utl::require(this->sf_exchange_mode_ ==
+                   GLST_SF_EXCHANGE_MODE::DISTRIBUTED_PREFIX,
+               function_name, "Distributed prefix exchange is not selected");
+
+  utl::require(tile < this->plan_->tile_count(), function_name,
+               "Tile is out of bounds");
+
+  const bool has_long_range_cells =
+      ((this->plan_->ncell_x() > 2) && (this->plan_->ncell_y() > 2) &&
+       (this->plan_->ncell_z() > 2));
+  if (!has_long_range_cells)
+    return;
+
+  const unsigned int tile_partition = this->plan_->tile_partition_idx(tile);
+  const unsigned int group = this->plan_->tile_group(tile);
+  const unsigned int nc = this->plan_->tile_node_count(tile);
+  const unsigned int off = this->plan_->tile_node_point(tile);
+  const unsigned int inner = this->plan_->grp_r_in()[0][group];
+  const unsigned int outer = this->plan_->grp_r_out()[0][group];
+  const unsigned int nx = this->plan_->ncell_x();
+  const unsigned int ny = this->plan_->ncell_y();
+  const unsigned int nz = this->plan_->ncell_z();
+  const std::size_t slot_group_offset =
+      static_cast<std::size_t>(group) * static_cast<std::size_t>(nx);
+  const std::size_t required_slot_count =
+      slot_group_offset + static_cast<std::size_t>(nx);
+
+  for (int dev = 0; dev < this->cuda_count_; dev++) {
+    if (this->dev_tile_partition_[dev] != tile_partition)
+      continue;
+
+    const unsigned int cell_partition = this->dev_cell_partition_[dev];
+    const unsigned int local_x_point =
+        this->plan_->cell_partition_x_point()[cell_partition];
+    const unsigned int local_x_count =
+        this->plan_->cell_partition_x_count()[cell_partition];
+    const unsigned int local_cell_count =
+        this->plan_->local_cell_count(cell_partition);
+
+    if (local_cell_count == 0)
+      continue;
+
+    const unsigned int first_global_cell =
+        this->plan_->first_global_cell(cell_partition);
+    const std::size_t rmt_entry_count =
+        static_cast<std::size_t>(local_cell_count) *
+        static_cast<std::size_t>(nc);
+
+    utl::require(
+        rmt_entry_count <= this->workspace_->rmt_tile_buffer_capacity(dev),
+        function_name, "Distributed rmt_sum exceeds workspace capacity");
+
+    utl::require(required_slot_count <=
+                     this->workspace_->prefix_plane_slot_capacity(dev),
+                 function_name, "Prefix-plane slot-map capacity is too small");
+
+    cudaCheck(cudaSetDevice(dev));
+
+    const unsigned int *remote_slot_by_x =
+        this->workspace_->prefix_plane_slot()[dev].d_array().data() +
+        slot_group_offset;
+
+#ifdef __GLST_DEBUG__
+    constexpr dim3 num_threads(256, 1, 1);
+#else
+    constexpr dim3 num_threads(512, 1, 1);
+#endif
+
+    const dim3 num_blocks((nc + num_threads.x - 1) / num_threads.x,
+                          std::min(65535u, local_cell_count), 1);
+
+    calc_rmt_sum_distributed_kernel<<<num_blocks, num_threads, 0,
+                                      this->comp_streams_[dev]>>>(
+        this->workspace_->rmt_sum_re()[dev].d_array().data(),
+        this->workspace_->rmt_sum_im()[dev].d_array().data(),
+        this->workspace_->sf_re()[dev].d_array().data(),
+        this->workspace_->sf_im()[dev].d_array().data(),
+        this->workspace_->sf_exchange_re()[dev].d_array().data(),
+        this->workspace_->sf_exchange_im()[dev].d_array().data(),
+        remote_slot_by_x, this->plan_->w()[dev].d_array().data() + off, nc,
+        inner, outer, local_x_point, local_x_count, nx, ny, nz,
+        local_cell_count, first_global_cell);
+    cudaCheck(cudaGetLastError());
+  }
+
+  return;
+}
+
 void glst_force::build_rmt_sum_tile(const unsigned int tile) {
   constexpr std::string_view function_name = "glst_force::build_rmt_sum_tile";
 
@@ -2847,6 +3690,62 @@ void glst_force::build_rmt_sum_tile(const unsigned int tile) {
     return;
   }
 
+  if (this->sf_exchange_mode_ == GLST_SF_EXCHANGE_MODE::DISTRIBUTED_PREFIX) {
+    if (!this->profiling_enabled_) {
+      this->build_distributed_prefix_tile(tile);
+      this->sum_rmt_sf_prefix_tile(tile);
+      return;
+    }
+
+    std::chrono::steady_clock::time_point phase_start =
+        std::chrono::steady_clock::now();
+    this->build_distributed_prefix_tile(tile);
+    this->synchronize_tile_partition_compute_streams(tile_partition);
+    std::chrono::steady_clock::time_point phase_end =
+        std::chrono::steady_clock::now();
+    this->profile_.exchange_sf_ms += profile_elapsed_ms(phase_start, phase_end);
+
+    const unsigned int group = this->plan_->tile_group(tile);
+    const std::size_t plane_entry_count =
+        static_cast<std::size_t>(this->plan_->ncell_y()) *
+        static_cast<std::size_t>(this->plan_->ncell_z()) *
+        static_cast<std::size_t>(this->plan_->tile_node_count(tile));
+    const std::size_t prefix_base_input_bytes =
+        2 * static_cast<std::size_t>(this->cell_partition_count_) *
+        plane_entry_count * sizeof(double);
+
+    std::size_t prefix_plane_import_count = 0;
+
+    for (unsigned int cell_partition = 0;
+         cell_partition < this->cell_partition_count_; cell_partition++) {
+      const std::vector<unsigned int> &prefix_x =
+          this->plan_->partition_group_prefix_x(cell_partition, group);
+
+      utl::require(prefix_x.size() <= std::numeric_limits<std::size_t>::max() -
+                                          prefix_plane_import_count,
+                   function_name, "Profiled prefix-plane count overflow");
+
+      prefix_plane_import_count += prefix_x.size();
+    }
+
+    const std::size_t prefix_plane_input_bytes =
+        2 * prefix_plane_import_count * plane_entry_count * sizeof(double);
+
+    this->profile_.prefix_base_input_bytes += prefix_base_input_bytes;
+    this->profile_.prefix_plane_input_bytes += prefix_plane_input_bytes;
+    this->profile_.prefix_plane_import_count += prefix_plane_import_count;
+    this->profile_.sf_collective_input_bytes +=
+        prefix_base_input_bytes + prefix_plane_input_bytes;
+
+    phase_start = std::chrono::steady_clock::now();
+    this->sum_rmt_sf_prefix_tile(tile);
+    this->synchronize_tile_partition_compute_streams(tile_partition);
+    phase_end = std::chrono::steady_clock::now();
+    this->profile_.sum_rmt_sf_ms += profile_elapsed_ms(phase_start, phase_end);
+
+    return;
+  }
+
   utl::require(this->sf_exchange_chunk_x_count_ > 0, function_name,
                "Local exchange chunk size is 0");
 
@@ -2855,13 +3754,10 @@ void glst_force::build_rmt_sum_tile(const unsigned int tile) {
   else {
     const std::chrono::steady_clock::time_point phase_start =
         std::chrono::steady_clock::now();
-
     this->zero_rmt_sum_tile(tile);
     this->synchronize_tile_partition_compute_streams(tile_partition);
-
     const std::chrono::steady_clock::time_point phase_end =
         std::chrono::steady_clock::now();
-
     this->profile_.sum_rmt_sf_ms += profile_elapsed_ms(phase_start, phase_end);
   }
 
@@ -2889,15 +3785,11 @@ void glst_force::build_rmt_sum_tile(const unsigned int tile) {
 
       std::chrono::steady_clock::time_point phase_start =
           std::chrono::steady_clock::now();
-
       this->exchange_sf_chunk_tile(tile, source_partition, source_x_offset,
                                    chunk_x_count);
-
       this->synchronize_tile_partition_compute_streams(tile_partition);
-
       std::chrono::steady_clock::time_point phase_end =
           std::chrono::steady_clock::now();
-
       this->profile_.exchange_sf_ms +=
           profile_elapsed_ms(phase_start, phase_end);
 
@@ -2916,14 +3808,10 @@ void glst_force::build_rmt_sum_tile(const unsigned int tile) {
           2 * chunk_entry_count * sizeof(double);
 
       phase_start = std::chrono::steady_clock::now();
-
       this->sum_rmt_sf_chunk_tile(tile, source_partition, source_x_offset,
                                   chunk_x_count);
-
       this->synchronize_tile_partition_compute_streams(tile_partition);
-
       phase_end = std::chrono::steady_clock::now();
-
       this->profile_.sum_rmt_sf_ms +=
           profile_elapsed_ms(phase_start, phase_end);
     }
@@ -3364,7 +4252,7 @@ void glst_force::init_cuda_resources(void) {
   }
 
   // NCCL enables peer access as needed when communicator transports connect.
-  // Pre-enabling every deviec pair here causes NCCL to encounter
+  // Pre-enabling every device pair here causes NCCL to encounter
   // cudaErrorPeerAccessAlreadyEnabled during lazy connection setup, which
   // compute-sanitizer reports as an API error even though the collective
   // completes successfully.
