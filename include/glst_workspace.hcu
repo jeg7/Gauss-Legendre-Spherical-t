@@ -49,9 +49,11 @@ public:
   std::size_t prefix_base_buffer_capacity(const int dev) const;
   std::size_t prefix_plane_slot_capacity(const int dev) const;
   std::size_t owned_atom_count(const int dev) const;
+  std::size_t source_atom_count(const int dev) const;
   std::size_t sr_source_cell_capacity(const int dev) const;
 
   const std::vector<std::size_t> &owned_atom_count(void) const;
+  const std::vector<std::size_t> &source_atom_count(void) const;
   const std::vector<std::size_t> &sr_source_cell_capacity(void) const;
 
   const std::vector<cuda_container<unsigned int>> &idx(void) const;
@@ -142,6 +144,8 @@ public:
             const bool distributed_prefix = false,
             const unsigned int sf_exchange_chunk_x_count = 0);
   void resize_atom_storage(const int dev, const std::size_t atom_capacity);
+  void set_source_atom_count(const int dev,
+                             const std::size_t source_atom_count);
   void set_owned_atom_count(const int dev, const std::size_t owned_atom_count);
   void clear(void);
 
@@ -170,6 +174,7 @@ private:
   std::vector<std::size_t> prefix_base_buffer_capacity_;
   std::vector<std::size_t> prefix_plane_slot_capacity_;
   std::vector<std::size_t> owned_atom_count_;
+  std::vector<std::size_t> source_atom_count_;
   std::vector<std::size_t> sr_source_cell_capacity_;
 
   // Atom arrays: Size atom_capacity_ (natom)

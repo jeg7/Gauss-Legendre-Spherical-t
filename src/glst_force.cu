@@ -1422,10 +1422,16 @@ void glst_force::validate_atom_scatter(void) const {
     const std::size_t owned_atom_count =
         this->workspace_->owned_atom_count(dev);
 
-    utl::require(owned_atom_count <= packets.size(), function_name,
+    const std::size_t source_atom_count =
+        this->workspace_->source_atom_count(dev);
+
+    utl::require(owned_atom_count <= source_atom_count, function_name,
                  "Owned atom count exceeds source atom count");
 
-    for (std::size_t i = 0; i < packets.size(); i++) {
+    utl::require(source_atom_count <= packets.size(), function_name,
+                 "Source atom count exceeds packet storage");
+
+    for (std::size_t i = 0; i < source_atom_count; i++) {
       const atom_packet &packet = packets[i];
 
       utl::require(packet.i < natom, function_name,
@@ -1455,6 +1461,7 @@ void glst_force::validate_atom_scatter(void) const {
 
     const std::size_t owned_cell_count = static_cast<std::size_t>(
         this->plan_->local_cell_count(expected_cell_partition));
+
     std::size_t observed_source_atom_count = 0;
     std::size_t observed_owned_atom_count = 0;
 
@@ -1470,21 +1477,25 @@ void glst_force::validate_atom_scatter(void) const {
     for (std::size_t source_local_cell = 0;
          source_local_cell < source_cells.size(); source_local_cell++) {
       const unsigned int expected_cell = source_cells[source_local_cell];
+
       const unsigned int point =
           this->workspace_->sr_source_cell_atom_point()[dev][source_local_cell];
+
       const unsigned int count =
           this->workspace_->sr_source_cell_atom_count()[dev][source_local_cell];
 
       observed_source_atom_count += static_cast<std::size_t>(count);
+
       if (source_local_cell < owned_cell_count)
         observed_owned_atom_count += static_cast<std::size_t>(count);
 
       utl::require(static_cast<std::size_t>(point) +
                            static_cast<std::size_t>(count) <=
-                       packets.size(),
+                       source_atom_count,
                    function_name, "Source cell atom range is out of bounds");
 
       unsigned int last_atom = 0;
+
       for (unsigned int j = 0; j < count; j++) {
         const atom_packet &packet = packets[point + j];
 
@@ -1501,7 +1512,7 @@ void glst_force::validate_atom_scatter(void) const {
       }
     }
 
-    utl::require(observed_source_atom_count == packets.size(), function_name,
+    utl::require(observed_source_atom_count == source_atom_count, function_name,
                  "Source cell counts do not sum to source atoms");
 
     utl::require(observed_owned_atom_count == owned_atom_count, function_name,
@@ -1526,15 +1537,38 @@ void glst_force::validate_atom_scatter(void) const {
         continue;
       }
 
+      const std::size_t lhs_owned_atom_count =
+          this->workspace_->owned_atom_count(first_dev);
+
+      const std::size_t rhs_owned_atom_count =
+          this->workspace_->owned_atom_count(dev);
+
+      utl::require(
+          lhs_owned_atom_count == rhs_owned_atom_count, function_name,
+          "Tile ranks in a cell partition have different owned atom counts");
+
+      const std::size_t lhs_source_atom_count =
+          this->workspace_->source_atom_count(first_dev);
+
+      const std::size_t rhs_source_atom_count =
+          this->workspace_->source_atom_count(dev);
+
+      utl::require(
+          lhs_source_atom_count == rhs_source_atom_count, function_name,
+          "Tile ranks in a cell partition have different source atom counts");
+
       const std::vector<atom_packet> &lhs =
           this->workspace_->sorted_packets()[first_dev].h_array();
+
       const std::vector<atom_packet> &rhs =
           this->workspace_->sorted_packets()[dev].h_array();
 
-      utl::require(lhs.size() == rhs.size(), function_name,
-                   "Tile ranks in a cell partition have different atom counts");
+      utl::require((lhs_source_atom_count <= lhs.size()) &&
+                       (rhs_source_atom_count <= rhs.size()),
+                   function_name,
+                   "Tile-rank source atom count exceeds packet storage");
 
-      for (std::size_t i = 0; i < lhs.size(); i++) {
+      for (std::size_t i = 0; i < lhs_source_atom_count; i++) {
         utl::require(
             (lhs[i].i == rhs[i].i) && (lhs[i].cell == rhs[i].cell) &&
                 (lhs[i].x == rhs[i].x) && (lhs[i].y == rhs[i].y) &&
@@ -1704,6 +1738,7 @@ void glst_force::assign_atoms_multi_gpu(const double *d_rx, const double *d_ry,
         function_name, "Source cell count does not match workspace capacity");
 
     this->workspace_->resize_atom_storage(dev, source_atom_count);
+    this->workspace_->set_source_atom_count(dev, source_atom_count);
     this->workspace_->set_owned_atom_count(dev, owned_atom_count);
 
     std::fill(this->workspace_->cell_atom_count()[dev].h_array().begin(),
