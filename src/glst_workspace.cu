@@ -36,16 +36,16 @@ glst_workspace::glst_workspace(void)
       sf_tile_buffer_capacity_(), sf_exchange_tile_buffer_capacity_(),
       rmt_tile_buffer_capacity_(), prefix_partition_total_buffer_capacity_(),
       prefix_base_buffer_capacity_(), prefix_plane_slot_capacity_(),
-      owned_atom_count_(), source_atom_count_(), sr_source_cell_capacity_(),
-      idx_(), sorted_idx_(), rx_(), ry_(), rz_(), qc_(), packets_(),
-      sorted_packets_(), atom_cell_idx_(), atom_cell_sorted_idx_(), fx_(),
-      fy_(), fz_(), en_(), cell_atom_point_(), cell_atom_count_(),
-      max_atoms_cell_(), sr_source_cell_atom_point_(),
-      sr_source_cell_atom_count_(), sf_re_(), sf_im_(), sf_exchange_re_(),
-      sf_exchange_im_(), prefix_partition_total_re_(),
-      prefix_partition_total_im_(), prefix_base_re_(), prefix_base_im_(),
-      prefix_plane_slot_(), rmt_sum_re_(), rmt_sum_im_(), cub_work_buffer_(),
-      cub_work_buffer_size_() {}
+      owned_atom_count_(), source_atom_count_(), atom_storage_growth_count_(),
+      cub_work_buffer_growth_count_(), sr_source_cell_capacity_(), idx_(),
+      sorted_idx_(), rx_(), ry_(), rz_(), qc_(), packets_(), sorted_packets_(),
+      atom_cell_idx_(), atom_cell_sorted_idx_(), fx_(), fy_(), fz_(), en_(),
+      cell_atom_point_(), cell_atom_count_(), max_atoms_cell_(),
+      sr_source_cell_atom_point_(), sr_source_cell_atom_count_(), sf_re_(),
+      sf_im_(), sf_exchange_re_(), sf_exchange_im_(),
+      prefix_partition_total_re_(), prefix_partition_total_im_(),
+      prefix_base_re_(), prefix_base_im_(), prefix_plane_slot_(), rmt_sum_re_(),
+      rmt_sum_im_(), cub_work_buffer_(), cub_work_buffer_size_() {}
 
 glst_workspace::glst_workspace(const glst_plan &plan, const int device_count)
     : glst_workspace() {
@@ -178,6 +178,23 @@ std::size_t glst_workspace::source_atom_count(const int dev) const {
                "Device index out of range");
 
   return this->source_atom_count_[dev];
+}
+
+std::size_t glst_workspace::atom_storage_growth_count(const int dev) const {
+  utl::require(
+      static_cast<std::size_t>(dev) < this->atom_storage_growth_count_.size(),
+      "glst_workspace::atom_storage_growth_count", "Device index out of range");
+
+  return this->atom_storage_growth_count_[dev];
+}
+
+std::size_t glst_workspace::cub_work_buffer_growth_count(const int dev) const {
+  utl::require(static_cast<std::size_t>(dev) <
+                   this->cub_work_buffer_growth_count_.size(),
+               "glst_workspace::cub_work_buffer_growth_count",
+               "Device index out of range");
+
+  return this->cub_work_buffer_growth_count_[dev];
 }
 
 std::size_t glst_workspace::sr_source_cell_capacity(const int dev) const {
@@ -575,6 +592,8 @@ void glst_workspace::init(const glst_plan &plan,
   this->prefix_plane_slot_capacity_.assign(device_count, 0);
   this->owned_atom_count_.assign(device_count, 0);
   this->source_atom_count_.assign(device_count, 0);
+  this->atom_storage_growth_count_.assign(device_count, 0);
+  this->cub_work_buffer_growth_count_.assign(device_count, 0);
   this->sr_source_cell_capacity_.assign(device_count, 0);
 
   for (int dev = 0; dev < device_count; dev++) {
@@ -655,8 +674,10 @@ void glst_workspace::init(const glst_plan &plan,
         prefix_partition_total_capacity;
     this->prefix_base_buffer_capacity_[dev] = prefix_base_capacity;
     this->prefix_plane_slot_capacity_[dev] = prefix_plane_slot_capacity;
-    this->owned_atom_count_[dev] = local_atom_capacity;
-    this->source_atom_count_[dev] = local_atom_capacity;
+    if (device_count == 1) {
+      this->owned_atom_count_[dev] = global_natom;
+      this->source_atom_count_[dev] = global_natom;
+    }
     this->sr_source_cell_capacity_[dev] = sr_source_cell_count;
 
     if (local_atom_capacity > this->max_atom_capacity_)
@@ -777,75 +798,106 @@ void glst_workspace::init(const glst_plan &plan,
   return;
 }
 
-void glst_workspace::resize_atom_storage(const int dev,
-                                         const std::size_t atom_capacity) {
-  utl::require(static_cast<std::size_t>(dev) < this->atom_capacity_.size(),
-               "glst_workspace::resize_atom_storage",
-               "Device index out of range");
+void glst_workspace::ensure_atom_capacity(
+    const int dev, const std::size_t required_source_atom_count) {
+  constexpr std::string_view function_name =
+      "glst_workspace::ensure_atom_capacity";
+
+  utl::require((dev >= 0) && (static_cast<std::size_t>(dev) <
+                              this->atom_capacity_.size()),
+               function_name, "Device index out of range");
+
+  const std::size_t current_capacity = this->atom_capacity_[dev];
+
+  utl::require(this->owned_atom_count_[dev] <= this->source_atom_count_[dev],
+               function_name,
+               "Existing owned atom count exceeds source atom count");
+
+  utl::require(this->source_atom_count_[dev] <= current_capacity, function_name,
+               "Existing source atom count exceeds atom capacity");
+
+  if (required_source_atom_count <= current_capacity)
+    return;
+
+  const std::size_t cub_item_limit =
+      static_cast<std::size_t>(std::numeric_limits<int>::max());
+
+  utl::require(required_source_atom_count <= cub_item_limit, function_name,
+               "Required source atom count exceeds CUB int range");
+
+  // Use bounded, fixed-quantum headroom rather than proportional growth.
+  //
+  // Below 1M atoms, round to 4096 atoms. At and above 1M atoms, round to 65536
+  // atoms. The maximum unused tail is therefore bounded and does not grow in
+  // proportion to a multi-million-atom system.
+  //
+  // The current workspace has approximately 160 bytes of atom-sized storage per
+  // capacity entry, so the large quantum adds at most about 10 MiB per device
+  // instead of the potentially hundres of MiB added by 1.5x growth.
+  constexpr std::size_t LARGE_CAPACITY_THRESHOLD = 1048576;
+  constexpr std::size_t SMALL_GROWTH_QUANTUM = 4096;
+  constexpr std::size_t LARGE_GROWTH_QUANTUM = 65536;
+
+  const std::size_t growth_quantum =
+      (required_source_atom_count < LARGE_CAPACITY_THRESHOLD)
+          ? SMALL_GROWTH_QUANTUM
+          : LARGE_GROWTH_QUANTUM;
+
+  const std::size_t growth_padding = growth_quantum - 1;
+  std::size_t new_capacity = required_source_atom_count;
+
+  if (required_source_atom_count <= cub_item_limit - growth_padding) {
+    new_capacity =
+        ((required_source_atom_count + growth_padding) / growth_quantum) *
+        growth_quantum;
+  }
 
   cudaCheck(cudaSetDevice(dev));
 
-  this->deallocate_cub_for_device(dev);
+  this->idx_[dev].resize(new_capacity);
+  this->sorted_idx_[dev].resize(new_capacity);
+  this->rx_[dev].resize(new_capacity);
+  this->ry_[dev].resize(new_capacity);
+  this->rz_[dev].resize(new_capacity);
+  this->qc_[dev].resize(new_capacity);
+  this->packets_[dev].resize(new_capacity);
+  this->sorted_packets_[dev].resize(new_capacity);
+  this->atom_cell_idx_[dev].resize(new_capacity);
+  this->atom_cell_sorted_idx_[dev].resize(new_capacity);
 
-  this->atom_capacity_[dev] = atom_capacity;
+  this->fx_[dev].resize(new_capacity);
+  this->fy_[dev].resize(new_capacity);
+  this->fz_[dev].resize(new_capacity);
+  this->en_[dev].resize(new_capacity);
 
-  this->owned_atom_count_[dev] = atom_capacity;
-  this->source_atom_count_[dev] = atom_capacity;
+  this->atom_capacity_[dev] = new_capacity;
 
-  this->idx_[dev].resize(atom_capacity);
-  this->sorted_idx_[dev].resize(atom_capacity);
-  this->rx_[dev].resize(atom_capacity);
-  this->ry_[dev].resize(atom_capacity);
-  this->rz_[dev].resize(atom_capacity);
-  this->qc_[dev].resize(atom_capacity);
-  this->packets_[dev].resize(atom_capacity);
-  this->sorted_packets_[dev].resize(atom_capacity);
-  this->atom_cell_idx_[dev].resize(atom_capacity);
-  this->atom_cell_sorted_idx_[dev].resize(atom_capacity);
+  if (new_capacity > this->max_atom_capacity_)
+    this->max_atom_capacity_ = new_capacity;
 
-  this->fx_[dev].resize(atom_capacity);
-  this->fy_[dev].resize(atom_capacity);
-  this->fz_[dev].resize(atom_capacity);
-  this->en_[dev].resize(atom_capacity);
+  this->atom_storage_growth_count_[dev]++;
 
-  this->max_atom_capacity_ = 0;
-  for (std::size_t i = 0; i < this->atom_capacity_.size(); i++) {
-    if (this->atom_capacity_[i] > this->max_atom_capacity_)
-      this->max_atom_capacity_ = this->atom_capacity_[i];
-  }
-
-  this->allocate_cub_for_device(dev);
+  this->ensure_cub_capacity_for_device(dev, true);
 
   return;
 }
 
-void glst_workspace::set_source_atom_count(
-    const int dev, const std::size_t source_atom_count) {
-  constexpr std::string_view function_name =
-      "glst_workspace::set_source_atom_count";
+void glst_workspace::set_atom_counts(const int dev,
+                                     const std::size_t source_atom_count,
+                                     const std::size_t owned_atom_count) {
+  constexpr std::string_view function_name = "glst_workspace::set_atom_counts";
 
-  utl::require(static_cast<std::size_t>(dev) < this->source_atom_count_.size(),
+  utl::require((dev >= 0) && (static_cast<std::size_t>(dev) <
+                              this->atom_capacity_.size()),
                function_name, "Device index out of range");
 
   utl::require(source_atom_count <= this->atom_capacity_[dev], function_name,
-               "source_atom_count exceeds atom capacity");
+               "Source atom count exceeds atom capacity");
+
+  utl::require(owned_atom_count <= source_atom_count, function_name,
+               "Owned atom count exceeds source atom count");
 
   this->source_atom_count_[dev] = source_atom_count;
-
-  return;
-}
-
-void glst_workspace::set_owned_atom_count(const int dev,
-                                          const std::size_t owned_atom_count) {
-  constexpr std::string_view function_name =
-      "glst_workspace::set_owned_atom_count";
-
-  utl::require(static_cast<std::size_t>(dev) < this->owned_atom_count_.size(),
-               function_name, "Device index out of range");
-
-  utl::require(owned_atom_count <= this->source_atom_count_[dev], function_name,
-               "owned_atom_count exceeds source atom count");
-
   this->owned_atom_count_[dev] = owned_atom_count;
 
   return;
@@ -873,6 +925,8 @@ void glst_workspace::clear(void) {
   this->prefix_plane_slot_capacity_.clear();
   this->owned_atom_count_.clear();
   this->source_atom_count_.clear();
+  this->atom_storage_growth_count_.clear();
+  this->cub_work_buffer_growth_count_.clear();
   this->sr_source_cell_capacity_.clear();
 
   this->idx_.clear();
@@ -915,11 +969,22 @@ void glst_workspace::clear(void) {
   return;
 }
 
-void glst_workspace::allocate_cub_for_device(const int dev) {
-  cudaCheck(cudaSetDevice(dev));
+void glst_workspace::ensure_cub_capacity_for_device(
+    const int dev, const bool count_growth_event) {
+  constexpr std::string_view function_name =
+      "glst_workspace::ensure_cub_capacity_for_device";
 
-  this->cub_work_buffer_[dev] = nullptr;
-  this->cub_work_buffer_size_[dev] = 0;
+  utl::require(static_cast<std::size_t>(dev) < this->atom_capacity_.size(),
+               function_name, "Device index out of range");
+
+  utl::require(static_cast<std::size_t>(dev) < this->cub_work_buffer_.size(),
+               function_name, "CUB work-buffer device index out of range");
+
+  utl::require(static_cast<std::size_t>(dev) <
+                   this->cub_work_buffer_size_.size(),
+               function_name, "CUB work-buffer-size device index out of range");
+
+  cudaCheck(cudaSetDevice(dev));
 
   const std::size_t atom_capacity = this->atom_capacity_[dev];
 
@@ -928,53 +993,69 @@ void glst_workspace::allocate_cub_for_device(const int dev) {
 
   utl::require(atom_capacity <=
                    static_cast<std::size_t>(std::numeric_limits<int>::max()),
-               "glst_workspace::allocate_cub",
-               "Atom capacity exceeds CUB int range");
+               function_name, "Atom capacity exceeds CUB int range");
 
   const int num_items = static_cast<int>(atom_capacity);
 
   // Determine storage requirements for CUB functions
   std::size_t size0 = 0, size1 = 0, size2 = 0;
+  void *tmp = nullptr;
 
   cub::DeviceRadixSort::SortPairs(
-      this->cub_work_buffer_[dev], size0,
-      this->atom_cell_idx_[dev].d_array().data(),
+      tmp, size0, this->atom_cell_idx_[dev].d_array().data(),
       this->atom_cell_sorted_idx_[dev].d_array().data(),
       this->idx_[dev].d_array().data(), this->sorted_idx_[dev].d_array().data(),
       num_items);
 
   cub::DeviceRadixSort::SortPairs(
-      this->cub_work_buffer_[dev], size1,
-      this->atom_cell_idx_[dev].d_array().data(),
+      tmp, size1, this->atom_cell_idx_[dev].d_array().data(),
       this->atom_cell_sorted_idx_[dev].d_array().data(),
       this->fx_[dev].d_array().data(), this->fx_[dev].d_array().data(),
       num_items);
 
   cub::DeviceRadixSort::SortPairs(
-      this->cub_work_buffer_[dev], size2,
-      this->atom_cell_idx_[dev].d_array().data(),
+      tmp, size2, this->atom_cell_idx_[dev].d_array().data(),
       this->atom_cell_sorted_idx_[dev].d_array().data(),
       this->packets_[dev].d_array().data(),
       this->sorted_packets_[dev].d_array().data(), num_items);
 
-  this->cub_work_buffer_size_[dev] = size0;
-  if (size1 > this->cub_work_buffer_size_[dev])
-    this->cub_work_buffer_size_[dev] = size1;
-  if (size2 > this->cub_work_buffer_size_[dev])
-    this->cub_work_buffer_size_[dev] = size2;
+  std::size_t required_size = size0;
+  if (size1 > required_size)
+    required_size = size1;
+  if (size2 > required_size)
+    required_size = size2;
 
-  cudaCheck(cudaMalloc(&(this->cub_work_buffer_[dev]),
-                       this->cub_work_buffer_size_[dev]));
+  if ((this->cub_work_buffer_[dev] != nullptr) &&
+      (required_size <= this->cub_work_buffer_size_[dev])) {
+    return;
+  }
+
+  // This path is reached only when scratch must grow. Release the old scratch
+  // before allocating the larger block to avoid temporarily holding both CUB
+  // allocations on memory-constrained devices.
+  if (this->cub_work_buffer_[dev] != nullptr) {
+    cudaCheck(cudaFree(this->cub_work_buffer_[dev]));
+    this->cub_work_buffer_[dev] = nullptr;
+    this->cub_work_buffer_size_[dev] = 0;
+  }
+
+  if (required_size > 0) {
+    cudaCheck(cudaMalloc(&(this->cub_work_buffer_[dev]), required_size));
+    this->cub_work_buffer_size_[dev] = required_size;
+  }
+
+  if (count_growth_event)
+    this->cub_work_buffer_growth_count_[dev]++;
 
   return;
 }
 
 void glst_workspace::allocate_cub(const int device_count) {
-  this->cub_work_buffer_.resize(device_count);
-  this->cub_work_buffer_size_.resize(device_count);
+  this->cub_work_buffer_.assign(device_count, nullptr);
+  this->cub_work_buffer_size_.assign(device_count, 0);
 
   for (int dev = 0; dev < device_count; dev++)
-    this->allocate_cub_for_device(dev);
+    this->ensure_cub_capacity_for_device(dev, false);
 
   return;
 }

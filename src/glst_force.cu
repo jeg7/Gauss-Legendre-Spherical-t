@@ -123,9 +123,11 @@ void glst_force::get_ef(cuda_container<double> &fx, cuda_container<double> &fy,
   // Preserve the existing single-GPU path exactly. Its local atom allocation
   // contains all atoms, so the existing CUB sort remains valid.
   if (this->execution_mode_ == GLST_EXECUTION_MODE::SINGLE_GPU_TILED) {
+    std::size_t cub_work_buffer_size =
+        this->workspace_->cub_work_buffer_size()[0];
+
     cub::DeviceRadixSort::SortPairs(
-        this->workspace_->cub_work_buffer()[0],
-        this->workspace_->cub_work_buffer_size()[0],
+        this->workspace_->cub_work_buffer()[0], cub_work_buffer_size,
         this->workspace_->sorted_idx()[0].d_array().data(),
         this->workspace_->idx()[0].d_array().data(),
         this->workspace_->fx()[0].d_array().data(), fx.d_array().data(),
@@ -133,8 +135,7 @@ void glst_force::get_ef(cuda_container<double> &fx, cuda_container<double> &fy,
         this->comp_streams_[0]);
 
     cub::DeviceRadixSort::SortPairs(
-        this->workspace_->cub_work_buffer()[0],
-        this->workspace_->cub_work_buffer_size()[0],
+        this->workspace_->cub_work_buffer()[0], cub_work_buffer_size,
         this->workspace_->sorted_idx()[0].d_array().data(),
         this->workspace_->idx()[0].d_array().data(),
         this->workspace_->fy()[0].d_array().data(), fy.d_array().data(),
@@ -142,8 +143,7 @@ void glst_force::get_ef(cuda_container<double> &fx, cuda_container<double> &fy,
         this->comp_streams_[0]);
 
     cub::DeviceRadixSort::SortPairs(
-        this->workspace_->cub_work_buffer()[0],
-        this->workspace_->cub_work_buffer_size()[0],
+        this->workspace_->cub_work_buffer()[0], cub_work_buffer_size,
         this->workspace_->sorted_idx()[0].d_array().data(),
         this->workspace_->idx()[0].d_array().data(),
         this->workspace_->fz()[0].d_array().data(), fz.d_array().data(),
@@ -151,8 +151,7 @@ void glst_force::get_ef(cuda_container<double> &fx, cuda_container<double> &fy,
         this->comp_streams_[0]);
 
     cub::DeviceRadixSort::SortPairs(
-        this->workspace_->cub_work_buffer()[0],
-        this->workspace_->cub_work_buffer_size()[0],
+        this->workspace_->cub_work_buffer()[0], cub_work_buffer_size,
         this->workspace_->sorted_idx()[0].d_array().data(),
         this->workspace_->idx()[0].d_array().data(),
         this->workspace_->en()[0].d_array().data(), en.d_array().data(),
@@ -988,7 +987,8 @@ void glst_force::calc_ener_force(const double *d_rx, const double *d_ry,
     // the owned-plus-halo short-range source arrays
     this->assign_atoms(d_rx, d_ry, d_rz, d_qc);
 
-    // assign_atoms may resize local atom storage, so zero after assignment.
+    // Assignment may grow local atom storage, but never shrinks it. Zero the
+    // active writable target prefix after assignment updates the active counts.
     this->zero_ef();
 
     // Iterate in the canonical global tile order. Each tile-aware method
@@ -1010,10 +1010,43 @@ void glst_force::calc_ener_force(const double *d_rx, const double *d_ry,
 
   this->reset_profile();
 
+  std::size_t atom_storage_growth_before = 0;
+  std::size_t cub_work_buffer_growth_before = 0;
+
+  for (int dev = 0; dev < this->cuda_count_; dev++) {
+    atom_storage_growth_before +=
+        this->workspace_->atom_storage_growth_count(dev);
+
+    cub_work_buffer_growth_before +=
+        this->workspace_->cub_work_buffer_growth_count(dev);
+  }
+
   const std::chrono::steady_clock::time_point total_start =
       std::chrono::steady_clock::now();
 
   this->assign_atoms(d_rx, d_ry, d_rz, d_qc);
+
+  std::size_t atom_storage_growth_after = 0;
+  std::size_t cub_work_buffer_growth_after = 0;
+
+  for (int dev = 0; dev < this->cuda_count_; dev++) {
+    atom_storage_growth_after +=
+        this->workspace_->atom_storage_growth_count(dev);
+
+    cub_work_buffer_growth_after +=
+        this->workspace_->cub_work_buffer_growth_count(dev);
+  }
+
+  utl::require(atom_storage_growth_after >= atom_storage_growth_before,
+               function_name, "Atom-storage growth counter decreased");
+
+  utl::require(cub_work_buffer_growth_after >= cub_work_buffer_growth_before,
+               function_name, "CUB growth counter decreased");
+
+  this->profile_.atom_storage_growth_events =
+      atom_storage_growth_after - atom_storage_growth_before;
+  this->profile_.cub_work_buffer_growth_events =
+      cub_work_buffer_growth_after - cub_work_buffer_growth_before;
 
   std::chrono::steady_clock::time_point phase_start =
       std::chrono::steady_clock::now();
@@ -1263,6 +1296,10 @@ void glst_force::assign_atoms_single_gpu(const double *d_rx, const double *d_ry,
   for (int dev = 0; dev < this->cuda_count_; dev++) {
     cudaCheck(cudaSetDevice(dev));
 
+    this->workspace_->set_atom_counts(
+        dev, static_cast<std::size_t>(this->plan_->natom()),
+        static_cast<std::size_t>(this->plan_->natom()));
+
     { // Fast reset of cell atom count array
       constexpr unsigned int num_threads = 512;
       const unsigned int num_blocks =
@@ -1358,9 +1395,11 @@ void glst_force::assign_atoms_single_gpu(const double *d_rx, const double *d_ry,
     }
 
     { // Sort atoms based on cell indices
+      std::size_t cub_work_buffer_size =
+          this->workspace_->cub_work_buffer_size()[dev];
+
       cub::DeviceRadixSort::SortPairs(
-          this->workspace_->cub_work_buffer()[dev],
-          this->workspace_->cub_work_buffer_size()[dev],
+          this->workspace_->cub_work_buffer()[dev], cub_work_buffer_size,
           this->workspace_->atom_cell_idx()[dev].d_array().data(),
           this->workspace_->atom_cell_sorted_idx()[dev].d_array().data(),
           this->workspace_->packets()[dev].d_array().data(),
@@ -1425,11 +1464,16 @@ void glst_force::validate_atom_scatter(void) const {
     const std::size_t source_atom_count =
         this->workspace_->source_atom_count(dev);
 
+    const std::size_t atom_capacity = this->workspace_->atom_capacity(dev);
+
     utl::require(owned_atom_count <= source_atom_count, function_name,
                  "Owned atom count exceeds source atom count");
 
-    utl::require(source_atom_count <= packets.size(), function_name,
-                 "Source atom count exceeds packet storage");
+    utl::require(source_atom_count <= atom_capacity, function_name,
+                 "Source atom count exceeds atom_capacity");
+
+    utl::require(packets.size() == atom_capacity, function_name,
+                 "Packet storage size does not match atom capacity");
 
     for (std::size_t i = 0; i < source_atom_count; i++) {
       const atom_packet &packet = packets[i];
@@ -1737,9 +1781,8 @@ void glst_force::assign_atoms_multi_gpu(const double *d_rx, const double *d_ry,
         source_cell_count == this->workspace_->sr_source_cell_capacity(dev),
         function_name, "Source cell count does not match workspace capacity");
 
-    this->workspace_->resize_atom_storage(dev, source_atom_count);
-    this->workspace_->set_source_atom_count(dev, source_atom_count);
-    this->workspace_->set_owned_atom_count(dev, owned_atom_count);
+    this->workspace_->ensure_atom_capacity(dev, source_atom_count);
+    this->workspace_->set_atom_counts(dev, source_atom_count, owned_atom_count);
 
     std::fill(this->workspace_->cell_atom_count()[dev].h_array().begin(),
               this->workspace_->cell_atom_count()[dev].h_array().end(), 0u);
@@ -4173,12 +4216,24 @@ void glst_force::reduce_tile_partition_ef(void) {
 }
 
 void glst_force::zero_ef(void) {
+  constexpr std::string_view function_name = "glst_force::zero_ef";
+
   for (int dev = 0; dev < this->cuda_count_; dev++) {
     cudaCheck(cudaSetDevice(dev));
 
-    const std::size_t nbytes =
-        this->workspace_->atom_capacity(dev) * sizeof(double);
+    const std::size_t atom_capacity = this->workspace_->atom_capacity(dev);
+    const std::size_t source_atom_count =
+        this->workspace_->source_atom_count(dev);
+    const std::size_t owned_atom_count =
+        this->workspace_->owned_atom_count(dev);
 
+    utl::require(owned_atom_count <= source_atom_count, function_name,
+                 "Owned atom count exceeds source atom count");
+
+    utl::require(source_atom_count <= atom_capacity, function_name,
+                 "Source atom count exceeds atom capacity");
+
+    const std::size_t nbytes = owned_atom_count * sizeof(double);
     if (nbytes == 0)
       continue;
 

@@ -55,6 +55,13 @@ target_link_libraries(hybrid_layout_correctness
   GLST
 )
 
+add_executable(atom_storage_capacity
+  ${GLST_SOURCE_DIR}/test/atom_storage_capacity.cu
+)
+target_link_libraries(atom_storage_capacity
+  GLST
+)
+
 # add_executable(setup_plan
 #   ${GLST_SOURCE_DIR}/test/setup_plan.cu
 # )

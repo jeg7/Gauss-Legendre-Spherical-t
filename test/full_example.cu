@@ -264,6 +264,8 @@ int main(int argc, char **argv) {
     std::size_t prefix_plane_import_count = 0;
     std::size_t owned_atom_replicas = 0;
     std::size_t halo_atom_replicas = 0;
+    std::size_t atom_storage_growth_events = 0;
+    std::size_t cub_work_buffer_growth_events = 0;
 
     glst_force_test_access::enable_profiling(*glst, true);
 
@@ -275,6 +277,15 @@ int main(int argc, char **argv) {
                             rz.d_array().data(), qc.d_array().data());
 
       const glst_profile &profile = glst_force_test_access::profile(*glst);
+
+      atom_storage_growth_events += profile.atom_storage_growth_events;
+      cub_work_buffer_growth_events += profile.cub_work_buffer_growth_events;
+
+      if ((iter > 0) && ((profile.atom_storage_growth_events != 0) ||
+                         (cub_work_buffer_growth_events != 0))) {
+        throw std::runtime_error("Storage allocation occurred after the first "
+                                 "repeated profiling calculation");
+      }
 
       assignment_times[iter] = profile.atom_assignment_scatter_ms;
       owned_halo_source_times[iter] = profile.owned_halo_source_scatter_ms;
@@ -429,6 +440,10 @@ int main(int argc, char **argv) {
               << std::endl;
     std::cout << "             Total atom replicas: " << total_atom_replicas
               << std::endl;
+    std::cout << "      Atom-storage growth events: "
+              << atom_storage_growth_events << std::endl;
+    std::cout << "   CUB work-buffer growth events: "
+              << cub_work_buffer_growth_events << std::endl;
     std::cout << "    Prefix-base all-gather input: " << prefix_base_input_mib
               << " MiB (" << prefix_base_input_bytes << " bytes)" << std::endl;
     std::cout << "     Imported prefix-plane input: " << prefix_plane_input_mib

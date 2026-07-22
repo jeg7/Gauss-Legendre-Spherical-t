@@ -50,6 +50,8 @@ public:
   std::size_t prefix_plane_slot_capacity(const int dev) const;
   std::size_t owned_atom_count(const int dev) const;
   std::size_t source_atom_count(const int dev) const;
+  std::size_t atom_storage_growth_count(const int dev) const;
+  std::size_t cub_work_buffer_growth_count(const int dev) const;
   std::size_t sr_source_cell_capacity(const int dev) const;
 
   const std::vector<std::size_t> &owned_atom_count(void) const;
@@ -143,14 +145,15 @@ public:
             const int device_count = 1, const bool full_sf_buffer = true,
             const bool distributed_prefix = false,
             const unsigned int sf_exchange_chunk_x_count = 0);
-  void resize_atom_storage(const int dev, const std::size_t atom_capacity);
-  void set_source_atom_count(const int dev,
-                             const std::size_t source_atom_count);
-  void set_owned_atom_count(const int dev, const std::size_t owned_atom_count);
+  void ensure_atom_capacity(const int dev,
+                            const std::size_t required_source_atom_count);
+  void set_atom_counts(const int dev, const std::size_t source_atom_count,
+                       const std::size_t owned_atom_count);
   void clear(void);
 
 private:
-  void allocate_cub_for_device(const int dev);
+  void ensure_cub_capacity_for_device(const int dev,
+                                      const bool count_growth_event);
   void allocate_cub(const int device_count);
   void deallocate_cub_for_device(const int dev);
   void deallocate_cub(void);
@@ -175,9 +178,15 @@ private:
   std::vector<std::size_t> prefix_plane_slot_capacity_;
   std::vector<std::size_t> owned_atom_count_;
   std::vector<std::size_t> source_atom_count_;
+  std::vector<std::size_t> atom_storage_growth_count_;
+  std::vector<std::size_t> cub_work_buffer_growth_count_;
   std::vector<std::size_t> sr_source_cell_capacity_;
 
-  // Atom arrays: Size atom_capacity_ (natom)
+  // Atom arrays are allocated to atom_capacity_.
+  //
+  // Source-array entries [0, source_atom_count_) are active. The owned target
+  // atoms occupy [0, owned_atom_count_), followed by short-range halo sources.
+  // Force/energy arrays are writable only in [0, owned_atom_count_).
   std::vector<cuda_container<unsigned int>> idx_;
   std::vector<cuda_container<unsigned int>> sorted_idx_;
   std::vector<cuda_container<double>> rx_;
