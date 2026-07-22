@@ -13,6 +13,17 @@
 
 #include <cstddef>
 
+// Deterministic global atom-classification key
+//
+// High 32 bits: Global cell ID
+// Low 32 bits: Original atom index
+using atom_sort_key = unsigned long long int;
+
+static_assert(sizeof(unsigned int) == 4,
+              "atom_sort_key requires 32-bit unsigned int fields");
+static_assert(sizeof(atom_sort_key) == 8,
+              "atom_sort_key must be exactly 64 bits");
+
 struct atom_packet {
 public:
   __device__ __host__ atom_packet(void)

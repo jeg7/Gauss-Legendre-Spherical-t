@@ -13,6 +13,7 @@
 
 #include "atom_packet.hcu"
 #include "cuda_container.hcu"
+#include "device_vector.hcu"
 #include "glst_plan.hcu"
 
 #include <cstddef>
@@ -70,6 +71,17 @@ public:
   const std::vector<cuda_container<unsigned int>> &
   atom_cell_sorted_idx(void) const;
 
+  const device_vector<atom_sort_key> &global_sort_key_in(void) const;
+  const device_vector<atom_sort_key> &global_sort_key_out(void) const;
+
+  const device_vector<atom_packet> &global_packet_in(void) const;
+  const device_vector<atom_packet> &global_packet_out(void) const;
+
+  const device_vector<unsigned int> &global_cell_atom_count(void) const;
+  const device_vector<unsigned int> &global_cell_atom_point(void) const;
+  const device_vector<unsigned int> &global_x_plane_atom_point(void) const;
+  const device_vector<unsigned int> &global_max_atoms_cell(void) const;
+
   const std::vector<cuda_container<double>> &fx(void) const;
   const std::vector<cuda_container<double>> &fy(void) const;
   const std::vector<cuda_container<double>> &fz(void) const;
@@ -111,6 +123,17 @@ public:
   std::vector<cuda_container<atom_packet>> &sorted_packets(void);
   std::vector<cuda_container<unsigned int>> &atom_cell_idx(void);
   std::vector<cuda_container<unsigned int>> &atom_cell_sorted_idx(void);
+
+  device_vector<atom_sort_key> &global_sort_key_in(void);
+  device_vector<atom_sort_key> &global_sort_key_out(void);
+
+  device_vector<atom_packet> &global_packet_in(void);
+  device_vector<atom_packet> &global_packet_out(void);
+
+  device_vector<unsigned int> &global_cell_atom_count(void);
+  device_vector<unsigned int> &global_cell_atom_point(void);
+  device_vector<unsigned int> &global_x_plane_atom_point(void);
+  device_vector<unsigned int> &global_max_atoms_cell(void);
 
   std::vector<cuda_container<double>> &fx(void);
   std::vector<cuda_container<double>> &fy(void);
@@ -197,6 +220,21 @@ private:
   std::vector<cuda_container<atom_packet>> sorted_packets_;
   std::vector<cuda_container<unsigned int>> atom_cell_idx_;
   std::vector<cuda_container<unsigned int>> atom_cell_sorted_idx_;
+
+  // Global atom-classification scratch. These singular device_vector objects
+  // are allocated only on CUDA device 0 when device_count > 1.
+  device_vector<atom_sort_key> global_sort_key_in_;
+  device_vector<atom_sort_key> global_sort_key_out_;
+
+  device_vector<atom_packet> global_packet_in_;
+  device_vector<atom_packet> global_packet_out_;
+
+  device_vector<unsigned int> global_cell_atom_count_;
+  device_vector<unsigned int> global_cell_atom_point_;
+  device_vector<unsigned int> global_x_plane_atom_point_;
+
+  // One-element output for DeivceReduce::Max over global cell counts.
+  device_vector<unsigned int> global_max_atoms_cell_;
 
   std::vector<cuda_container<double>> fx_;
   std::vector<cuda_container<double>> fy_;

@@ -27,6 +27,15 @@ inline static std::size_t checked_mul(const std::size_t a, const std::size_t b,
   return (a * b);
 }
 
+inline static std::size_t checked_add(const std::size_t a, const std::size_t b,
+                                      const std::string_view label) {
+  if (b > std::numeric_limits<std::size_t>::max() - a) {
+    utl::throw_error("checked_add",
+                     "Overflow while computing " + std::string(label));
+  }
+  return (a + b);
+}
+
 glst_workspace::glst_workspace(void)
     : max_atom_capacity_(0), max_cell_capacity_(0), tile_node_capacity_(0),
       max_sf_tile_buffer_capacity_(0), max_sf_exchange_tile_buffer_capacity_(0),
@@ -39,8 +48,11 @@ glst_workspace::glst_workspace(void)
       owned_atom_count_(), source_atom_count_(), atom_storage_growth_count_(),
       cub_work_buffer_growth_count_(), sr_source_cell_capacity_(), idx_(),
       sorted_idx_(), rx_(), ry_(), rz_(), qc_(), packets_(), sorted_packets_(),
-      atom_cell_idx_(), atom_cell_sorted_idx_(), fx_(), fy_(), fz_(), en_(),
-      cell_atom_point_(), cell_atom_count_(), max_atoms_cell_(),
+      atom_cell_idx_(), atom_cell_sorted_idx_(), global_sort_key_in_(),
+      global_sort_key_out_(), global_packet_in_(), global_packet_out_(),
+      global_cell_atom_count_(), global_cell_atom_point_(),
+      global_x_plane_atom_point_(), global_max_atoms_cell_(), fx_(), fy_(),
+      fz_(), en_(), cell_atom_point_(), cell_atom_count_(), max_atoms_cell_(),
       sr_source_cell_atom_point_(), sr_source_cell_atom_count_(), sf_re_(),
       sf_im_(), sf_exchange_re_(), sf_exchange_im_(),
       prefix_partition_total_re_(), prefix_partition_total_im_(),
@@ -264,6 +276,45 @@ glst_workspace::atom_cell_sorted_idx(void) const {
   return this->atom_cell_sorted_idx_;
 }
 
+const device_vector<atom_sort_key> &
+glst_workspace::global_sort_key_in(void) const {
+  return this->global_sort_key_in_;
+}
+
+const device_vector<atom_sort_key> &
+glst_workspace::global_sort_key_out(void) const {
+  return this->global_sort_key_out_;
+}
+
+const device_vector<atom_packet> &glst_workspace::global_packet_in(void) const {
+  return this->global_packet_in_;
+}
+
+const device_vector<atom_packet> &
+glst_workspace::global_packet_out(void) const {
+  return this->global_packet_out_;
+}
+
+const device_vector<unsigned int> &
+glst_workspace::global_cell_atom_count(void) const {
+  return this->global_cell_atom_count_;
+}
+
+const device_vector<unsigned int> &
+glst_workspace::global_cell_atom_point(void) const {
+  return this->global_cell_atom_point_;
+}
+
+const device_vector<unsigned int> &
+glst_workspace::global_x_plane_atom_point(void) const {
+  return this->global_x_plane_atom_point_;
+}
+
+const device_vector<unsigned int> &
+glst_workspace::global_max_atoms_cell(void) const {
+  return this->global_max_atoms_cell_;
+}
+
 const std::vector<cuda_container<double>> &glst_workspace::fx(void) const {
   return this->fx_;
 }
@@ -407,6 +458,38 @@ glst_workspace::atom_cell_sorted_idx(void) {
   return this->atom_cell_sorted_idx_;
 }
 
+device_vector<atom_sort_key> &glst_workspace::global_sort_key_in(void) {
+  return this->global_sort_key_in_;
+}
+
+device_vector<atom_sort_key> &glst_workspace::global_sort_key_out(void) {
+  return this->global_sort_key_out_;
+}
+
+device_vector<atom_packet> &glst_workspace::global_packet_in(void) {
+  return this->global_packet_in_;
+}
+
+device_vector<atom_packet> &glst_workspace::global_packet_out(void) {
+  return this->global_packet_out_;
+}
+
+device_vector<unsigned int> &glst_workspace::global_cell_atom_count(void) {
+  return this->global_cell_atom_count_;
+}
+
+device_vector<unsigned int> &glst_workspace::global_cell_atom_point(void) {
+  return this->global_cell_atom_point_;
+}
+
+device_vector<unsigned int> &glst_workspace::global_x_plane_atom_point(void) {
+  return this->global_x_plane_atom_point_;
+}
+
+device_vector<unsigned int> &glst_workspace::global_max_atoms_cell(void) {
+  return this->global_max_atoms_cell_;
+}
+
 std::vector<cuda_container<double>> &glst_workspace::fx(void) {
   return this->fx_;
 }
@@ -536,11 +619,53 @@ void glst_workspace::init(const glst_plan &plan,
   const std::size_t max_tile_nodes =
       static_cast<std::size_t>(plan.max_tile_nodes());
 
+  const bool allocate_global_classification_scratch = (device_count > 1);
+
+  std::size_t global_cell_point_count = 0;
+  std::size_t global_x_plane_point_count = 0;
+
   utl::require(global_natom > 0, function_name, "natom is 0");
 
   utl::require(global_ncell > 0, function_name, "ncell is 0");
 
   utl::require(max_tile_nodes > 0, function_name, "max_tile_nodes is 0");
+
+  if (allocate_global_classification_scratch) {
+    const std::size_t cub_item_limit =
+        static_cast<std::size_t>(std::numeric_limits<int>::max());
+
+    utl::require(global_natom <= cub_item_limit, function_name,
+                 "Global atom count exceeds CUB int range");
+
+    utl::require(global_ncell <= cub_item_limit, function_name,
+                 "Global cell count exceeds CUB int range");
+
+    global_cell_point_count =
+        checked_add(global_ncell, static_cast<std::size_t>(1),
+                    "Global cell atom-point count");
+
+    global_x_plane_point_count = checked_add(
+        static_cast<std::size_t>(plan.ncell_x()), static_cast<std::size_t>(1),
+        "Global x-plane atom-point count");
+
+    // device_vector performs count * sizeof(T) internally. Validate every
+    // distinct allocation shape before any cudaMalloc can occur.
+    static_cast<void>(checked_mul(global_natom, sizeof(atom_sort_key),
+                                  "Global sort-key buffer bytes"));
+
+    static_cast<void>(checked_mul(global_natom, sizeof(atom_packet),
+                                  "Global atom-packet buffer bytes"));
+
+    static_cast<void>(checked_mul(global_ncell, sizeof(unsigned int),
+                                  "Global cell atom-point buffer bytes"));
+
+    static_cast<void>(checked_mul(global_cell_point_count, sizeof(unsigned int),
+                                  "Global cell atom-point buffer bytes"));
+
+    static_cast<void>(checked_mul(global_x_plane_point_count,
+                                  sizeof(unsigned int),
+                                  "Global x-plane atom-point buffer bytes"));
+  }
 
   utl::require(
       !(use_full_sf_buffer && use_distributed_prefix), function_name,
@@ -793,6 +918,22 @@ void glst_workspace::init(const glst_plan &plan,
     this->rmt_sum_im_[dev].resize(this->rmt_tile_buffer_capacity_[dev]);
   }
 
+  if (allocate_global_classification_scratch) {
+    cudaCheck(cudaSetDevice(0));
+
+    this->global_sort_key_in_.resize(global_natom);
+    this->global_sort_key_out_.resize(global_natom);
+
+    this->global_packet_in_.resize(global_natom);
+    this->global_packet_out_.resize(global_natom);
+
+    this->global_cell_atom_count_.resize(global_ncell);
+    this->global_cell_atom_point_.resize(global_cell_point_count);
+    this->global_x_plane_atom_point_.resize(global_x_plane_point_count);
+
+    this->global_max_atoms_cell_.resize(1);
+  }
+
   this->allocate_cub(device_count);
 
   return;
@@ -940,6 +1081,17 @@ void glst_workspace::clear(void) {
   this->atom_cell_idx_.clear();
   this->atom_cell_sorted_idx_.clear();
 
+  this->global_sort_key_in_.clear();
+  this->global_sort_key_out_.clear();
+
+  this->global_packet_in_.clear();
+  this->global_packet_out_.clear();
+
+  this->global_cell_atom_count_.clear();
+  this->global_cell_atom_point_.clear();
+  this->global_x_plane_atom_point_.clear();
+  this->global_max_atoms_cell_.clear();
+
   this->fx_.clear();
   this->fy_.clear();
   this->fz_.clear();
@@ -988,42 +1140,124 @@ void glst_workspace::ensure_cub_capacity_for_device(
 
   const std::size_t atom_capacity = this->atom_capacity_[dev];
 
-  if (atom_capacity == 0)
+  const bool has_global_classification_scratch =
+      ((dev == 0) && (!this->global_sort_key_in_.empty()));
+
+  if ((atom_capacity == 0) && (!has_global_classification_scratch))
     return;
 
-  utl::require(atom_capacity <=
-                   static_cast<std::size_t>(std::numeric_limits<int>::max()),
-               function_name, "Atom capacity exceeds CUB int range");
-
-  const int num_items = static_cast<int>(atom_capacity);
-
-  // Determine storage requirements for CUB functions
-  std::size_t size0 = 0, size1 = 0, size2 = 0;
   void *tmp = nullptr;
+  std::size_t required_size = 0;
 
-  cub::DeviceRadixSort::SortPairs(
-      tmp, size0, this->atom_cell_idx_[dev].d_array().data(),
-      this->atom_cell_sorted_idx_[dev].d_array().data(),
-      this->idx_[dev].d_array().data(), this->sorted_idx_[dev].d_array().data(),
-      num_items);
+  if (atom_capacity > 0) {
+    utl::require(atom_capacity <=
+                     static_cast<std::size_t>(std::numeric_limits<int>::max()),
+                 function_name, "Atom capacity exceeds CUB int range");
 
-  cub::DeviceRadixSort::SortPairs(
-      tmp, size1, this->atom_cell_idx_[dev].d_array().data(),
-      this->atom_cell_sorted_idx_[dev].d_array().data(),
-      this->fx_[dev].d_array().data(), this->fx_[dev].d_array().data(),
-      num_items);
+    const int num_items = static_cast<int>(atom_capacity);
 
-  cub::DeviceRadixSort::SortPairs(
-      tmp, size2, this->atom_cell_idx_[dev].d_array().data(),
-      this->atom_cell_sorted_idx_[dev].d_array().data(),
-      this->packets_[dev].d_array().data(),
-      this->sorted_packets_[dev].d_array().data(), num_items);
+    // Determine storage requirements for CUB functions
+    std::size_t index_sort_size = 0;
+    std::size_t value_sort_size = 0;
+    std::size_t packet_sort_size = 0;
 
-  std::size_t required_size = size0;
-  if (size1 > required_size)
-    required_size = size1;
-  if (size2 > required_size)
-    required_size = size2;
+    cub::DeviceRadixSort::SortPairs(
+        tmp, index_sort_size, this->atom_cell_idx_[dev].d_array().data(),
+        this->atom_cell_sorted_idx_[dev].d_array().data(),
+        this->idx_[dev].d_array().data(),
+        this->sorted_idx_[dev].d_array().data(), num_items);
+
+    cub::DeviceRadixSort::SortPairs(
+        tmp, value_sort_size, this->atom_cell_idx_[dev].d_array().data(),
+        this->atom_cell_sorted_idx_[dev].d_array().data(),
+        this->fx_[dev].d_array().data(), this->fx_[dev].d_array().data(),
+        num_items);
+
+    cub::DeviceRadixSort::SortPairs(
+        tmp, packet_sort_size, this->atom_cell_idx_[dev].d_array().data(),
+        this->atom_cell_sorted_idx_[dev].d_array().data(),
+        this->packets_[dev].d_array().data(),
+        this->sorted_packets_[dev].d_array().data(), num_items);
+
+    required_size = index_sort_size;
+
+    if (value_sort_size > required_size)
+      required_size = value_sort_size;
+
+    if (packet_sort_size > required_size)
+      required_size = packet_sort_size;
+  }
+
+  if (has_global_classification_scratch) {
+    const std::size_t global_atom_count = this->global_sort_key_in_.size();
+    const std::size_t global_cell_count = this->global_cell_atom_count_.size();
+
+    utl::require(global_atom_count > 0, function_name,
+                 "Global atom-classification cpacity is zero");
+
+    utl::require(global_cell_count > 0, function_name,
+                 "Global cell-count capacity is zero");
+
+    utl::require(this->global_sort_key_out_.size() == global_atom_count,
+                 function_name, "Global sort-key capacities differ");
+
+    utl::require(this->global_packet_in_.size() == global_atom_count,
+                 function_name,
+                 "Global input packet capacity does not match atom count");
+
+    utl::require(this->global_packet_out_.size() == global_atom_count,
+                 function_name,
+                 "Global output packet capacity does not match atom count");
+
+    utl::require(this->global_cell_atom_point_.size() == global_cell_count + 1,
+                 function_name,
+                 "Global cell atom-point capacity lacks the final endpoint");
+
+    utl::require(!this->global_x_plane_atom_point_.empty(), function_name,
+                 "Global x-plane atom-point capacity is zero");
+
+    utl::require(this->global_max_atoms_cell_.size() == 1, function_name,
+                 "Global reduction-output capacity is not one");
+
+    const std::size_t cub_item_limit =
+        static_cast<std::size_t>(std::numeric_limits<int>::max());
+
+    utl::require(global_atom_count <= cub_item_limit, function_name,
+                 "Global atom count exceeds CUB int range");
+
+    utl::require(global_cell_count <= cub_item_limit, function_name,
+                 "Global cell count exceeds CUB int range");
+
+    const int global_atom_items = static_cast<int>(global_atom_count);
+    const int global_cell_items = static_cast<int>(global_cell_count);
+
+    std::size_t global_sort_size = 0;
+    std::size_t global_scan_size = 0;
+    std::size_t global_reduce_size = 0;
+
+    cub::DeviceRadixSort::SortPairs(
+        tmp, global_sort_size, this->global_sort_key_in_.data(),
+        this->global_sort_key_out_.data(), this->global_packet_in_.data(),
+        this->global_packet_out_.data(), global_atom_items, 0,
+        static_cast<int>(8 * sizeof(atom_sort_key)));
+
+    cub::DeviceScan::ExclusiveSum(
+        tmp, global_scan_size, this->global_cell_atom_count_.data(),
+        this->global_cell_atom_point_.data(), global_cell_items);
+
+    cub::DeviceReduce::Max(
+        tmp, global_reduce_size, this->global_cell_atom_count_.data(),
+        this->global_max_atoms_cell_.data(), global_cell_items);
+
+    if (global_sort_size > required_size)
+      required_size = global_sort_size;
+
+    if (global_scan_size > required_size)
+      required_size = global_scan_size;
+
+    if (global_reduce_size > required_size)
+      required_size = global_reduce_size;
+  }
 
   if ((this->cub_work_buffer_[dev] != nullptr) &&
       (required_size <= this->cub_work_buffer_size_[dev])) {

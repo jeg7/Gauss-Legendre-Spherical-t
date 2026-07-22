@@ -13,6 +13,8 @@
 #include <glst_force.hcu>
 #include <glst_workspace.hcu>
 
+#include <cub/cub.cuh>
+
 #include <array>
 #include <cmath>
 #include <cstddef>
@@ -31,12 +33,22 @@ public:
 
     return *(force.workspace_);
   }
+
+  static const glst_plan &plan(const glst_force &force) {
+    if (force.plan_ == nullptr) {
+      throw std::runtime_error(
+          "glst_force_test_access::plan: Plan is not initialized");
+    }
+
+    return *(force.plan_);
+  }
 };
 
 namespace {
 
 constexpr int test_device_count = 2;
 constexpr std::size_t atom_buffer_count = 14;
+constexpr std::size_t global_scratch_buffer_count = 8;
 
 struct storage_snapshot {
   std::array<std::size_t, test_device_count> atom_capacity;
@@ -48,11 +60,139 @@ struct storage_snapshot {
   std::array<const void *, test_device_count> cub_buffer;
   std::array<std::array<const void *, atom_buffer_count>, test_device_count>
       atom_buffer;
+  std::array<std::size_t, global_scratch_buffer_count> global_scratch_size;
+  std::array<const void *, global_scratch_buffer_count> global_scratch_buffer;
 };
 
 void require(const bool condition, const std::string &message) {
   if (!condition)
     throw std::runtime_error(message);
+
+  return;
+}
+
+std::array<std::size_t, global_scratch_buffer_count>
+global_scratch_sizes(const glst_workspace &workspace) {
+  return std::array<std::size_t, global_scratch_buffer_count>{
+      workspace.global_sort_key_in().size(),
+      workspace.global_sort_key_out().size(),
+      workspace.global_packet_in().size(),
+      workspace.global_packet_out().size(),
+      workspace.global_cell_atom_count().size(),
+      workspace.global_cell_atom_point().size(),
+      workspace.global_x_plane_atom_point().size(),
+      workspace.global_max_atoms_cell().size()};
+}
+
+std::array<const void *, global_scratch_buffer_count>
+global_scratch_addresses(const glst_workspace &workspace) {
+  return std::array<const void *, global_scratch_buffer_count>{
+      static_cast<const void *>(workspace.global_sort_key_in().data()),
+      static_cast<const void *>(workspace.global_sort_key_out().data()),
+      static_cast<const void *>(workspace.global_packet_in().data()),
+      static_cast<const void *>(workspace.global_packet_out().data()),
+      static_cast<const void *>(workspace.global_cell_atom_count().data()),
+      static_cast<const void *>(workspace.global_cell_atom_point().data()),
+      static_cast<const void *>(workspace.global_x_plane_atom_point().data()),
+      static_cast<const void *>(workspace.global_max_atoms_cell().data())};
+}
+
+void require_no_global_classification_scratch(const glst_workspace &workspace) {
+  const std::array<std::size_t, global_scratch_buffer_count> sizes =
+      global_scratch_sizes(workspace);
+
+  const std::array<const void *, global_scratch_buffer_count> buffers =
+      global_scratch_addresses(workspace);
+
+  for (std::size_t i = 0; i < global_scratch_buffer_count; i++) {
+    require(sizes[i] == 0,
+            "Single-device workspace allocated global classification storage");
+
+    require(buffers[i] == nullptr,
+            "Single-device workspace has a global classification pointer");
+  }
+
+  return;
+}
+
+void require_global_classification_scratch(const glst_workspace &workspace,
+                                           const std::size_t natom,
+                                           const std::size_t ncell,
+                                           const std::size_t ncell_x) {
+  const std::array<std::size_t, global_scratch_buffer_count> expected_sizes{
+      natom, natom, natom, natom, ncell, ncell + 1, ncell_x + 1, 1};
+
+  const std::array<std::size_t, global_scratch_buffer_count> observed_sizes =
+      global_scratch_sizes(workspace);
+
+  require(observed_sizes == expected_sizes,
+          "Global classification scratch sizes are incorrect");
+
+  const std::array<const void *, global_scratch_buffer_count> buffers =
+      global_scratch_addresses(workspace);
+
+  cudaCheck(cudaSetDevice(0));
+
+  for (std::size_t i = 0; i < global_scratch_buffer_count; i++) {
+    require(buffers[i] != nullptr,
+            "Global classification scratch contains a null pointer");
+
+    cudaPointerAttributes attributes{};
+    cudaCheck(cudaPointerGetAttributes(&attributes, buffers[i]));
+
+    require(attributes.device == 0,
+            "Global classification scratch was not allocated on GPU 0");
+  }
+
+  std::size_t sort_size = 0;
+  std::size_t scan_size = 0;
+  std::size_t reduce_size = 0;
+  void *tmp = nullptr;
+
+  atom_sort_key *key_in =
+      const_cast<atom_sort_key *>(workspace.global_sort_key_in().data());
+
+  atom_sort_key *key_out =
+      const_cast<atom_sort_key *>(workspace.global_sort_key_out().data());
+
+  atom_packet *packet_in =
+      const_cast<atom_packet *>(workspace.global_packet_in().data());
+
+  atom_packet *packet_out =
+      const_cast<atom_packet *>(workspace.global_packet_out().data());
+
+  unsigned int *cell_count =
+      const_cast<unsigned int *>(workspace.global_cell_atom_count().data());
+
+  unsigned int *cell_point =
+      const_cast<unsigned int *>(workspace.global_cell_atom_point().data());
+
+  unsigned int *max_atoms =
+      const_cast<unsigned int *>(workspace.global_max_atoms_cell().data());
+
+  cub::DeviceRadixSort::SortPairs(tmp, sort_size, key_in, key_out, packet_in,
+                                  packet_out, static_cast<int>(natom), 0,
+                                  static_cast<int>(8 * sizeof(atom_sort_key)));
+
+  cub::DeviceScan::ExclusiveSum(tmp, scan_size, cell_count, cell_point,
+                                static_cast<int>(ncell));
+
+  cub::DeviceReduce::Max(tmp, reduce_size, cell_count, max_atoms,
+                         static_cast<int>(ncell));
+
+  std::size_t required_cub_size = sort_size;
+
+  if (scan_size > required_cub_size)
+    required_cub_size = scan_size;
+
+  if (reduce_size > required_cub_size)
+    required_cub_size = reduce_size;
+
+  require(workspace.cub_work_buffer()[0] != nullptr,
+          "GPU-0 CUB work buffer is null");
+
+  require(workspace.cub_work_buffer_size()[0] >= required_cub_size,
+          "GPU-0 CUB work buffer is too small for global classification");
 
   return;
 }
@@ -129,6 +269,9 @@ storage_snapshot take_snapshot(const glst_force &force) {
     snapshot.atom_buffer[index] = atom_buffer_addresses(workspace, dev);
   }
 
+  snapshot.global_scratch_size = global_scratch_sizes(workspace);
+  snapshot.global_scratch_buffer = global_scratch_addresses(workspace);
+
   return snapshot;
 }
 
@@ -156,6 +299,14 @@ void require_device_allocation_unchanged(const storage_snapshot &before,
 
   require(after.atom_buffer[index] == before.atom_buffer[index],
           prefix + "at least one atom-array pointer changed");
+
+  if (dev == 0) {
+    require(after.global_scratch_size == before.global_scratch_size,
+            prefix + "global classification sizes changed");
+
+    require(after.global_scratch_buffer == before.global_scratch_buffer,
+            prefix + "global classification pointers changed");
+  }
 
   return;
 }
@@ -272,6 +423,16 @@ int main(void) {
     force.set_gpu_layout(2, 1);
     force.init(natom, tol, box, box, box, rcut);
 
+    {
+      glst_workspace single_device_workspace(
+          glst_force_test_access::plan(force), 1);
+
+      require_no_global_classification_scratch(single_device_workspace);
+    }
+
+    require_global_classification_scratch(
+        glst_force_test_access::workspace(force), natom, 64, 4);
+
     const storage_snapshot initial = take_snapshot(force);
 
     require(initial.atom_capacity[0] == 6000,
@@ -354,6 +515,18 @@ int main(void) {
 
     require(grown.atom_buffer[0] != below_capacity.atom_buffer[0],
             "Device-0 atom-array pointers did not change during growth");
+
+    require(grown.global_scratch_size == below_capacity.global_scratch_size,
+            "GPU-0 global classification sizes changed during atom growth");
+
+    require(grown.global_scratch_buffer == below_capacity.global_scratch_buffer,
+            "GPU-0 global classification pointers changed during atom growth");
+
+    require(grown.cub_buffer[0] == below_capacity.cub_buffer[0],
+            "GPU-0 CUB buffer reallocated after initialization");
+
+    require(grown.cub_growth_count[0] == below_capacity.cub_growth_count[0],
+            "GPU-0 CUB growth was recorded after initialization");
 
     require_device_allocation_unchanged(below_capacity, grown, 1,
                                         "Capacity-exceeding assignment");
