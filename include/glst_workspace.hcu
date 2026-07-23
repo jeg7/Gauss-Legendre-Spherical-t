@@ -252,7 +252,8 @@ private:
   device_vector<unsigned int> global_cell_atom_point_;
   device_vector<unsigned int> global_x_plane_atom_point_;
 
-  // One-element output for DeivceReduce::Max over global cell counts.
+  // One DeviceReduce::max output per cell partition. This scratch array is
+  // allocated only on GPU 0 with the other global classification buffers.
   device_vector<unsigned int> global_max_atoms_cell_;
 
   std::vector<cuda_container<double>> fx_;

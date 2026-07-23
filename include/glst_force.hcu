@@ -119,8 +119,9 @@ private:
   void build_global_atom_reference(const double *d_rx, const double *d_ry,
                                    const double *d_rz, const double *d_qc);
 
-  // Packet-only multi-GPU assignment step. This deliberately does not unpack
-  // packets or construct local device metadata yet.
+  // GPU-resident root scatter for sorted packets and contiguous source-cell
+  // counts. assign_atoms_multi_gpu unpacks packets and builds local prefix
+  // metadata on each root's compute stream.
   void scatter_sorted_atom_packets(const double *d_rx, const double *d_ry,
                                    const double *d_rz, const double *d_qc);
 

@@ -281,6 +281,7 @@ static double run_case(const unsigned int cell_partition_count,
 
   glst_force force;
   force.set_gpu_layout(cell_partition_count, tile_partition_count);
+  force.set_sf_exchange_mode(GLST_SF_EXCHANGE_MODE::FULL_GLOBAL_ALLREDUCE);
   force.init(natom, tol, box, box, box, rcut);
   force.assign_atoms(rx.d_array().data(), ry.d_array().data(),
                      rz.d_array().data(), qc.d_array().data());
@@ -571,9 +572,10 @@ static double run_case(const unsigned int cell_partition_count,
   require(reduced_value_count > 0,
           "Reduction test did not check any owned force/energy values");
 
-  // Run the same calculation through the public orchestration method. The
-  // workspace is deliberately nonzero here, so this also verifies that
-  // calc_ener_force zeroes old force/energy values before accumulating.
+  // Run the same calculation through the public orchestration method. The owned
+  // writable prefix is deliberately nonzero, so this verifies that
+  // calc_ener_force zeroes old owned force/energy values before accumulating.
+  // The non-owned source/capacity tail must remain unchanged.
   force.calc_ener_force(rx.d_array().data(), ry.d_array().data(),
                         rz.d_array().data(), qc.d_array().data());
 
@@ -581,7 +583,7 @@ static double run_case(const unsigned int cell_partition_count,
 
   double orchestration_max_error = 0.0;
   std::size_t orchestration_value_count = 0;
-  std::size_t zero_halo_value_count = 0;
+  std::size_t preserved_orchestration_tail_value_count = 0;
 
   for (unsigned int cell_partition = 0; cell_partition < cell_partition_count;
        cell_partition++) {
@@ -591,6 +593,12 @@ static double run_case(const unsigned int cell_partition_count,
 
     require(workspace.owned_atom_count(root_dev) == owned_atom_count,
             "calc_ener_force changed the root owned atom count");
+
+    require((post_reduce.fx[root_dev].size() == atom_capacity) &&
+                (post_reduce.fy[root_dev].size() == atom_capacity) &&
+                (post_reduce.fz[root_dev].size() == atom_capacity) &&
+                (post_reduce.en[root_dev].size() == atom_capacity),
+            "calc_ener_force changed the root force/energy capacity");
 
     for (std::size_t atom = 0; atom < owned_atom_count; atom++) {
       std::ostringstream prefix;
@@ -620,23 +628,24 @@ static double run_case(const unsigned int cell_partition_count,
       orchestration_value_count += 4;
     }
 
-    // calc_ener_force must zero the complete local allocation, while all
-    // calculation and reduction kernels are restricted to owned atoms.
+    // calc_ener_force zeroes and writes only the owned target prefix. Atom
+    // assignment, long-range kernels, short-range kernels, and tile reduction
+    // must leave the non-owned source/capacity tail unchanged.
     for (std::size_t atom = owned_atom_count; atom < atom_capacity; atom++) {
-      if ((orchestrated.fx[root_dev][atom] != 0.0) ||
-          (orchestrated.fy[root_dev][atom] != 0.0) ||
-          (orchestrated.fz[root_dev][atom] != 0.0) ||
-          (orchestrated.en[root_dev][atom] != 0.0)) {
+      if ((orchestrated.fx[root_dev][atom] != post_reduce.fx[root_dev][atom]) ||
+          (orchestrated.fy[root_dev][atom] != post_reduce.fy[root_dev][atom]) ||
+          (orchestrated.fz[root_dev][atom] != post_reduce.fz[root_dev][atom]) ||
+          (orchestrated.en[root_dev][atom] != post_reduce.en[root_dev][atom])) {
         std::ostringstream message;
         message << "calc_ener_force, cell partition " << cell_partition
                 << ", root GPU " << root_dev
-                << ": halo force/energy entry was modified at local atom "
+                << ": non-owned force/energy tail entry changed at local atom "
                 << atom << " (owned atoms " << owned_atom_count << ", capacity "
                 << atom_capacity << ")";
         throw std::runtime_error(message.str());
       }
 
-      zero_halo_value_count += 4;
+      preserved_orchestration_tail_value_count += 4;
     }
   }
 
@@ -780,8 +789,9 @@ static double run_case(const unsigned int cell_partition_count,
             << "^3 cells, " << reduced_value_count << " reduced values, "
             << orchestration_value_count << " calc_ener_force values, "
             << gathered_value_count << " gathered host/device values, "
-            << checked_halo_count << " preserved sentinel halo values, "
-            << zero_halo_value_count << " zeroed halo values, max error "
+            << checked_halo_count << " preserved reduction tail values, "
+            << preserved_orchestration_tail_value_count
+            << " preserved calc_ener_force tail values, max error "
             << std::scientific << std::setprecision(6) << max_error
             << std::endl;
 

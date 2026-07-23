@@ -626,6 +626,8 @@ void glst_workspace::init(const glst_plan &plan,
 
   const std::size_t global_natom = static_cast<std::size_t>(plan.natom());
   const std::size_t global_ncell = static_cast<std::size_t>(plan.ncell());
+  const std::size_t global_partition_count =
+      static_cast<std::size_t>(plan.cell_partition_count());
   const std::size_t max_tile_nodes =
       static_cast<std::size_t>(plan.max_tile_nodes());
 
@@ -637,6 +639,9 @@ void glst_workspace::init(const glst_plan &plan,
   utl::require(global_natom > 0, function_name, "natom is 0");
 
   utl::require(global_ncell > 0, function_name, "ncell is 0");
+
+  utl::require(global_partition_count > 0, function_name,
+               "cell_partition_count is 0");
 
   utl::require(max_tile_nodes > 0, function_name, "max_tile_nodes is 0");
 
@@ -675,6 +680,9 @@ void glst_workspace::init(const glst_plan &plan,
     static_cast<void>(checked_mul(global_x_plane_point_count,
                                   sizeof(unsigned int),
                                   "Global x-plane atom-point buffer bytes"));
+
+    static_cast<void>(checked_mul(global_partition_count, sizeof(unsigned int),
+                                  "Global partition max-atoms buffer size"));
   }
 
   utl::require(
@@ -944,7 +952,7 @@ void glst_workspace::init(const glst_plan &plan,
     this->global_cell_atom_point_.resize(global_cell_point_count);
     this->global_x_plane_atom_point_.resize(global_x_plane_point_count);
 
-    this->global_max_atoms_cell_.resize(1);
+    this->global_max_atoms_cell_.resize(global_partition_count);
   }
 
   this->allocate_cub(device_count);
@@ -1155,10 +1163,17 @@ void glst_workspace::ensure_cub_capacity_for_device(
 
   const std::size_t atom_capacity = this->atom_capacity_[dev];
 
+  utl::require(
+      static_cast<std::size_t>(dev) < this->sr_source_cell_capacity_.size(),
+      function_name, "Short-range source-cell device index out of range");
+
+  const std::size_t source_cell_capacity = this->sr_source_cell_capacity_[dev];
+
   const bool has_global_classification_scratch =
       ((dev == 0) && (!this->global_sort_key_in_.empty()));
 
-  if ((atom_capacity == 0) && (!has_global_classification_scratch))
+  if ((atom_capacity == 0) && (source_cell_capacity == 0) &&
+      (!has_global_classification_scratch))
     return;
 
   void *tmp = nullptr;
@@ -1203,6 +1218,24 @@ void glst_workspace::ensure_cub_capacity_for_device(
       required_size = packet_sort_size;
   }
 
+  if (source_cell_capacity > 0) {
+    utl::require(source_cell_capacity <=
+                     static_cast<std::size_t>(std::numeric_limits<int>::max()),
+                 function_name,
+                 "Short-range source-cell capacity exceeds CUB int range");
+
+    std::size_t source_cell_scan_size = 0;
+
+    cudaCheck(cub::DeviceScan::ExclusiveSum(
+        tmp, source_cell_scan_size,
+        this->sr_source_cell_atom_count_[dev].d_array().data(),
+        this->sr_source_cell_atom_point_[dev].d_array().data(),
+        static_cast<int>(source_cell_capacity)));
+
+    if (source_cell_scan_size > required_size)
+      required_size = source_cell_scan_size;
+  }
+
   if (has_global_classification_scratch) {
     const std::size_t global_atom_count = this->global_sort_key_in_.size();
     const std::size_t global_cell_count = this->global_cell_atom_count_.size();
@@ -1231,8 +1264,8 @@ void glst_workspace::ensure_cub_capacity_for_device(
     utl::require(!this->global_x_plane_atom_point_.empty(), function_name,
                  "Global x-plane atom-point capacity is zero");
 
-    utl::require(this->global_max_atoms_cell_.size() == 1, function_name,
-                 "Global reduction-output capacity is not one");
+    utl::require(!this->global_max_atoms_cell_.empty(), function_name,
+                 "Global reduction-output capacity is zero");
 
     const std::size_t cub_item_limit =
         static_cast<std::size_t>(std::numeric_limits<int>::max());

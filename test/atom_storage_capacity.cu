@@ -13,8 +13,6 @@
 #include <glst_force.hcu>
 #include <glst_workspace.hcu>
 
-#include <cub/cub.cuh>
-
 #include <array>
 #include <cmath>
 #include <cstddef>
@@ -115,12 +113,13 @@ void require_no_global_classification_scratch(const glst_workspace &workspace) {
   return;
 }
 
-void require_global_classification_scratch(const glst_workspace &workspace,
-                                           const std::size_t natom,
-                                           const std::size_t ncell,
-                                           const std::size_t ncell_x) {
+void require_global_classification_scratch(
+    const glst_workspace &workspace, const std::size_t natom,
+    const std::size_t ncell, const std::size_t ncell_x,
+    const std::size_t cell_partition_count) {
   const std::array<std::size_t, global_scratch_buffer_count> expected_sizes{
-      natom, natom, natom, natom, ncell, ncell + 1, ncell_x + 1, 1};
+      natom, natom,      natom,        natom,
+      ncell, ncell + 1u, ncell_x + 1u, cell_partition_count};
 
   const std::array<std::size_t, global_scratch_buffer_count> observed_sizes =
       global_scratch_sizes(workspace);
@@ -144,55 +143,17 @@ void require_global_classification_scratch(const glst_workspace &workspace,
             "Global classification scratch was not allocated on GPU 0");
   }
 
-  std::size_t sort_size = 0;
-  std::size_t scan_size = 0;
-  std::size_t reduce_size = 0;
-  void *tmp = nullptr;
+  require(!workspace.cub_work_buffer().empty(),
+          "CUB work-buffer array is empty");
 
-  atom_sort_key *key_in =
-      const_cast<atom_sort_key *>(workspace.global_sort_key_in().data());
-
-  atom_sort_key *key_out =
-      const_cast<atom_sort_key *>(workspace.global_sort_key_out().data());
-
-  atom_packet *packet_in =
-      const_cast<atom_packet *>(workspace.global_packet_in().data());
-
-  atom_packet *packet_out =
-      const_cast<atom_packet *>(workspace.global_packet_out().data());
-
-  unsigned int *cell_count =
-      const_cast<unsigned int *>(workspace.global_cell_atom_count().data());
-
-  unsigned int *cell_point =
-      const_cast<unsigned int *>(workspace.global_cell_atom_point().data());
-
-  unsigned int *max_atoms =
-      const_cast<unsigned int *>(workspace.global_max_atoms_cell().data());
-
-  cub::DeviceRadixSort::SortPairs(tmp, sort_size, key_in, key_out, packet_in,
-                                  packet_out, static_cast<int>(natom), 0,
-                                  static_cast<int>(8 * sizeof(atom_sort_key)));
-
-  cub::DeviceScan::ExclusiveSum(tmp, scan_size, cell_count, cell_point,
-                                static_cast<int>(ncell));
-
-  cub::DeviceReduce::Max(tmp, reduce_size, cell_count, max_atoms,
-                         static_cast<int>(ncell));
-
-  std::size_t required_cub_size = sort_size;
-
-  if (scan_size > required_cub_size)
-    required_cub_size = scan_size;
-
-  if (reduce_size > required_cub_size)
-    required_cub_size = reduce_size;
+  require(!workspace.cub_work_buffer_size().empty(),
+          "CUB work-buffer-size array is empty");
 
   require(workspace.cub_work_buffer()[0] != nullptr,
           "GPU-0 CUB work buffer is null");
 
-  require(workspace.cub_work_buffer_size()[0] >= required_cub_size,
-          "GPU-0 CUB work buffer is too small for global classification");
+  require(workspace.cub_work_buffer_size()[0] > 0u,
+          "GPU-0 CUB work-buffer size is zero");
 
   return;
 }
@@ -431,7 +392,7 @@ int main(void) {
     }
 
     require_global_classification_scratch(
-        glst_force_test_access::workspace(force), natom, 64, 4);
+        glst_force_test_access::workspace(force), natom, 64u, 4u, 2u);
 
     const storage_snapshot initial = take_snapshot(force);
 

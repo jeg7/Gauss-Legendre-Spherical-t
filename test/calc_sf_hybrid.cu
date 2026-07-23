@@ -1131,6 +1131,7 @@ int main(void) {
 
     glst_force force;
     force.set_gpu_layout(cell_partition_count, tile_partition_count);
+    force.set_sf_exchange_mode(GLST_SF_EXCHANGE_MODE::FULL_GLOBAL_ALLREDUCE);
     force.init(natom, tol, box, box, box, rcut);
     force.assign_atoms(rx.d_array().data(), ry.d_array().data(),
                        rz.d_array().data(), qc.d_array().data());
