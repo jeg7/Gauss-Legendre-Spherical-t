@@ -20,11 +20,17 @@
 #include <cuda_runtime_api.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstddef>
 #include <iostream>
 #include <limits>
 #include <string>
+#include <type_traits>
+
+// Make the raw-byte NCCL tranfer an explicit compile-time requirement.
+static_assert(std::is_trivially_copyable<atom_packet>::value,
+              "atom_packet must remain trivially copyable");
 
 static double
 profile_elapsed_ms(const std::chrono::steady_clock::time_point &start,
@@ -1662,6 +1668,373 @@ void glst_force::build_global_atom_reference(const double *d_rx,
   // Deliberately asynchronous. The caller may enqueue later GPU work on the
   // same stream. The targeted test synchronizes once after the complete
   // pipeline before copying reference results to the host.
+
+  return;
+}
+
+void glst_force::scatter_sorted_atom_packets(const double *d_rx,
+                                             const double *d_ry,
+                                             const double *d_rz,
+                                             const double *d_qc) {
+  constexpr std::string_view function_name =
+      "glst_force::scatter_sorted_atom_packets";
+
+  utl::require(this->plan_ != nullptr, function_name,
+               "Plan is not initialized");
+
+  utl::require(this->workspace_ != nullptr, function_name,
+               "Workspace is not initialized");
+
+  utl::require(this->execution_mode_ != GLST_EXECUTION_MODE::SINGLE_GPU_TILED,
+               function_name,
+               "Packet scatter requires a multi-GPU execution mode");
+
+  // This first implementation intentionally handles only one tile rank per cell
+  // partition. Broadcast to additional tile ranks is a later step.
+  utl::require(this->tile_partition_count_ == 1u, function_name,
+               "Packet scatter currently requires G_tile == 1");
+
+  utl::require(this->cell_partition_count_ ==
+                   static_cast<unsigned int>(this->cuda_count_),
+               function_name,
+               "G_tile == 1 requires one root device per cell partition");
+
+  const std::size_t device_count = static_cast<std::size_t>(this->cuda_count_);
+
+  utl::require((this->comp_streams_.size() == device_count) &&
+                   (this->comm_streams_.size() == device_count) &&
+                   (this->comp_events_.size() == device_count) &&
+                   (this->comm_events_.size() == device_count),
+               function_name, "CUDA stream/event topology is incomplete");
+
+  // For G_tile == 1, cell communicator 0 contains all tile-rank-0 roots.
+  utl::require(this->cell_comm_devs_.size() == 1u, function_name,
+               "Expected one cell communicator for G_tile == 1");
+
+  utl::require(this->cell_comms_.size() == 1u, function_name,
+               "Expected one cell communicator for G_tile == 1");
+
+  const std::vector<int> &root_devs = this->cell_comm_devs_[0];
+  const std::vector<ncclComm_t> &root_comms = this->cell_comms_[0];
+
+  utl::require(
+      root_devs.size() == static_cast<std::size_t>(this->cell_partition_count_),
+      function_name, "Cell communicator device count does not match G_cell");
+
+  utl::require(root_comms.size() == root_devs.size(), function_name,
+               "Cell communicator handle count is incorrect");
+
+  utl::require(this->tile_comm_devs_.size() ==
+                   static_cast<std::size_t>(this->cell_partition_count_),
+               function_name,
+               "Tile communicator topology does not match G_cell");
+
+  for (unsigned int partition = 0; partition < this->cell_partition_count_;
+       partition++) {
+    utl::require(this->tile_comm_devs_[partition].size() == 1u, function_name,
+                 "Cell partition does not have exactly one tile root");
+
+    const int root_dev = this->tile_comm_devs_[partition][0];
+
+    utl::require(root_dev < this->cuda_count_, function_name,
+                 "Root device is out of range");
+
+    utl::require(root_devs[partition] == root_dev, function_name,
+                 "Cell communicator rank does not match tile root");
+
+    utl::require(this->dev_cell_partition_[root_dev] == partition,
+                 function_name,
+                 "Root device belongs to the wrong cell partition");
+
+    utl::require(this->dev_tile_partition_[root_dev] == 0u, function_name,
+                 "Cell-partition root is not tile partition 0");
+  }
+
+  utl::require(root_devs[0] == 0, function_name,
+               "GPU 0 must be the root of cell partition 0");
+
+  // Enqueues classify, pack, deterministic radix sort, cell scan, and
+  // x-plane-point construction on GPU 0's compute stream.
+  this->build_global_atom_reference(d_rx, d_ry, d_rz, d_qc);
+
+  const unsigned int ncell_x = this->plan_->ncell_x();
+  const std::size_t x_plane_point_count =
+      static_cast<std::size_t>(ncell_x) + 1u;
+
+  std::vector<unsigned int> x_plane_atom_point(x_plane_point_count);
+
+  // This is the only device-to-host transfer in the optimized packet path. Its
+  // size is O(ncell_x), not O(natom).
+  cudaCheck(cudaSetDevice(0));
+
+  cudaCheck(
+      cudaMemcpyAsync(static_cast<void *>(x_plane_atom_point.data()),
+                      static_cast<const void *>(
+                          this->workspace_->global_x_plane_atom_point().data()),
+                      x_plane_point_count * sizeof(unsigned int),
+                      cudaMemcpyDeviceToHost, this->comp_streams_[0]));
+
+  // One synchronization after the complete GPU 0 classify/sort/scan pipeline
+  // and the small descriptor transfer. There are no synchronizations between
+  // individual assignment operations.
+  cudaCheck(cudaStreamSynchronize(this->comp_streams_[0]));
+
+  utl::require(x_plane_atom_point.front() == 0u, function_name,
+               "First x-plane atom point is not zero");
+
+  utl::require(x_plane_atom_point.back() == this->plan_->natom(), function_name,
+               "Terminal x-plane atom point does not equal natom");
+
+  for (std::size_t x = 1; x < x_plane_atom_point.size(); x++) {
+    utl::require(x_plane_atom_point[x] >= x_plane_atom_point[x - 1u],
+                 function_name,
+                 "X-plane atom points are not monotonically ordered");
+  }
+
+  std::vector<atom_partition_range> &partition_range =
+      this->workspace_->partition_atom_range();
+
+  utl::require(partition_range.size() ==
+                   static_cast<std::size_t>(this->cell_partition_count_),
+               function_name,
+               "Partition atom-range metadata does not match G_cell");
+
+  // Derive source ranges and establish active capacities/counts before
+  // recording communication dependencies. A first assignment may grow; later
+  // assignments with the same or smaller source population do not allocate.
+  for (unsigned int partition = 0; partition < this->cell_partition_count_;
+       partition++) {
+    const unsigned int x_point =
+        this->plan_->cell_partition_x_point()[partition];
+    const unsigned int x_count =
+        this->plan_->cell_partition_x_count()[partition];
+
+    utl::require(x_point <= ncell_x, function_name,
+                 "Partition x point is out of range");
+
+    utl::require(x_count <= ncell_x - x_point, function_name,
+                 "Partition x count is out of range");
+
+    const unsigned int x_end = x_point + x_count;
+
+    atom_partition_range range;
+
+    const std::size_t owned_begin =
+        static_cast<std::size_t>(x_plane_atom_point[x_point]);
+    const std::size_t owned_end =
+        static_cast<std::size_t>(x_plane_atom_point[x_end]);
+
+    utl::require(owned_end >= owned_begin, function_name,
+                 "Owned packet range is reversed");
+
+    range.owned_source_offset = owned_begin;
+    range.owned_atom_count = owned_end - owned_begin;
+
+    // Keep zero-sized optional ranges anchored to a valid packet boundary.
+    range.left_source_offset = owned_begin;
+    range.right_source_offset = owned_end;
+
+    // Empty x-slabs have no halo source cells in glst_plan.
+    if (x_count > 0u) {
+      if (x_point > 0u) {
+        const std::size_t left_begin =
+            static_cast<std::size_t>(x_plane_atom_point[x_point - 1u]);
+
+        utl::require(owned_begin >= left_begin, function_name,
+                     "Left-halo packet range is reversed");
+
+        range.left_source_offset = left_begin;
+        range.left_atom_count = owned_begin - left_begin;
+      }
+
+      if (x_end < ncell_x) {
+        const std::size_t right_end =
+            static_cast<std::size_t>(x_plane_atom_point[x_end + 1u]);
+
+        utl::require(right_end >= owned_end, function_name,
+                     "Right-halo packet range is reversed");
+
+        range.right_source_offset = owned_end;
+        range.right_atom_count = right_end - owned_end;
+      }
+    }
+
+    utl::require(
+        range.left_atom_count <=
+            std::numeric_limits<std::size_t>::max() - range.owned_atom_count,
+        function_name, "Owned plus left-halo atom count overflows size_t");
+
+    const std::size_t owned_left_count =
+        range.owned_atom_count + range.left_atom_count;
+
+    utl::require(range.right_atom_count <=
+                     std::numeric_limits<std::size_t>::max() - owned_left_count,
+                 function_name, "Total source atom count overflows size_t");
+
+    range.source_atom_count = owned_left_count + range.right_atom_count;
+
+    // Owned and adjacent non-PBC halo planes are disjoint.
+    utl::require(range.source_atom_count <=
+                     static_cast<std::size_t>(this->plan_->natom()),
+                 function_name, "Partition source atom count exceeds natom");
+
+    partition_range[partition] = range;
+
+    const int root_dev = root_devs[partition];
+
+    this->workspace_->ensure_atom_capacity(root_dev, range.source_atom_count);
+
+    this->workspace_->set_atom_counts(root_dev, range.source_atom_count,
+                                      range.owned_atom_count);
+  }
+
+  // Prevent packet communication from overwriting a root buffer still being
+  // consumed by earlier work. GPU 0's event also publishes the completed global
+  // packet source to its communication stream.
+  for (unsigned int partition = 0; partition < this->cell_partition_count_;
+       partition++) {
+    const int root_dev = root_devs[partition];
+
+    cudaCheck(cudaSetDevice(root_dev));
+
+    cudaCheck(cudaEventRecord(this->comp_events_[root_dev],
+                              this->comp_streams_[root_dev]));
+
+    cudaCheck(cudaStreamWaitEvent(this->comm_streams_[root_dev],
+                                  this->comp_events_[root_dev], 0));
+  }
+
+  const atom_packet *global_packet =
+      this->workspace_->global_packet_out().data();
+
+  // Cell partition 0 is local to GPU 0. Use ordinary asynchronous D2D copies,
+  // preserving the exact [owned][left][right] destination order.
+  {
+    const unsigned int partition = 0u;
+    const int root_dev = root_devs[partition];
+
+    const atom_partition_range &range = partition_range[partition];
+
+    const std::array<std::size_t, 3> source_offset = {
+        range.owned_source_offset, range.left_source_offset,
+        range.right_source_offset};
+
+    const std::array<std::size_t, 3> destination_offset = {
+        0u, range.owned_atom_count,
+        range.owned_atom_count + range.left_atom_count};
+
+    const std::array<std::size_t, 3> packet_count = {
+        range.owned_atom_count, range.left_atom_count, range.right_atom_count};
+
+    atom_packet *destination =
+        this->workspace_->sorted_packets()[root_dev].d_array().data();
+
+    cudaCheck(cudaSetDevice(root_dev));
+
+    for (std::size_t segment = 0; segment < packet_count.size(); segment++) {
+      if (packet_count[segment] == 0u)
+        continue;
+
+      utl::require(packet_count[segment] <=
+                       std::numeric_limits<std::size_t>::max() /
+                           sizeof(atom_packet),
+                   function_name, "Packet-copy byte count overflows size_t");
+
+      const std::size_t byte_count =
+          packet_count[segment] * sizeof(atom_packet);
+
+      cudaCheck(cudaMemcpyAsync(
+          static_cast<void *>(destination + destination_offset[segment]),
+          static_cast<const void *>(global_packet + source_offset[segment]),
+          byte_count, cudaMemcpyDeviceToDevice, this->comp_streams_[root_dev]));
+    }
+  }
+
+  bool has_remote_transfer = false;
+
+  for (unsigned int partition = 1; partition < this->cell_partition_count_;
+       partition++) {
+    if (partition_range[partition].source_atom_count > 0u) {
+      has_remote_transfer = true;
+      break;
+    }
+  }
+
+  // The current CUDA initiaization deliberately does not own peer-access
+  // enablement. Use the existing NCCL cell communicator for all remote roots;
+  // NCCL selects its available GPU transport and no application host packet
+  // staging is introduced.
+  if (has_remote_transfer) {
+    ncclCheck(ncclGroupStart());
+
+    for (unsigned int partition = 1; partition < this->cell_partition_count_;
+         partition++) {
+      const int root_dev = root_devs[partition];
+
+      const atom_partition_range &range = partition_range[partition];
+
+      const std::array<std::size_t, 3> source_offset = {
+          range.owned_source_offset, range.left_source_offset,
+          range.right_source_offset};
+
+      const std::array<std::size_t, 3> destination_offset = {
+          0u, range.owned_atom_count,
+          range.owned_atom_count + range.left_atom_count};
+
+      const std::array<std::size_t, 3> packet_count = {range.owned_atom_count,
+                                                       range.left_atom_count,
+                                                       range.right_atom_count};
+
+      atom_packet *destination =
+          this->workspace_->sorted_packets()[root_dev].d_array().data();
+
+      for (std::size_t segment = 0; segment < packet_count.size(); segment++) {
+        if (packet_count[segment] == 0u)
+          continue;
+
+        utl::require(packet_count[segment] <=
+                         std::numeric_limits<std::size_t>::max() /
+                             sizeof(atom_packet),
+                     function_name, "Packet-copy byte count overflows size_t");
+
+        const std::size_t byte_count =
+            packet_count[segment] * sizeof(atom_packet);
+
+        // Cell-communicator rank 0 is GPU 0/cell partition 0.
+        cudaCheck(cudaSetDevice(0));
+
+        ncclCheck(ncclSend(
+            static_cast<const void *>(global_packet + source_offset[segment]),
+            byte_count, ncclChar, static_cast<int>(partition), root_comms[0],
+            this->comm_streams_[0]));
+
+        cudaCheck(cudaSetDevice(root_dev));
+
+        ncclCheck(ncclRecv(
+            static_cast<void *>(destination + destination_offset[segment]),
+            byte_count, ncclChar, 0, root_comms[partition],
+            this->comm_streams_[root_dev]));
+      }
+    }
+
+    ncclCheck(ncclGroupEnd());
+  }
+
+  // Publish completion to each root's compute stream. In particular, GPU 0's
+  // compute stream cannot overwrite global_packet_out during the next
+  // assignment until all remote sends have finished.
+  for (unsigned int partition = 0; partition < this->cell_partition_count_;
+       partition++) {
+    const int root_dev = root_devs[partition];
+
+    cudaCheck(cudaSetDevice(root_dev));
+
+    cudaCheck(cudaEventRecord(this->comm_events_[root_dev],
+                              this->comm_streams_[root_dev]));
+
+    cudaCheck(cudaStreamWaitEvent(this->comp_streams_[root_dev],
+                                  this->comm_events_[root_dev], 0));
+  }
 
   return;
 }

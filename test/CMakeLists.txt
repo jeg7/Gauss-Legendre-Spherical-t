@@ -69,6 +69,13 @@ target_link_libraries(global_atom_reference
   GLST
 )
 
+add_executable(global_atom_scatter
+  ${GLST_SOURCE_DIR}/test/global_atom_scatter.cu
+)
+target_link_libraries(global_atom_scatter
+  GLST
+)
+
 # add_executable(setup_plan
 #   ${GLST_SOURCE_DIR}/test/setup_plan.cu
 # )

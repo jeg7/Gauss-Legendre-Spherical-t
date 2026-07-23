@@ -20,6 +20,19 @@
 #include <memory>
 #include <vector>
 
+struct atom_partition_range {
+  std::size_t owned_source_offset = 0;
+  std::size_t owned_atom_count = 0;
+
+  std::size_t left_source_offset = 0;
+  std::size_t left_atom_count = 0;
+
+  std::size_t right_source_offset = 0;
+  std::size_t right_atom_count = 0;
+
+  std::size_t source_atom_count = 0;
+};
+
 class glst_workspace {
 public:
   glst_workspace(void);
@@ -58,6 +71,8 @@ public:
   const std::vector<std::size_t> &owned_atom_count(void) const;
   const std::vector<std::size_t> &source_atom_count(void) const;
   const std::vector<std::size_t> &sr_source_cell_capacity(void) const;
+
+  const std::vector<atom_partition_range> &partition_atom_range(void) const;
 
   const std::vector<cuda_container<unsigned int>> &idx(void) const;
   const std::vector<cuda_container<unsigned int>> &sorted_idx(void) const;
@@ -112,6 +127,8 @@ public:
 
   const std::vector<void *> &cub_work_buffer(void) const;
   const std::vector<std::size_t> &cub_work_buffer_size(void) const;
+
+  std::vector<atom_partition_range> &partition_atom_range(void);
 
   std::vector<cuda_container<unsigned int>> &idx(void);
   std::vector<cuda_container<unsigned int>> &sorted_idx(void);
@@ -204,6 +221,8 @@ private:
   std::vector<std::size_t> atom_storage_growth_count_;
   std::vector<std::size_t> cub_work_buffer_growth_count_;
   std::vector<std::size_t> sr_source_cell_capacity_;
+
+  std::vector<atom_partition_range> partition_atom_range_;
 
   // Atom arrays are allocated to atom_capacity_.
   //

@@ -114,9 +114,14 @@ private:
   void assign_atoms_single_gpu(const double *d_rx, const double *d_ry,
                                const double *d_rz, const double *d_qc);
 
-  // Reference-only GPU 0 pipeline. Production assignment does not call this
-  // method until the later packet-distribution step is implemented.
+  // Deterministic GPU 0 classification, packing, sorting, and cell-offset
+  // construction. Shared by the reference test and the packet-scatter path.
   void build_global_atom_reference(const double *d_rx, const double *d_ry,
+                                   const double *d_rz, const double *d_qc);
+
+  // Packet-only multi-GPU assignment step. This deliberately does not unpack
+  // packets or construct local device metadata yet.
+  void scatter_sorted_atom_packets(const double *d_rx, const double *d_ry,
                                    const double *d_rz, const double *d_qc);
 
   void validate_atom_scatter(void) const;

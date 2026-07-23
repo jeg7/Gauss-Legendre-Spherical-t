@@ -46,18 +46,19 @@ glst_workspace::glst_workspace(void)
       rmt_tile_buffer_capacity_(), prefix_partition_total_buffer_capacity_(),
       prefix_base_buffer_capacity_(), prefix_plane_slot_capacity_(),
       owned_atom_count_(), source_atom_count_(), atom_storage_growth_count_(),
-      cub_work_buffer_growth_count_(), sr_source_cell_capacity_(), idx_(),
-      sorted_idx_(), rx_(), ry_(), rz_(), qc_(), packets_(), sorted_packets_(),
-      atom_cell_idx_(), atom_cell_sorted_idx_(), global_sort_key_in_(),
-      global_sort_key_out_(), global_packet_in_(), global_packet_out_(),
-      global_cell_atom_count_(), global_cell_atom_point_(),
-      global_x_plane_atom_point_(), global_max_atoms_cell_(), fx_(), fy_(),
-      fz_(), en_(), cell_atom_point_(), cell_atom_count_(), max_atoms_cell_(),
-      sr_source_cell_atom_point_(), sr_source_cell_atom_count_(), sf_re_(),
-      sf_im_(), sf_exchange_re_(), sf_exchange_im_(),
-      prefix_partition_total_re_(), prefix_partition_total_im_(),
-      prefix_base_re_(), prefix_base_im_(), prefix_plane_slot_(), rmt_sum_re_(),
-      rmt_sum_im_(), cub_work_buffer_(), cub_work_buffer_size_() {}
+      cub_work_buffer_growth_count_(), sr_source_cell_capacity_(),
+      partition_atom_range_(), idx_(), sorted_idx_(), rx_(), ry_(), rz_(),
+      qc_(), packets_(), sorted_packets_(), atom_cell_idx_(),
+      atom_cell_sorted_idx_(), global_sort_key_in_(), global_sort_key_out_(),
+      global_packet_in_(), global_packet_out_(), global_cell_atom_count_(),
+      global_cell_atom_point_(), global_x_plane_atom_point_(),
+      global_max_atoms_cell_(), fx_(), fy_(), fz_(), en_(), cell_atom_point_(),
+      cell_atom_count_(), max_atoms_cell_(), sr_source_cell_atom_point_(),
+      sr_source_cell_atom_count_(), sf_re_(), sf_im_(), sf_exchange_re_(),
+      sf_exchange_im_(), prefix_partition_total_re_(),
+      prefix_partition_total_im_(), prefix_base_re_(), prefix_base_im_(),
+      prefix_plane_slot_(), rmt_sum_re_(), rmt_sum_im_(), cub_work_buffer_(),
+      cub_work_buffer_size_() {}
 
 glst_workspace::glst_workspace(const glst_plan &plan, const int device_count)
     : glst_workspace() {
@@ -228,6 +229,11 @@ const std::vector<std::size_t> &glst_workspace::source_atom_count(void) const {
 const std::vector<std::size_t> &
 glst_workspace::sr_source_cell_capacity(void) const {
   return this->sr_source_cell_capacity_;
+}
+
+const std::vector<atom_partition_range> &
+glst_workspace::partition_atom_range(void) const {
+  return this->partition_atom_range_;
 }
 
 const std::vector<cuda_container<unsigned int>> &
@@ -415,6 +421,10 @@ const std::vector<void *> &glst_workspace::cub_work_buffer(void) const {
 const std::vector<std::size_t> &
 glst_workspace::cub_work_buffer_size(void) const {
   return this->cub_work_buffer_size_;
+}
+
+std::vector<atom_partition_range> &glst_workspace::partition_atom_range(void) {
+  return this->partition_atom_range_;
 }
 
 std::vector<cuda_container<unsigned int>> &glst_workspace::idx(void) {
@@ -720,6 +730,9 @@ void glst_workspace::init(const glst_plan &plan,
   this->atom_storage_growth_count_.assign(device_count, 0);
   this->cub_work_buffer_growth_count_.assign(device_count, 0);
   this->sr_source_cell_capacity_.assign(device_count, 0);
+
+  this->partition_atom_range_.assign(plan.cell_partition_count(),
+                                     atom_partition_range());
 
   for (int dev = 0; dev < device_count; dev++) {
     const unsigned int cell_partition = dev_cell_partition[dev];
@@ -1069,6 +1082,8 @@ void glst_workspace::clear(void) {
   this->atom_storage_growth_count_.clear();
   this->cub_work_buffer_growth_count_.clear();
   this->sr_source_cell_capacity_.clear();
+
+  this->partition_atom_range_.clear();
 
   this->idx_.clear();
   this->sorted_idx_.clear();
