@@ -113,6 +113,12 @@ public:
 private:
   void assign_atoms_single_gpu(const double *d_rx, const double *d_ry,
                                const double *d_rz, const double *d_qc);
+
+  // Reference-only GPU 0 pipeline. Production assignment does not call this
+  // method until the later packet-distribution step is implemented.
+  void build_global_atom_reference(const double *d_rx, const double *d_ry,
+                                   const double *d_rz, const double *d_qc);
+
   void validate_atom_scatter(void) const;
   void assign_atoms_multi_gpu(const double *d_rx, const double *d_ry,
                               const double *d_rz, const double *d_qc);

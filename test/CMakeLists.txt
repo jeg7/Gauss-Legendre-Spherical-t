@@ -62,6 +62,13 @@ target_link_libraries(atom_storage_capacity
   GLST
 )
 
+add_executable(global_atom_reference
+  ${GLST_SOURCE_DIR}/test/global_atom_reference.cu
+)
+target_link_libraries(global_atom_reference
+  GLST
+)
+
 # add_executable(setup_plan
 #   ${GLST_SOURCE_DIR}/test/setup_plan.cu
 # )

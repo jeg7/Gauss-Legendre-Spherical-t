@@ -1444,6 +1444,228 @@ void glst_force::assign_atoms_single_gpu(const double *d_rx, const double *d_ry,
   return;
 }
 
+__global__ static void classify_pack_global_kernel(
+    atom_sort_key *__restrict__ sort_key, atom_packet *__restrict__ packet,
+    unsigned int *__restrict__ cell_atom_count, const double *__restrict__ rx,
+    const double *__restrict__ ry, const double *__restrict__ rz,
+    const double *__restrict__ qc, const unsigned int natom,
+    const double cell_dim_x, const double cell_dim_y, const double cell_dim_z,
+    const unsigned int ncell_x, const unsigned int ncell_y,
+    const unsigned int ncell_z) {
+  constexpr unsigned int ATOM_INDEX_BITS =
+      static_cast<unsigned int>(8u * sizeof(unsigned int));
+
+  const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const unsigned int stride = gridDim.x * blockDim.x;
+
+  for (unsigned int atom = idx; atom < natom; atom += stride) {
+    int cx = static_cast<int>(rx[atom] / cell_dim_x);
+    int cy = static_cast<int>(ry[atom] / cell_dim_y);
+    int cz = static_cast<int>(rz[atom] / cell_dim_z);
+
+    // Keep this operation order identical to the existing host and single-GPU
+    // classification paths: Upper clamp first, then lower clamp.
+    cx = (cx >= static_cast<int>(ncell_x) ? static_cast<int>(ncell_x - 1) : cx);
+    cy = (cy >= static_cast<int>(ncell_y) ? static_cast<int>(ncell_y - 1) : cy);
+    cz = (cz >= static_cast<int>(ncell_z) ? static_cast<int>(ncell_z - 1) : cz);
+
+    cx = (cx < 0) ? 0 : cx;
+    cy = (cy < 0) ? 0 : cy;
+    cz = (cz < 0) ? 0 : cz;
+
+    const unsigned int global_cell = (static_cast<unsigned int>(cx) * ncell_y +
+                                      static_cast<unsigned int>(cy)) *
+                                         ncell_z +
+                                     static_cast<unsigned int>(cz);
+
+    const atom_sort_key key =
+        (static_cast<atom_sort_key>(global_cell) << ATOM_INDEX_BITS) |
+        static_cast<atom_sort_key>(atom);
+
+    sort_key[atom] = key;
+    packet[atom] =
+        atom_packet(atom, global_cell, rx[atom], ry[atom], rz[atom], qc[atom]);
+
+    atomicAdd(&cell_atom_count[global_cell], 1u);
+  }
+
+  return;
+}
+
+__global__ static void finalize_global_atom_points_kernel(
+    unsigned int *__restrict__ cell_atom_point,
+    unsigned int *__restrict__ x_plane_atom_point, const unsigned int natom,
+    const unsigned int ncell, const unsigned int ncell_x,
+    const unsigned int yz_cell_count) {
+  // One block is deliberately used for this kernel. The block-wide barrier
+  // guarantees that cell_atom_point[ncell] exists before the terminal x-plane
+  // reads it.
+  if (threadIdx.x == 0)
+    cell_atom_point[ncell] = natom;
+
+  __syncthreads();
+
+  for (unsigned int x = threadIdx.x; x <= ncell_x; x += blockDim.x) {
+    const unsigned int first_cell = x * yz_cell_count;
+    x_plane_atom_point[x] = cell_atom_point[first_cell];
+  }
+
+  return;
+}
+
+void glst_force::build_global_atom_reference(const double *d_rx,
+                                             const double *d_ry,
+                                             const double *d_rz,
+                                             const double *d_qc) {
+  constexpr std::string_view function_name =
+      "glst_force::build_global_atom_reference";
+
+  utl::require(this->plan_ != nullptr, function_name,
+               "Plan is not initialized");
+
+  utl::require(this->workspace_ != nullptr, function_name,
+               "Workspace is not initialized");
+
+  utl::require(
+      this->execution_mode_ != GLST_EXECUTION_MODE::SINGLE_GPU_TILED,
+      function_name,
+      "Global reference scratch is allocated only for multi-GPU execution");
+
+  utl::require((d_rx != nullptr) && (d_ry != nullptr) && (d_rz != nullptr) &&
+                   (d_qc != nullptr),
+               function_name, "At least one input atom array is null");
+
+  utl::require(!this->comp_streams_.empty(), function_name,
+               "GPU 0 compute stream is not initialized");
+
+  const unsigned int natom = this->plan_->natom();
+  const unsigned int ncell = this->plan_->ncell();
+  const unsigned int ncell_x = this->plan_->ncell_x();
+  const unsigned int ncell_y = this->plan_->ncell_y();
+  const unsigned int ncell_z = this->plan_->ncell_z();
+  const unsigned int yz_cell_count = ncell_y * ncell_z;
+
+  const std::size_t atom_count = static_cast<std::size_t>(natom);
+  const std::size_t cell_count = static_cast<std::size_t>(ncell);
+  const std::size_t cell_point_count = cell_count + 1u;
+  const std::size_t x_plane_point_count =
+      static_cast<std::size_t>(ncell_x) + 1u;
+
+  const std::size_t cub_item_limit =
+      static_cast<std::size_t>(std::numeric_limits<int>::max());
+
+  utl::require(atom_count <= cub_item_limit, function_name,
+               "Global atom count exceeds the CUB int item-count range");
+
+  utl::require(cell_count <= cub_item_limit, function_name,
+               "Global cell count exceeds the CUB int item-count range");
+
+  utl::require(this->workspace_->global_sort_key_in().size() == atom_count,
+               function_name, "Global input-key capacity is incorrect");
+
+  utl::require(this->workspace_->global_sort_key_out().size() == atom_count,
+               function_name, "Global output-key capacity is incorrect");
+
+  utl::require(this->workspace_->global_packet_in().size() == atom_count,
+               function_name, "Global input-packet capacity is incorrect");
+
+  utl::require(this->workspace_->global_packet_out().size() == atom_count,
+               function_name, "Global output-packet capacity is incorrect");
+
+  utl::require(this->workspace_->global_cell_atom_count().size() == cell_count,
+               function_name, "Global cell-count capacity is incorrect");
+
+  utl::require(this->workspace_->global_cell_atom_point().size() ==
+                   cell_point_count,
+               function_name, "Global cell-point capacity is incorrect");
+
+  utl::require(this->workspace_->global_x_plane_atom_point().size() ==
+                   x_plane_point_count,
+               function_name, "Global x-plane-point capacity is incorrect");
+
+  utl::require(!this->workspace_->cub_work_buffer().empty(), function_name,
+               "GPU 0 CUB work-buffer array is empty");
+
+  utl::require(!this->workspace_->cub_work_buffer_size().empty(), function_name,
+               "GPU 0 CUB work-buffer-size array is empty");
+
+  cudaCheck(cudaSetDevice(0));
+
+  const cudaStream_t stream = this->comp_streams_[0];
+
+  // Step 1: Asynchronously reset global cell counts.
+  cudaCheck(cudaMemsetAsync(
+      static_cast<void *>(this->workspace_->global_cell_atom_count().data()), 0,
+      cell_count * sizeof(unsigned int), stream));
+
+  // Step 2: Classify every atom, construct its packet, construct its complete
+  // deterministic sort key, and increment its global cell count.
+  {
+    constexpr unsigned int num_threads = 512;
+    const unsigned int num_blocks = (natom + num_threads - 1u) / num_threads;
+
+    classify_pack_global_kernel<<<num_blocks, num_threads, 0, stream>>>(
+        this->workspace_->global_sort_key_in().data(),
+        this->workspace_->global_packet_in().data(),
+        this->workspace_->global_cell_atom_count().data(), d_rx, d_ry, d_rz,
+        d_qc, natom, this->plan_->cell_dim_x(), this->plan_->cell_dim_y(),
+        this->plan_->cell_dim_z(), ncell_x, ncell_y, ncell_z);
+    cudaCheck(cudaGetLastError());
+  }
+
+  void *const cub_work_buffer = this->workspace_->cub_work_buffer()[0];
+
+  const std::size_t cub_work_buffer_capacity =
+      this->workspace_->cub_work_buffer_size()[0];
+
+  utl::require(cub_work_buffer != nullptr, function_name,
+               "GPU 0 CUB work buffer is null");
+
+  utl::require(cub_work_buffer_capacity > 0, function_name,
+               "GPU 0 CUB work-buffer capacity is zero");
+
+  // Step 3: one radix sort over the complete (cell, original-index) key.
+  //
+  // Reset temp_storage_bytes to the complete capacity before every CUB call.
+  // CUB treats this parameter as both input and output.
+
+  std::size_t cub_work_buffer_size = cub_work_buffer_capacity;
+
+  cudaCheck(cub::DeviceRadixSort::SortPairs(
+      cub_work_buffer, cub_work_buffer_size,
+      this->workspace_->global_sort_key_in().data(),
+      this->workspace_->global_sort_key_out().data(),
+      this->workspace_->global_packet_in().data(),
+      this->workspace_->global_packet_out().data(), static_cast<int>(natom), 0,
+      static_cast<int>(8u * sizeof(atom_sort_key)), stream));
+
+  // Step 4: Exclusive scan over global cell counts.
+  cub_work_buffer_size = cub_work_buffer_capacity;
+
+  cudaCheck(cub::DeviceScan::ExclusiveSum(
+      cub_work_buffer, cub_work_buffer_size,
+      this->workspace_->global_cell_atom_count().data(),
+      this->workspace_->global_cell_atom_point().data(),
+      static_cast<int>(ncell), stream));
+
+  // Step 5 and 6: Append the terminal cell point and derive x-plane points.
+  {
+    constexpr unsigned int num_threads = 256;
+
+    finalize_global_atom_points_kernel<<<1, num_threads, 0, stream>>>(
+        this->workspace_->global_cell_atom_point().data(),
+        this->workspace_->global_x_plane_atom_point().data(), natom, ncell,
+        ncell_x, yz_cell_count);
+    cudaCheck(cudaGetLastError());
+  }
+
+  // Deliberately asynchronous. The caller may enqueue later GPU work on the
+  // same stream. The targeted test synchronizes once after the complete
+  // pipeline before copying reference results to the host.
+
+  return;
+}
+
 void glst_force::validate_atom_scatter(void) const {
   constexpr std::string_view function_name =
       "glst_force::validate_atom_scatter";

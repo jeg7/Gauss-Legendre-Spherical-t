@@ -1170,7 +1170,7 @@ void glst_workspace::ensure_cub_capacity_for_device(
     cub::DeviceRadixSort::SortPairs(
         tmp, value_sort_size, this->atom_cell_idx_[dev].d_array().data(),
         this->atom_cell_sorted_idx_[dev].d_array().data(),
-        this->fx_[dev].d_array().data(), this->fx_[dev].d_array().data(),
+        this->fx_[dev].d_array().data(), this->fy_[dev].d_array().data(),
         num_items);
 
     cub::DeviceRadixSort::SortPairs(
@@ -1193,7 +1193,7 @@ void glst_workspace::ensure_cub_capacity_for_device(
     const std::size_t global_cell_count = this->global_cell_atom_count_.size();
 
     utl::require(global_atom_count > 0, function_name,
-                 "Global atom-classification cpacity is zero");
+                 "Global atom-classification capacity is zero");
 
     utl::require(global_cell_count > 0, function_name,
                  "Global cell-count capacity is zero");
@@ -1235,19 +1235,19 @@ void glst_workspace::ensure_cub_capacity_for_device(
     std::size_t global_scan_size = 0;
     std::size_t global_reduce_size = 0;
 
-    cub::DeviceRadixSort::SortPairs(
+    cudaCheck(cub::DeviceRadixSort::SortPairs(
         tmp, global_sort_size, this->global_sort_key_in_.data(),
         this->global_sort_key_out_.data(), this->global_packet_in_.data(),
         this->global_packet_out_.data(), global_atom_items, 0,
-        static_cast<int>(8 * sizeof(atom_sort_key)));
+        static_cast<int>(8 * sizeof(atom_sort_key))));
 
-    cub::DeviceScan::ExclusiveSum(
+    cudaCheck(cub::DeviceScan::ExclusiveSum(
         tmp, global_scan_size, this->global_cell_atom_count_.data(),
-        this->global_cell_atom_point_.data(), global_cell_items);
+        this->global_cell_atom_point_.data(), global_cell_items));
 
-    cub::DeviceReduce::Max(
+    cudaCheck(cub::DeviceReduce::Max(
         tmp, global_reduce_size, this->global_cell_atom_count_.data(),
-        this->global_max_atoms_cell_.data(), global_cell_items);
+        this->global_max_atoms_cell_.data(), global_cell_items));
 
     if (global_sort_size > required_size)
       required_size = global_sort_size;
