@@ -97,6 +97,9 @@ public:
   const device_vector<unsigned int> &global_x_plane_atom_point(void) const;
   const device_vector<unsigned int> &global_max_atoms_cell(void) const;
 
+  const std::vector<cuda_container<unsigned int>> &
+  atom_assignment_metadata(void) const;
+
   const std::vector<cuda_container<double>> &fx(void) const;
   const std::vector<cuda_container<double>> &fy(void) const;
   const std::vector<cuda_container<double>> &fz(void) const;
@@ -151,6 +154,8 @@ public:
   device_vector<unsigned int> &global_cell_atom_point(void);
   device_vector<unsigned int> &global_x_plane_atom_point(void);
   device_vector<unsigned int> &global_max_atoms_cell(void);
+
+  std::vector<cuda_container<unsigned int>> &atom_assignment_metadata(void);
 
   std::vector<cuda_container<double>> &fx(void);
   std::vector<cuda_container<double>> &fy(void);
@@ -255,6 +260,10 @@ private:
   // One DeviceReduce::max output per cell partition. This scratch array is
   // allocated only on GPU 0 with the other global classification buffers.
   device_vector<unsigned int> global_max_atoms_cell_;
+
+  // Per-rank assignment metadata:
+  // [source_atom_count, owned_atom_count, max_atoms_cell].
+  std::vector<cuda_container<unsigned int>> atom_assignment_metadata_;
 
   std::vector<cuda_container<double>> fx_;
   std::vector<cuda_container<double>> fy_;

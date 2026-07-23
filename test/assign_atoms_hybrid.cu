@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <iostream>
 #include <limits>
@@ -93,6 +94,11 @@ constexpr double box_dim_y = static_cast<double>(test_ncell_y) * rcut;
 constexpr double box_dim_z = static_cast<double>(test_ncell_z) * rcut;
 constexpr double tol = 1.0e-6;
 
+constexpr std::size_t source_atom_count_metadata_index = 0u;
+constexpr std::size_t owned_atom_count_metadata_index = 1u;
+constexpr std::size_t max_atoms_cell_metadata_index = 2u;
+constexpr std::size_t atom_assignment_metadata_count = 3u;
+
 struct atom_site {
   unsigned int x;
   unsigned int y;
@@ -104,6 +110,11 @@ struct position {
   double x;
   double y;
   double z;
+};
+
+struct gpu_layout {
+  unsigned int cell_partition_count;
+  unsigned int tile_partition_count;
 };
 
 struct partition_reference {
@@ -122,10 +133,13 @@ struct partition_reference {
 
 struct partition_snapshot {
   unsigned int cell_partition = 0u;
+  unsigned int tile_partition = 0u;
+
   std::size_t owned_atom_count = 0;
   std::size_t source_atom_count = 0;
   unsigned int max_atoms_cell = 0u;
 
+  std::vector<unsigned int> assignment_metadata;
   std::vector<unsigned int> source_cell_atom_count;
   std::vector<unsigned int> source_cell_atom_point;
   std::vector<unsigned int> owned_cell_atom_count;
@@ -155,6 +169,7 @@ struct device_storage_snapshot {
   const void *cell_atom_point = nullptr;
   const void *source_cell_atom_count = nullptr;
   const void *source_cell_atom_point = nullptr;
+  const void *assignment_metadata = nullptr;
   const void *cub = nullptr;
 };
 
@@ -181,6 +196,14 @@ void require(const bool condition, const std::string &message) {
 bool packets_equal(const atom_packet &lhs, const atom_packet &rhs) {
   return (lhs.i == rhs.i) && (lhs.cell == rhs.cell) && (lhs.x == rhs.x) &&
          (lhs.y == rhs.y) && (lhs.z == rhs.z) && (lhs.q == rhs.q);
+}
+
+bool raw_bytes_equal(const void *lhs, const void *rhs,
+                     const std::size_t byte_count) {
+  if (byte_count == 0u)
+    return true;
+
+  return std::memcmp(lhs, rhs, byte_count) == 0;
 }
 
 std::vector<atom_site> make_atom_sites(void) {
@@ -439,8 +462,13 @@ partition_snapshot read_partition_snapshot(const glst_force &force,
 
   snapshot.cell_partition = glst_force_test_access::cell_partition(force, dev);
 
+  snapshot.tile_partition = glst_force_test_access::tile_partition(force, dev);
+
   require(snapshot.cell_partition < plan.cell_partition_count(),
           "Observed cell partition is out of range");
+
+  require(snapshot.tile_partition < plan.tile_partition_count(),
+          "Observed tile partition is out of range");
 
   const std::size_t local_cell_count =
       static_cast<std::size_t>(plan.local_cell_count(snapshot.cell_partition));
@@ -454,6 +482,14 @@ partition_snapshot read_partition_snapshot(const glst_force &force,
   require(source_cell_count == workspace.sr_source_cell_capacity(dev),
           "Observed source-cell count does not match workspace capacity");
 
+  require(static_cast<std::size_t>(dev) <
+              workspace.atom_assignment_metadata().size(),
+          "Assignment-metadata device index is out of range");
+
+  require(workspace.atom_assignment_metadata()[dev].size() ==
+              atom_assignment_metadata_count,
+          "Assignment-metadata capacity is incorrect");
+
   snapshot.owned_atom_count = workspace.owned_atom_count(dev);
   snapshot.source_atom_count = workspace.source_atom_count(dev);
   snapshot.max_atoms_cell = workspace.max_atoms_cell()[dev];
@@ -463,6 +499,8 @@ partition_snapshot read_partition_snapshot(const glst_force &force,
 
   require(snapshot.source_atom_count <= workspace.atom_capacity(dev),
           "Observed source atom count exceeds workspace capacity");
+
+  snapshot.assignment_metadata.resize(atom_assignment_metadata_count);
 
   snapshot.source_cell_atom_count.resize(source_cell_count);
   snapshot.source_cell_atom_point.resize(source_cell_count);
@@ -478,11 +516,20 @@ partition_snapshot read_partition_snapshot(const glst_force &force,
 
   cudaCheck(cudaSetDevice(dev));
 
+  cudaCheck(cudaMemcpy(
+      static_cast<void *>(snapshot.assignment_metadata.data()),
+      static_cast<const void *>(
+          workspace.atom_assignment_metadata()[dev].d_array().data()),
+      atom_assignment_metadata_count * sizeof(unsigned int),
+      cudaMemcpyDeviceToHost));
+
   if (snapshot.source_atom_count > 0u) {
     const std::size_t packet_bytes =
         snapshot.source_atom_count * sizeof(atom_packet);
+
     const std::size_t index_bytes =
         snapshot.source_atom_count * sizeof(unsigned int);
+
     const std::size_t value_bytes = snapshot.source_atom_count * sizeof(double);
 
     cudaCheck(cudaMemcpy(static_cast<void *>(snapshot.packet.data()),
@@ -564,6 +611,31 @@ void compare_partition_snapshot(const partition_reference &expected,
 
   require(observed.max_atoms_cell == expected.max_atoms_cell,
           label + ": max_atoms_cell differs");
+
+  require(
+      expected.source_atom_count <=
+          static_cast<std::size_t>(std::numeric_limits<unsigned int>::max()),
+      label + ": expected source atom count exceeds unsigned int range");
+
+  require(
+      expected.owned_atom_count <=
+          static_cast<std::size_t>(std::numeric_limits<unsigned int>::max()),
+      label + ": expected owned atom count exceeds unsigned int range");
+
+  require(observed.assignment_metadata.size() == atom_assignment_metadata_count,
+          label + ": assignment metadata count differs");
+
+  require(observed.assignment_metadata[source_atom_count_metadata_index] ==
+              static_cast<unsigned int>(expected.source_atom_count),
+          label + ": device source atom count differs");
+
+  require(observed.assignment_metadata[owned_atom_count_metadata_index] ==
+              static_cast<unsigned int>(expected.owned_atom_count),
+          label + ": device owned atom count differs");
+
+  require(observed.assignment_metadata[max_atoms_cell_metadata_index] ==
+              expected.max_atoms_cell,
+          label + ": locally reduced maximum cell population differs");
 
   require(observed.source_cell_atom_count == expected.source_cell_atom_count,
           label + ": source cell atom counts differ");
@@ -679,6 +751,154 @@ void compare_partition_snapshot(const partition_reference &expected,
   return;
 }
 
+void compare_tile_rank_snapshots(
+    const std::vector<partition_snapshot> &snapshot,
+    const unsigned int cell_partition, const unsigned int tile_partition_count,
+    const std::string &label) {
+  require(tile_partition_count > 0u, label + ": tile partition count is zero");
+
+  std::vector<unsigned int> tile_seen(tile_partition_count, 0u);
+
+  int root_dev = -1;
+
+  for (std::size_t dev = 0; dev < snapshot.size(); dev++) {
+    const partition_snapshot &rank = snapshot[dev];
+
+    if (rank.cell_partition != cell_partition)
+      continue;
+
+    require(rank.tile_partition < tile_partition_count,
+            label + ": tile partition is out of range");
+
+    tile_seen[rank.tile_partition]++;
+
+    if (rank.tile_partition == 0u) {
+      require(root_dev < 0, label + ": more than one tile rank 0 was found");
+
+      root_dev = static_cast<int>(dev);
+    }
+  }
+
+  require(root_dev >= 0, label + ": tile rank 0 was not found");
+
+  for (unsigned int tile_partition = 0u; tile_partition < tile_partition_count;
+       tile_partition++) {
+    require(tile_seen[tile_partition] == 1u,
+            label + ": expected exactly one device for tile partition " +
+                std::to_string(tile_partition));
+  }
+
+  const partition_snapshot &root = snapshot[static_cast<std::size_t>(root_dev)];
+
+  for (std::size_t dev = 0; dev < snapshot.size(); dev++) {
+    const partition_snapshot &rank = snapshot[dev];
+
+    if (rank.cell_partition != cell_partition)
+      continue;
+
+    const std::string prefix =
+        label + ", tile_partition=" + std::to_string(rank.tile_partition);
+
+    require(rank.owned_atom_count == root.owned_atom_count,
+            prefix + ": owned atom counts differ");
+
+    require(rank.source_atom_count == root.source_atom_count,
+            prefix + ": source atom counts differ");
+
+    require(rank.max_atoms_cell == root.max_atoms_cell,
+            prefix + ": max_atoms_cell differs");
+
+    require(rank.assignment_metadata.size() == root.assignment_metadata.size(),
+            prefix + ": assignment metadata sizes differ");
+
+    require(rank.source_cell_atom_count.size() ==
+                root.source_cell_atom_count.size(),
+            prefix + ": source cell-count sizes differ");
+
+    require(rank.source_cell_atom_point.size() ==
+                root.source_cell_atom_point.size(),
+            prefix + ": source cell-point sizes differ");
+
+    require(rank.owned_cell_atom_count.size() ==
+                root.owned_cell_atom_count.size(),
+            prefix + ": owned cell-count sizes differ");
+
+    require(rank.owned_cell_atom_point.size() ==
+                root.owned_cell_atom_point.size(),
+            prefix + ": owned cell-point sizes differ");
+
+    require(rank.packet.size() == root.packet.size(),
+            prefix + ": packet sizes differ");
+
+    require(rank.sorted_idx.size() == root.sorted_idx.size(),
+            prefix + ": sorted-index sizes differ");
+
+    require(rank.rx.size() == root.rx.size(), prefix + ": rx sizes differ");
+
+    require(rank.ry.size() == root.ry.size(), prefix + ": ry sizes differ");
+
+    require(rank.rz.size() == root.rz.size(), prefix + ": rz sizes differ");
+
+    require(rank.qc.size() == root.qc.size(), prefix + ": qc sizes differ");
+
+    require(
+        raw_bytes_equal(root.assignment_metadata.data(),
+                        rank.assignment_metadata.data(),
+                        root.assignment_metadata.size() * sizeof(unsigned int)),
+        prefix + ": assignment metadata is not byte-identical");
+
+    require(raw_bytes_equal(root.source_cell_atom_count.data(),
+                            rank.source_cell_atom_count.data(),
+                            root.source_cell_atom_count.size() *
+                                sizeof(unsigned int)),
+            prefix + ": source cell counts are not byte-identical");
+
+    require(raw_bytes_equal(root.source_cell_atom_point.data(),
+                            rank.source_cell_atom_point.data(),
+                            root.source_cell_atom_point.size() *
+                                sizeof(unsigned int)),
+            prefix + ": source cell points are not byte-identical");
+
+    require(raw_bytes_equal(root.owned_cell_atom_count.data(),
+                            rank.owned_cell_atom_count.data(),
+                            root.owned_cell_atom_count.size() *
+                                sizeof(unsigned int)),
+            prefix + ": owned cell counts are not byte-identical");
+
+    require(raw_bytes_equal(root.owned_cell_atom_point.data(),
+                            rank.owned_cell_atom_point.data(),
+                            root.owned_cell_atom_point.size() *
+                                sizeof(unsigned int)),
+            prefix + ": owned cell points are not byte-identical");
+
+    require(raw_bytes_equal(root.packet.data(), rank.packet.data(),
+                            root.packet.size() * sizeof(atom_packet)),
+            prefix + ": packets are not byte-identical");
+
+    require(raw_bytes_equal(root.sorted_idx.data(), rank.sorted_idx.data(),
+                            root.sorted_idx.size() * sizeof(unsigned int)),
+            prefix + ": sorted indices are not byte-identical");
+
+    require(raw_bytes_equal(root.rx.data(), rank.rx.data(),
+                            root.rx.size() * sizeof(double)),
+            prefix + ": rx is not byte-identical");
+
+    require(raw_bytes_equal(root.ry.data(), rank.ry.data(),
+                            root.ry.size() * sizeof(double)),
+            prefix + ": ry is not byte-identical");
+
+    require(raw_bytes_equal(root.rz.data(), rank.rz.data(),
+                            root.rz.size() * sizeof(double)),
+            prefix + ": rz is not byte-identical");
+
+    require(raw_bytes_equal(root.qc.data(), rank.qc.data(),
+                            root.qc.size() * sizeof(double)),
+            prefix + ": qc is not byte-identical");
+  }
+
+  return;
+}
+
 void validate_owner_coverage(const std::vector<partition_snapshot> &snapshot,
                              const glst_plan &plan, const unsigned int natom,
                              const std::string &label) {
@@ -711,9 +931,17 @@ void validate_owner_coverage(const std::vector<partition_snapshot> &snapshot,
     }
   }
 
+  const unsigned int expected_replica_count = plan.tile_partition_count();
+
+  require(expected_replica_count > 0u,
+          label + ": expected owned-replica count is zero");
+
   for (unsigned int atom = 0; atom < natom; atom++) {
-    require(owner_count[atom] == 1u, label + ": atom " + std::to_string(atom) +
-                                         " does not have exactly one owner");
+    require(owner_count[atom] == expected_replica_count,
+            label + ": atom " + std::to_string(atom) + " has " +
+                std::to_string(owner_count[atom]) +
+                " owned replicas; expected " +
+                std::to_string(expected_replica_count));
   }
 
   return;
@@ -731,6 +959,10 @@ storage_snapshot take_storage_snapshot(const glst_workspace &workspace,
   require(workspace.cub_work_buffer_size().size() ==
               static_cast<std::size_t>(cuda_count),
           "CUB work-buffer-size count does not match device count");
+
+  require(workspace.atom_assignment_metadata().size() ==
+              static_cast<std::size_t>(cuda_count),
+          "Assignment-metadata device count does not match device count");
 
   for (int dev = 0; dev < cuda_count; dev++) {
     device_storage_snapshot &device = snapshot.device[dev];
@@ -758,6 +990,9 @@ storage_snapshot take_storage_snapshot(const glst_workspace &workspace,
     device.source_cell_atom_point = static_cast<const void *>(
         workspace.sr_source_cell_atom_point()[dev].d_array().data());
 
+    device.assignment_metadata = static_cast<const void *>(
+        workspace.atom_assignment_metadata()[dev].d_array().data());
+
     device.cub = workspace.cub_work_buffer()[dev];
 
     require(device.sorted_packet != nullptr,
@@ -776,6 +1011,8 @@ storage_snapshot take_storage_snapshot(const glst_workspace &workspace,
             "Source cell-count pointer is null");
     require(device.source_cell_atom_point != nullptr,
             "Source cell-point pointer is null");
+    require(device.assignment_metadata != nullptr,
+            "Assignment metadata pointer is null");
     require(device.cub != nullptr, "CUB work-buffer pointer is null");
   }
 
@@ -853,6 +1090,8 @@ void compare_storage_snapshot(const storage_snapshot &expected,
             prefix + "source cell-count pointer changed");
     require(rhs.source_cell_atom_point == lhs.source_cell_atom_point,
             prefix + "source cell-point pointer changed");
+    require(rhs.assignment_metadata == lhs.assignment_metadata,
+            prefix + "assignment metadata pointer changed");
     require(rhs.cub == lhs.cub, prefix + "CUB work-buffer pointer changed");
   }
 
@@ -877,6 +1116,195 @@ void compare_storage_snapshot(const storage_snapshot &expected,
   return;
 }
 
+void run_layout(const gpu_layout &layout, const int cuda_count,
+                cuda_container<double> &rx, cuda_container<double> &ry,
+                cuda_container<double> &rz, cuda_container<double> &qc,
+                const std::vector<position> &uniform_positions,
+                const std::vector<position> &paired_positions,
+                const std::vector<double> &charge) {
+  const unsigned long long int layout_product =
+      static_cast<unsigned long long int>(layout.cell_partition_count) *
+      static_cast<unsigned long long int>(layout.tile_partition_count);
+
+  require(layout.cell_partition_count > 0u,
+          "Requested cell partition count is zero");
+
+  require(layout.tile_partition_count > 0u,
+          "Requested tile partition count is zero");
+
+  require(layout_product == static_cast<unsigned long long int>(cuda_count),
+          "Requested layout does not match visible CUDA device count");
+
+  const std::string layout_label =
+      "G_cell=" + std::to_string(layout.cell_partition_count) +
+      ", G_tile=" + std::to_string(layout.tile_partition_count);
+
+  glst_force force;
+
+  force.set_gpu_layout(layout.cell_partition_count,
+                       layout.tile_partition_count);
+
+  force.init(test_natom, tol, box_dim_x, box_dim_y, box_dim_z, rcut);
+
+  require(glst_force_test_access::device_count(force) == cuda_count,
+          layout_label + ": force device count does not match visible GPUs");
+
+  const glst_plan &plan = glst_force_test_access::plan(force);
+
+  require(plan.natom() == test_natom,
+          layout_label + ": unexpected plan atom count");
+
+  require(plan.ncell_x() == test_ncell_x,
+          layout_label + ": unexpected plan ncell_x");
+
+  require(plan.ncell_y() == test_ncell_y,
+          layout_label + ": unexpected plan ncell_y");
+
+  require(plan.ncell_z() == test_ncell_z,
+          layout_label + ": unexpected plan ncell_z");
+
+  require(plan.ncell() == test_ncell_x * test_ncell_y * test_ncell_z,
+          layout_label + ": unexpected total plan cell count");
+
+  require(plan.cell_partition_count() == layout.cell_partition_count,
+          layout_label + ": plan cell-partition count is incorrect");
+
+  require(plan.tile_partition_count() == layout.tile_partition_count,
+          layout_label + ": plan tile-partition count is incorrect");
+
+  const std::size_t layout_slot_count =
+      static_cast<std::size_t>(layout.cell_partition_count) *
+      static_cast<std::size_t>(layout.tile_partition_count);
+
+  std::vector<unsigned int> layout_visit_count(layout_slot_count, 0u);
+
+  for (int dev = 0; dev < cuda_count; dev++) {
+    const unsigned int cell_partition =
+        glst_force_test_access::cell_partition(force, dev);
+
+    const unsigned int tile_partition =
+        glst_force_test_access::tile_partition(force, dev);
+
+    require(cell_partition < layout.cell_partition_count,
+            layout_label + ": device cell partition is out of range");
+
+    require(tile_partition < layout.tile_partition_count,
+            layout_label + ": device tile partition is out of range");
+
+    const std::size_t layout_slot =
+        static_cast<std::size_t>(cell_partition) *
+            static_cast<std::size_t>(layout.tile_partition_count) +
+        static_cast<std::size_t>(tile_partition);
+
+    require(layout_slot < layout_visit_count.size(),
+            layout_label + ": computed layout slot is out of range");
+
+    layout_visit_count[layout_slot]++;
+  }
+
+  for (std::size_t layout_slot = 0; layout_slot < layout_visit_count.size();
+       layout_slot++) {
+    require(layout_visit_count[layout_slot] == 1u,
+            layout_label +
+                ": GPU layout does not contain exactly one "
+                "device for partition slot " +
+                std::to_string(layout_slot));
+  }
+
+  const std::vector<std::vector<atom_packet>> uniform_cell_packets =
+      make_cell_packets(plan, uniform_positions, charge);
+
+  const std::vector<std::vector<atom_packet>> paired_cell_packets =
+      make_cell_packets(plan, paired_positions, charge);
+
+  const std::vector<partition_reference> uniform_reference =
+      make_partition_reference(plan, uniform_cell_packets);
+
+  const std::vector<partition_reference> paired_reference =
+      make_partition_reference(plan, paired_cell_packets);
+
+  storage_snapshot stable_storage;
+  bool stable_storage_initialized = false;
+
+  for (unsigned int repeat = 0u; repeat < repeat_count; repeat++) {
+    const bool use_paired_positions = ((repeat % 2u) != 0u);
+
+    const std::vector<position> &positions =
+        use_paired_positions ? paired_positions : uniform_positions;
+
+    const std::vector<partition_reference> &reference =
+        use_paired_positions ? paired_reference : uniform_reference;
+
+    const std::string distribution_name =
+        use_paired_positions ? "paired" : "uniform";
+
+    upload_input(rx, ry, rz, qc, positions, charge);
+
+    force.assign_atoms(rx.d_array().data(), ry.d_array().data(),
+                       rz.d_array().data(), qc.d_array().data());
+
+    glst_force_test_access::synchronize_compute_streams(force);
+
+    const glst_workspace &workspace = glst_force_test_access::workspace(force);
+
+    std::vector<partition_snapshot> observed(
+        static_cast<std::size_t>(cuda_count));
+
+    for (int dev = 0; dev < cuda_count; dev++) {
+      observed[dev] = read_partition_snapshot(force, dev);
+
+      const unsigned int cell_partition = observed[dev].cell_partition;
+
+      const unsigned int tile_partition = observed[dev].tile_partition;
+
+      require(cell_partition < reference.size(),
+              layout_label + ": observed partition has no host reference");
+
+      const std::string label =
+          layout_label + ", repeat=" + std::to_string(repeat) +
+          ", distribution=" + distribution_name +
+          ", device=" + std::to_string(dev) +
+          ", cell_partition=" + std::to_string(cell_partition) +
+          ", tile_partition=" + std::to_string(tile_partition);
+
+      compare_partition_snapshot(reference[cell_partition], observed[dev],
+                                 label);
+    }
+
+    const std::string repeat_label = layout_label +
+                                     ", repeat=" + std::to_string(repeat) +
+                                     ", distribution=" + distribution_name;
+
+    validate_owner_coverage(observed, plan, test_natom, repeat_label);
+
+    for (unsigned int cell_partition = 0u;
+         cell_partition < layout.cell_partition_count; cell_partition++) {
+      compare_tile_rank_snapshots(
+          observed, cell_partition, layout.tile_partition_count,
+          repeat_label + ", cell_partition=" + std::to_string(cell_partition));
+    }
+
+    const storage_snapshot current_storage =
+        take_storage_snapshot(workspace, cuda_count);
+
+    if (!stable_storage_initialized) {
+      stable_storage = current_storage;
+      stable_storage_initialized = true;
+    } else {
+      compare_storage_snapshot(stable_storage, current_storage, repeat_label);
+    }
+  }
+
+  require(stable_storage_initialized,
+          layout_label + ": no storage snapshot was recorded");
+
+  std::cout << "assign_atoms_hybrid: PASSED " << layout_label << ", "
+            << repeat_count << " alternating deterministic assignments"
+            << std::endl;
+
+  return;
+}
+
 } // namespace
 
 int main(void) {
@@ -887,10 +1315,12 @@ int main(void) {
     if ((cuda_count != 2) && (cuda_count != 4) && (cuda_count != 8)) {
       std::cout << "assign_atoms_hybrid: SKIPPED "
                 << "(expose exactly 2, 4, or 8 GPUs)" << std::endl;
+
       return EXIT_SUCCESS;
     }
 
     const std::vector<atom_site> sites = make_atom_sites();
+
     const std::vector<double> charge = make_charges(sites.size());
 
     const std::vector<position> uniform_positions =
@@ -911,125 +1341,30 @@ int main(void) {
     cuda_container<double> rz(test_natom);
     cuda_container<double> qc(test_natom);
 
-    glst_force force;
+    std::vector<gpu_layout> layouts;
 
-    force.set_gpu_layout(static_cast<unsigned int>(cuda_count), 1u);
-    force.init(test_natom, tol, box_dim_x, box_dim_y, box_dim_z, rcut);
+    // Preserve the existing pure-cell regression first.
+    layouts.push_back(gpu_layout{static_cast<unsigned int>(cuda_count), 1u});
 
-    require(glst_force_test_access::device_count(force) == cuda_count,
-            "Force device count does not match CUDA device count");
-
-    const glst_plan &plan = glst_force_test_access::plan(force);
-
-    require(plan.natom() == test_natom, "Unexpected plan atom count");
-    require(plan.ncell_x() == test_ncell_x, "Unexpected plan ncell_x");
-    require(plan.ncell_y() == test_ncell_y, "Unexpected plan ncell_y");
-    require(plan.ncell_z() == test_ncell_z, "Unexpected plan ncell_z");
-    require(plan.ncell() == test_ncell_x * test_ncell_y * test_ncell_z,
-            "Unexpected total plan cell count");
-
-    require(plan.cell_partition_count() ==
-                static_cast<unsigned int>(cuda_count),
-            "Plan cell-partition count does not match visible GPUs");
-
-    require(plan.tile_partition_count() == 1u,
-            "assign_atoms_hybrid requires G_tile = 1");
-
-    std::vector<unsigned int> partition_seen(
-        static_cast<std::size_t>(cuda_count), 0u);
-
-    for (int dev = 0; dev < cuda_count; dev++) {
-      const unsigned int cell_partition =
-          glst_force_test_access::cell_partition(force, dev);
-
-      require(cell_partition < static_cast<unsigned int>(cuda_count),
-              "Device cell partition is out of range");
-
-      require(glst_force_test_access::tile_partition(force, dev) == 0u,
-              "G_tile = 1 device has a nonzero tile partition");
-
-      partition_seen[cell_partition]++;
+    if (cuda_count == 2) {
+      layouts.push_back(gpu_layout{1u, 2u});
+    } else if (cuda_count == 4) {
+      layouts.push_back(gpu_layout{2u, 2u});
+      layouts.push_back(gpu_layout{1u, 4u});
+    } else {
+      layouts.push_back(gpu_layout{4u, 2u});
+      layouts.push_back(gpu_layout{2u, 4u});
+      layouts.push_back(gpu_layout{1u, 8u});
     }
 
-    for (unsigned int partition = 0;
-         partition < static_cast<unsigned int>(cuda_count); partition++) {
-      require(partition_seen[partition] == 1u,
-              "Cell partition does not have exactly one root device");
+    for (std::size_t layout_index = 0u; layout_index < layouts.size();
+         layout_index++) {
+      run_layout(layouts[layout_index], cuda_count, rx, ry, rz, qc,
+                 uniform_positions, paired_positions, charge);
     }
 
-    const std::vector<std::vector<atom_packet>> uniform_cell_packets =
-        make_cell_packets(plan, uniform_positions, charge);
-
-    const std::vector<std::vector<atom_packet>> paired_cell_packets =
-        make_cell_packets(plan, paired_positions, charge);
-
-    const std::vector<partition_reference> uniform_reference =
-        make_partition_reference(plan, uniform_cell_packets);
-
-    const std::vector<partition_reference> paired_reference =
-        make_partition_reference(plan, paired_cell_packets);
-
-    storage_snapshot stable_storage;
-
-    for (unsigned int repeat = 0; repeat < repeat_count; repeat++) {
-      const bool use_paired_positions = ((repeat % 2u) != 0u);
-
-      const std::vector<position> &positions =
-          use_paired_positions ? paired_positions : uniform_positions;
-
-      const std::vector<partition_reference> &reference =
-          use_paired_positions ? paired_reference : uniform_reference;
-
-      upload_input(rx, ry, rz, qc, positions, charge);
-
-      force.assign_atoms(rx.d_array().data(), ry.d_array().data(),
-                         rz.d_array().data(), qc.d_array().data());
-
-      glst_force_test_access::synchronize_compute_streams(force);
-
-      const glst_workspace &workspace =
-          glst_force_test_access::workspace(force);
-
-      std::vector<partition_snapshot> observed(
-          static_cast<std::size_t>(cuda_count));
-
-      for (int dev = 0; dev < cuda_count; dev++) {
-        observed[dev] = read_partition_snapshot(force, dev);
-
-        const unsigned int partition = observed[dev].cell_partition;
-
-        require(partition < reference.size(),
-                "Observed partition has no host reference");
-
-        const std::string label =
-            "G_cell=" + std::to_string(cuda_count) +
-            ", G_tile=1, repeat=" + std::to_string(repeat) + ", distribution=" +
-            std::string(use_paired_positions ? "paired" : "uniform") +
-            ", device=" + std::to_string(dev) +
-            ", partition=" + std::to_string(partition);
-
-        compare_partition_snapshot(reference[partition], observed[dev], label);
-      }
-
-      validate_owner_coverage(observed, plan, test_natom,
-                              "G_cell=" + std::to_string(cuda_count) +
-                                  ", repeat=" + std::to_string(repeat));
-
-      const storage_snapshot current_storage =
-          take_storage_snapshot(workspace, cuda_count);
-
-      if (repeat == 0u)
-        stable_storage = current_storage;
-      else {
-        compare_storage_snapshot(stable_storage, current_storage,
-                                 "G_cell=" + std::to_string(cuda_count) +
-                                     ", repeat=" + std::to_string(repeat));
-      }
-    }
-
-    std::cout << "assign_atoms_hybrid: PASSED G_cell=" << cuda_count
-              << ", G_tile=1, " << repeat_count
-              << " alternating deterministic assignments" << std::endl;
+    std::cout << "assign_atoms_hybrid: PASSED " << layouts.size()
+              << " layout(s) on " << cuda_count << " visible GPUs" << std::endl;
 
     return EXIT_SUCCESS;
   } catch (const std::exception &error) {

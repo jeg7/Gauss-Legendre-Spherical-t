@@ -52,13 +52,13 @@ glst_workspace::glst_workspace(void)
       atom_cell_sorted_idx_(), global_sort_key_in_(), global_sort_key_out_(),
       global_packet_in_(), global_packet_out_(), global_cell_atom_count_(),
       global_cell_atom_point_(), global_x_plane_atom_point_(),
-      global_max_atoms_cell_(), fx_(), fy_(), fz_(), en_(), cell_atom_point_(),
-      cell_atom_count_(), max_atoms_cell_(), sr_source_cell_atom_point_(),
-      sr_source_cell_atom_count_(), sf_re_(), sf_im_(), sf_exchange_re_(),
-      sf_exchange_im_(), prefix_partition_total_re_(),
-      prefix_partition_total_im_(), prefix_base_re_(), prefix_base_im_(),
-      prefix_plane_slot_(), rmt_sum_re_(), rmt_sum_im_(), cub_work_buffer_(),
-      cub_work_buffer_size_() {}
+      global_max_atoms_cell_(), atom_assignment_metadata_(), fx_(), fy_(),
+      fz_(), en_(), cell_atom_point_(), cell_atom_count_(), max_atoms_cell_(),
+      sr_source_cell_atom_point_(), sr_source_cell_atom_count_(), sf_re_(),
+      sf_im_(), sf_exchange_re_(), sf_exchange_im_(),
+      prefix_partition_total_re_(), prefix_partition_total_im_(),
+      prefix_base_re_(), prefix_base_im_(), prefix_plane_slot_(), rmt_sum_re_(),
+      rmt_sum_im_(), cub_work_buffer_(), cub_work_buffer_size_() {}
 
 glst_workspace::glst_workspace(const glst_plan &plan, const int device_count)
     : glst_workspace() {
@@ -321,6 +321,11 @@ glst_workspace::global_max_atoms_cell(void) const {
   return this->global_max_atoms_cell_;
 }
 
+const std::vector<cuda_container<unsigned int>> &
+glst_workspace::atom_assignment_metadata(void) const {
+  return this->atom_assignment_metadata_;
+}
+
 const std::vector<cuda_container<double>> &glst_workspace::fx(void) const {
   return this->fx_;
 }
@@ -498,6 +503,11 @@ device_vector<unsigned int> &glst_workspace::global_x_plane_atom_point(void) {
 
 device_vector<unsigned int> &glst_workspace::global_max_atoms_cell(void) {
   return this->global_max_atoms_cell_;
+}
+
+std::vector<cuda_container<unsigned int>> &
+glst_workspace::atom_assignment_metadata(void) {
+  return this->atom_assignment_metadata_;
 }
 
 std::vector<cuda_container<double>> &glst_workspace::fx(void) {
@@ -867,6 +877,8 @@ void glst_workspace::init(const glst_plan &plan,
   this->fz_.resize(device_count);
   this->en_.resize(device_count);
 
+  this->atom_assignment_metadata_.resize(device_count);
+
   this->cell_atom_point_.resize(device_count);
   this->cell_atom_count_.resize(device_count);
   this->max_atoms_cell_.resize(device_count);
@@ -903,6 +915,8 @@ void glst_workspace::init(const glst_plan &plan,
     this->fy_[dev].resize(this->atom_capacity_[dev]);
     this->fz_[dev].resize(this->atom_capacity_[dev]);
     this->en_[dev].resize(this->atom_capacity_[dev]);
+
+    this->atom_assignment_metadata_[dev].resize(3);
 
     this->cell_atom_point_[dev].resize(this->cell_capacity_[dev]);
     this->cell_atom_count_[dev].resize(this->cell_capacity_[dev]);
@@ -1114,6 +1128,8 @@ void glst_workspace::clear(void) {
   this->global_cell_atom_point_.clear();
   this->global_x_plane_atom_point_.clear();
   this->global_max_atoms_cell_.clear();
+
+  this->atom_assignment_metadata_.clear();
 
   this->fx_.clear();
   this->fy_.clear();

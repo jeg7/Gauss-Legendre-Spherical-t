@@ -15,6 +15,7 @@
 #include <glst_plan.hcu>
 #include <glst_workspace.hcu>
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdlib>
 #include <exception>
@@ -152,68 +153,90 @@ std::vector<position> make_positions(void) {
   return positions;
 }
 
-std::vector<partition_snapshot>
-make_host_reference(const glst_plan &target_plan, const int cuda_count,
-                    const unsigned int natom, const cuda_container<double> &rx,
-                    const cuda_container<double> &ry,
-                    const cuda_container<double> &rz,
-                    const cuda_container<double> &qc) {
-  glst_force force;
+std::vector<partition_snapshot> make_host_reference(
+    const glst_plan &target_plan, const unsigned int natom,
+    const cuda_container<double> &rx, const cuda_container<double> &ry,
+    const cuda_container<double> &rz, const cuda_container<double> &qc) {
+  require(rx.size() == static_cast<std::size_t>(natom),
+          "Host-reference rx size is incorrect");
 
-  // G_tile > 1 intentionally retains the host fallback in this commit.
-  force.set_gpu_layout(1u, static_cast<unsigned int>(cuda_count));
+  require(ry.size() == static_cast<std::size_t>(natom),
+          "Host-reference ry size is incorrect");
 
-  force.init(natom, tol, box_dim_x, box_dim_y, box_dim_z, rcut);
+  require(rz.size() == static_cast<std::size_t>(natom),
+          "Host-reference rz size is incorrect");
 
-  force.assign_atoms(rx.d_array().data(), ry.d_array().data(),
-                     rz.d_array().data(), qc.d_array().data());
-
-  const glst_workspace &workspace = glst_force_test_access::workspace(force);
-
-  require(workspace.source_atom_count(0) == static_cast<std::size_t>(natom),
-          "Global host reference does not contain every atom");
-
-  const std::vector<atom_packet> &global_storage =
-      workspace.sorted_packets()[0].h_array();
-
-  require(global_storage.size() >= static_cast<std::size_t>(natom),
-          "Global host packet storage is too small");
+  require(qc.size() == static_cast<std::size_t>(natom),
+          "Host-reference qc size is incorrect");
 
   std::vector<std::vector<atom_packet>> cell_packets(target_plan.ncell());
 
-  for (unsigned int atom = 0; atom < natom; atom++) {
-    const atom_packet &packet = global_storage[atom];
+  for (unsigned int atom = 0u; atom < natom; atom++) {
+    int cx = static_cast<int>(rx[atom] / target_plan.cell_dim_x());
 
-    require(packet.cell < target_plan.ncell(),
-            "Host reference cell is out of range");
+    int cy = static_cast<int>(ry[atom] / target_plan.cell_dim_y());
 
-    cell_packets[packet.cell].push_back(packet);
+    int cz = static_cast<int>(rz[atom] / target_plan.cell_dim_z());
+
+    cx = (cx >= static_cast<int>(target_plan.ncell_x()))
+             ? static_cast<int>(target_plan.ncell_x() - 1u)
+             : cx;
+
+    cy = (cy >= static_cast<int>(target_plan.ncell_y()))
+             ? static_cast<int>(target_plan.ncell_y() - 1u)
+             : cy;
+
+    cz = (cz >= static_cast<int>(target_plan.ncell_z()))
+             ? static_cast<int>(target_plan.ncell_z() - 1u)
+             : cz;
+
+    cx = (cx < 0) ? 0 : cx;
+    cy = (cy < 0) ? 0 : cy;
+    cz = (cz < 0) ? 0 : cz;
+
+    const unsigned int global_cell =
+        (static_cast<unsigned int>(cx) * target_plan.ncell_y() +
+         static_cast<unsigned int>(cy)) *
+            target_plan.ncell_z() +
+        static_cast<unsigned int>(cz);
+
+    cell_packets[global_cell].push_back(
+        atom_packet(atom, global_cell, rx[atom], ry[atom], rz[atom], qc[atom]));
+  }
+
+  for (unsigned int cell = 0u; cell < target_plan.ncell(); cell++) {
+    std::vector<atom_packet> &packets = cell_packets[cell];
+
+    std::sort(packets.begin(), packets.end(),
+              [](const atom_packet &lhs, const atom_packet &rhs) {
+                return lhs.i < rhs.i;
+              });
   }
 
   std::vector<partition_snapshot> snapshot(target_plan.cell_partition_count());
 
-  for (unsigned int partition = 0;
+  for (unsigned int partition = 0u;
        partition < target_plan.cell_partition_count(); partition++) {
-    partition_snapshot &partition_snapshot = snapshot[partition];
+    partition_snapshot &partition_data = snapshot[partition];
 
     const std::vector<unsigned int> &owned_cells =
         target_plan.partition_cell_idx(partition);
 
-    for (std::size_t i = 0; i < owned_cells.size(); i++)
-      partition_snapshot.owned_atom_count +=
-          cell_packets[owned_cells[i]].size();
+    for (std::size_t i = 0u; i < owned_cells.size(); i++) {
+      partition_data.owned_atom_count += cell_packets[owned_cells[i]].size();
+    }
 
     const std::vector<unsigned int> &source_cells =
         target_plan.partition_sr_source_cell_idx(partition);
 
-    for (std::size_t i = 0; i < source_cells.size(); i++) {
+    for (std::size_t i = 0u; i < source_cells.size(); i++) {
       const std::vector<atom_packet> &packets = cell_packets[source_cells[i]];
 
-      partition_snapshot.packet.insert(partition_snapshot.packet.end(),
-                                       packets.begin(), packets.end());
+      partition_data.packet.insert(partition_data.packet.end(), packets.begin(),
+                                   packets.end());
     }
 
-    partition_snapshot.source_atom_count = partition_snapshot.packet.size();
+    partition_data.source_atom_count = partition_data.packet.size();
   }
 
   return snapshot;
@@ -578,7 +601,7 @@ int main(void) {
     const glst_plan &plan = glst_force_test_access::plan(force);
 
     const std::vector<partition_snapshot> host_reference =
-        make_host_reference(plan, cuda_count, natom, rx, ry, rz, qc);
+        make_host_reference(plan, natom, rx, ry, rz, qc);
 
     require(plan.ncell_x() == test_ncell_x, "Unexpected ncell_x");
 

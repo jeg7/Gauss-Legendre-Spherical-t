@@ -833,7 +833,6 @@ int main(void) {
           continue;
 
         append_layout(layouts, cell_partition_count, tile_partition_count);
-        break;
       }
     }
 

@@ -1519,6 +1519,40 @@ __global__ static void finalize_global_atom_points_kernel(
   return;
 }
 
+__global__ static void write_atom_assignment_metadata_kernel(
+    unsigned int *__restrict__ metadata, const unsigned int source_atom_count,
+    const unsigned int owned_atom_count, const unsigned int max_atoms_cell) {
+  if ((blockIdx.x == 0) && (threadIdx.x == 0)) {
+    metadata[0] = source_atom_count;
+    metadata[1] = owned_atom_count;
+    metadata[2] = max_atoms_cell;
+  }
+
+  return;
+}
+
+__global__ static void build_local_atom_metadata_kernel(
+    unsigned int *__restrict__ local_cell_atom_count,
+    unsigned int *__restrict__ local_cell_atom_point,
+    unsigned int *__restrict__ assignment_metadata,
+    const unsigned int *__restrict__ source_cell_atom_count,
+    const unsigned int *__restrict__ source_cell_atom_point,
+    const unsigned int local_cell_count) {
+  const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const unsigned int stride = gridDim.x * blockDim.x;
+
+  for (unsigned int local_cell = idx; local_cell < local_cell_count;
+       local_cell += stride) {
+    const unsigned int count = source_cell_atom_count[local_cell];
+
+    local_cell_atom_count[local_cell] = count;
+    local_cell_atom_point[local_cell] = source_cell_atom_point[local_cell];
+    atomicMax(&assignment_metadata[2], count);
+  }
+
+  return;
+}
+
 void glst_force::build_global_atom_reference(const double *d_rx,
                                              const double *d_ry,
                                              const double *d_rz,
@@ -1727,16 +1761,6 @@ void glst_force::scatter_sorted_atom_packets(const double *d_rx,
                function_name,
                "Packet scatter requires a multi-GPU execution mode");
 
-  // This first implementation intentionally handles only one tile rank per cell
-  // partition. Broadcast to additional tile ranks is a later step.
-  utl::require(this->tile_partition_count_ == 1u, function_name,
-               "Packet scatter currently requires G_tile == 1");
-
-  utl::require(this->cell_partition_count_ ==
-                   static_cast<unsigned int>(this->cuda_count_),
-               function_name,
-               "G_tile == 1 requires one root device per cell partition");
-
   const std::size_t device_count = static_cast<std::size_t>(this->cuda_count_);
 
   utl::require((this->comp_streams_.size() == device_count) &&
@@ -1745,47 +1769,74 @@ void glst_force::scatter_sorted_atom_packets(const double *d_rx,
                    (this->comm_events_.size() == device_count),
                function_name, "CUDA stream/event topology is incomplete");
 
-  // For G_tile == 1, cell communicator 0 contains all tile-rank-0 roots.
-  utl::require(this->cell_comm_devs_.size() == 1u, function_name,
-               "Expected one cell communicator for G_tile == 1");
+  utl::require(this->cell_comm_devs_.size() ==
+                   static_cast<std::size_t>(this->tile_partition_count_),
+               function_name,
+               "Cell communicator topology does not match G_tile");
 
-  utl::require(this->cell_comms_.size() == 1u, function_name,
-               "Expected one cell communicator for G_tile == 1");
+  utl::require(this->cell_comms_.size() ==
+                   static_cast<std::size_t>(this->tile_partition_count_),
+               function_name, "Cell communicator handles do not match G_tile");
+
+  utl::require(!this->cell_comm_devs_.empty(), function_name,
+               "Tile-partition-0 cell communicator is missing");
 
   const std::vector<int> &root_devs = this->cell_comm_devs_[0];
   const std::vector<ncclComm_t> &root_comms = this->cell_comms_[0];
 
-  utl::require(
-      root_devs.size() == static_cast<std::size_t>(this->cell_partition_count_),
-      function_name, "Cell communicator device count does not match G_cell");
+  utl::require(root_devs.size() ==
+                   static_cast<std::size_t>(this->cell_partition_count_),
+               function_name,
+               "Cell-root communicator device count does not match G_cell");
 
   utl::require(root_comms.size() == root_devs.size(), function_name,
-               "Cell communicator handle count is incorrect");
+               "Cell-root communicator handle count is incorrect");
 
   utl::require(this->tile_comm_devs_.size() ==
                    static_cast<std::size_t>(this->cell_partition_count_),
                function_name,
                "Tile communicator topology does not match G_cell");
 
+  utl::require(this->tile_comms_.size() ==
+                   static_cast<std::size_t>(this->cell_partition_count_),
+               function_name, "Tile communicator handles do not match G_cell");
+
   for (unsigned int partition = 0; partition < this->cell_partition_count_;
        partition++) {
-    utl::require(this->tile_comm_devs_[partition].size() == 1u, function_name,
-                 "Cell partition does not have exactly one tile root");
+    const std::vector<int> &tile_devs = this->tile_comm_devs_[partition];
 
-    const int root_dev = this->tile_comm_devs_[partition][0];
+    const std::vector<ncclComm_t> &tile_comms = this->tile_comms_[partition];
 
-    utl::require(root_dev < this->cuda_count_, function_name,
-                 "Root device is out of range");
+    utl::require(tile_devs.size() ==
+                     static_cast<std::size_t>(this->tile_partition_count_),
+                 function_name,
+                 "Tile communicator device count does not match G_tile");
+
+    utl::require(tile_comms.size() == tile_devs.size(), function_name,
+                 "Tile communicator handle count is incorrect");
+
+    const int root_dev = tile_devs[0];
+
+    utl::require((root_dev >= 0) && (root_dev < this->cuda_count_),
+                 function_name, "Cell-partition root device is out of range");
 
     utl::require(root_devs[partition] == root_dev, function_name,
                  "Cell communicator rank does not match tile root");
 
-    utl::require(this->dev_cell_partition_[root_dev] == partition,
-                 function_name,
-                 "Root device belongs to the wrong cell partition");
+    for (unsigned int tile_partition = 0;
+         tile_partition < this->tile_partition_count_; tile_partition++) {
+      const int dev = tile_devs[tile_partition];
 
-    utl::require(this->dev_tile_partition_[root_dev] == 0u, function_name,
-                 "Cell-partition root is not tile partition 0");
+      utl::require((dev >= 0) && (dev < this->cuda_count_), function_name,
+                   "Tile communicator device is out of range");
+
+      utl::require(this->dev_cell_partition_[dev] == partition, function_name,
+                   "Tile communicator device is in the wrong cell partition");
+
+      utl::require(this->dev_tile_partition_[dev] == tile_partition,
+                   function_name,
+                   "Tile communicator rank does not match tile partition");
+    }
   }
 
   utl::require(root_devs[0] == 0, function_name,
@@ -1937,12 +1988,12 @@ void glst_force::scatter_sorted_atom_packets(const double *d_rx,
 
     partition_range[partition] = range;
 
-    const int root_dev = root_devs[partition];
-
     const std::vector<unsigned int> &left_cells =
         this->plan_->partition_left_halo_cell_idx(partition);
+
     const std::vector<unsigned int> &right_cells =
         this->plan_->partition_right_halo_cell_idx(partition);
+
     const std::size_t owned_cell_count =
         static_cast<std::size_t>(this->plan_->local_cell_count(partition));
 
@@ -1951,12 +2002,14 @@ void glst_force::scatter_sorted_atom_packets(const double *d_rx,
 
     const std::size_t first_owned_cell =
         static_cast<std::size_t>(this->plan_->first_global_cell(partition));
+
     const std::size_t first_left_cell =
-        (left_cells.empty()) ? first_owned_cell
-                             : static_cast<std::size_t>(left_cells.front());
+        left_cells.empty() ? first_owned_cell
+                           : static_cast<std::size_t>(left_cells.front());
+
     const std::size_t first_right_cell =
-        (right_cells.empty()) ? first_owned_cell
-                              : static_cast<std::size_t>(right_cells.front());
+        right_cells.empty() ? first_owned_cell
+                            : static_cast<std::size_t>(right_cells.front());
 
     cell_source_offset[partition] = {first_owned_cell, first_left_cell,
                                      first_right_cell};
@@ -1967,40 +2020,54 @@ void glst_force::scatter_sorted_atom_packets(const double *d_rx,
     cell_segment_count[partition] = {owned_cell_count, left_cell_count,
                                      right_cell_count};
 
-    utl::require(owned_cell_count + left_cell_count + right_cell_count ==
-                     this->workspace_->sr_source_cell_capacity(root_dev),
-                 function_name,
-                 "Source-cell segment counts do not match workspace capacity");
-
     const unsigned int max_atoms_cell = partition_max_atoms_cell[partition];
+
+    utl::require(
+        range.source_atom_count <=
+            static_cast<std::size_t>(std::numeric_limits<unsigned int>::max()),
+        function_name,
+        "Partition source atom count exceeds unsigned int range");
+
+    utl::require(
+        range.owned_atom_count <=
+            static_cast<std::size_t>(std::numeric_limits<unsigned int>::max()),
+        function_name, "Partition owned atom count exceeds unsigned int range");
 
     utl::require(static_cast<std::size_t>(max_atoms_cell) <=
                      range.owned_atom_count,
                  function_name,
                  "Partition maximum cell population exceeds owned atom count");
 
-    this->workspace_->max_atoms_cell()[root_dev] = max_atoms_cell;
+    const std::vector<int> &tile_devs = this->tile_comm_devs_[partition];
 
-    this->workspace_->ensure_atom_capacity(root_dev, range.source_atom_count);
+    for (std::size_t rank = 0; rank < tile_devs.size(); rank++) {
+      const int dev = tile_devs[rank];
 
-    this->workspace_->set_atom_counts(root_dev, range.source_atom_count,
-                                      range.owned_atom_count);
+      utl::require(
+          owned_cell_count + left_cell_count + right_cell_count ==
+              this->workspace_->sr_source_cell_capacity(dev),
+          function_name,
+          "Source-cell segment counts do not match workspace capacity");
+
+      this->workspace_->max_atoms_cell()[dev] = max_atoms_cell;
+
+      this->workspace_->ensure_atom_capacity(dev, range.source_atom_count);
+
+      this->workspace_->set_atom_counts(dev, range.source_atom_count,
+                                        range.owned_atom_count);
+    }
   }
 
-  // Prevent packet communication from overwriting a root buffer still being
-  // consumed by earlier work. GPU 0's event also publishes the completed global
-  // packet source to its communication stream.
-  for (unsigned int partition = 0; partition < this->cell_partition_count_;
-       partition++) {
-    const int root_dev = root_devs[partition];
+  // No assignment communication may overwrite a rank's packet or metadata
+  // buffers until preceeding compute work on that rank has finished.
+  for (int dev = 0; dev < this->cuda_count_; dev++) {
+    cudaCheck(cudaSetDevice(dev));
 
-    cudaCheck(cudaSetDevice(root_dev));
+    cudaCheck(
+        cudaEventRecord(this->comp_events_[dev], this->comp_streams_[dev]));
 
-    cudaCheck(cudaEventRecord(this->comp_events_[root_dev],
-                              this->comp_streams_[root_dev]));
-
-    cudaCheck(cudaStreamWaitEvent(this->comm_streams_[root_dev],
-                                  this->comp_events_[root_dev], 0));
+    cudaCheck(cudaStreamWaitEvent(this->comm_streams_[dev],
+                                  this->comp_events_[dev], 0));
   }
 
   const atom_packet *global_packet =
@@ -2008,6 +2075,29 @@ void glst_force::scatter_sorted_atom_packets(const double *d_rx,
 
   const unsigned int *global_cell_atom_count =
       this->workspace_->global_cell_atom_count().data();
+
+  for (unsigned int partition = 0; partition < this->cell_partition_count_;
+       partition++) {
+    const int root_dev = root_devs[partition];
+
+    const atom_partition_range &range = partition_range[partition];
+
+    unsigned int *metadata =
+        this->workspace_->atom_assignment_metadata()[root_dev].d_array().data();
+
+    utl::require(
+        this->workspace_->atom_assignment_metadata()[root_dev].size() == 3,
+        function_name, "Root assignment metadata capacity is incorrect");
+
+    cudaCheck(cudaSetDevice(root_dev));
+
+    write_atom_assignment_metadata_kernel<<<1, 1, 0,
+                                            this->comm_streams_[root_dev]>>>(
+        metadata, static_cast<unsigned int>(range.source_atom_count),
+        static_cast<unsigned int>(range.owned_atom_count),
+        partition_max_atoms_cell[partition]);
+    cudaCheck(cudaGetLastError());
+  }
 
   // Cell partition 0 is local to GPU 0. Use ordinary asynchronous D2D copies,
   // preserving the exact [owned][left][right] destination order.
@@ -2048,7 +2138,7 @@ void glst_force::scatter_sorted_atom_packets(const double *d_rx,
       cudaCheck(cudaMemcpyAsync(
           static_cast<void *>(destination + destination_offset[segment]),
           static_cast<const void *>(global_packet + source_offset[segment]),
-          byte_count, cudaMemcpyDeviceToDevice, this->comp_streams_[root_dev]));
+          byte_count, cudaMemcpyDeviceToDevice, this->comm_streams_[root_dev]));
     }
 
     unsigned int *destination_cell_count =
@@ -2074,7 +2164,7 @@ void glst_force::scatter_sorted_atom_packets(const double *d_rx,
                               cell_destination_offset[partition][segment]),
           static_cast<const void *>(global_cell_atom_count +
                                     cell_source_offset[partition][segment]),
-          byte_count, cudaMemcpyDeviceToDevice, this->comp_streams_[root_dev]));
+          byte_count, cudaMemcpyDeviceToDevice, this->comm_streams_[root_dev]));
     }
   }
 
@@ -2187,20 +2277,77 @@ void glst_force::scatter_sorted_atom_packets(const double *d_rx,
     ncclCheck(ncclGroupEnd());
   }
 
-  // Publish completion to each root's compute stream. In particular, GPU 0's
-  // compute stream cannot overwrite global_packet_out during the next
-  // assignment until all remote sends have finished.
-  for (unsigned int partition = 0; partition < this->cell_partition_count_;
-       partition++) {
-    const int root_dev = root_devs[partition];
+  // Replicate each cell partition's packed source representation from
+  // tile-communicator rank 0 to all tile ranks in that cell partition.
+  if (this->tile_partition_count_ > 1u) {
+    ncclCheck(ncclGroupStart());
 
-    cudaCheck(cudaSetDevice(root_dev));
+    for (unsigned int partition = 0; partition < this->cell_partition_count_;
+         partition++) {
+      const atom_partition_range &range = partition_range[partition];
 
-    cudaCheck(cudaEventRecord(this->comm_events_[root_dev],
-                              this->comm_streams_[root_dev]));
+      const std::size_t source_cell_count =
+          this->plan_->partition_sr_source_cell_idx(partition).size();
 
-    cudaCheck(cudaStreamWaitEvent(this->comp_streams_[root_dev],
-                                  this->comm_events_[root_dev], 0));
+      utl::require(
+          range.source_atom_count <=
+              std::numeric_limits<std::size_t>::max() / sizeof(atom_packet),
+          function_name, "Packet broadcast byte count overflows size_t");
+
+      const std::size_t packet_byte_count =
+          range.source_atom_count * sizeof(atom_packet);
+
+      const std::vector<int> &tile_devs = this->tile_comm_devs_[partition];
+      const std::vector<ncclComm_t> &tile_comms = this->tile_comms_[partition];
+
+      utl::require(tile_devs.size() == tile_comms.size(), function_name,
+                   "Tile communicator device/handle counts differ");
+
+      for (std::size_t rank = 0; rank < tile_devs.size(); rank++) {
+        const int dev = tile_devs[rank];
+
+        cudaCheck(cudaSetDevice(dev));
+
+        unsigned int *metadata =
+            this->workspace_->atom_assignment_metadata()[dev].d_array().data();
+        atom_packet *packet =
+            this->workspace_->sorted_packets()[dev].d_array().data();
+        unsigned int *source_cell_atom_count =
+            this->workspace_->sr_source_cell_atom_count()[dev].d_array().data();
+
+        // Communicator rank 0 is tile partition 0.
+        ncclCheck(ncclBroadcast(static_cast<const void *>(metadata),
+                                static_cast<void *>(metadata), 3, ncclUint32, 0,
+                                tile_comms[rank], this->comm_streams_[dev]));
+
+        if (packet_byte_count > 0) {
+          ncclCheck(ncclBroadcast(static_cast<const void *>(packet),
+                                  static_cast<void *>(packet),
+                                  packet_byte_count, ncclChar, 0,
+                                  tile_comms[rank], this->comm_streams_[dev]));
+        }
+
+        if (source_cell_count > 0) {
+          ncclCheck(ncclBroadcast(
+              static_cast<const void *>(source_cell_atom_count),
+              static_cast<void *>(source_cell_atom_count), source_cell_count,
+              ncclUint32, 0, tile_comms[rank], this->comm_streams_[dev]));
+        }
+      }
+    }
+
+    ncclCheck(ncclGroupEnd());
+  }
+
+  // Publish assignment communication completion to every rank's compute stream.
+  for (int dev = 0; dev < this->cuda_count_; dev++) {
+    cudaCheck(cudaSetDevice(dev));
+
+    cudaCheck(
+        cudaEventRecord(this->comm_events_[dev], this->comm_streams_[dev]));
+
+    cudaCheck(cudaStreamWaitEvent(this->comp_streams_[dev],
+                                  this->comm_events_[dev], 0));
   }
 
   return;
@@ -2404,230 +2551,10 @@ void glst_force::assign_atoms_multi_gpu(const double *d_rx, const double *d_ry,
   if (this->profiling_enabled_)
     assignment_start = std::chrono::steady_clock::now();
 
-  if (this->tile_partition_count_ == 1u) {
-    this->scatter_sorted_atom_packets(d_rx, d_ry, d_rz, d_qc);
-
-    if (this->profiling_enabled_) {
-      const std::chrono::steady_clock::time_point assignment_end =
-          std::chrono::steady_clock::now();
-
-      this->profile_.atom_assignment_scatter_ms =
-          profile_elapsed_ms(assignment_start, assignment_end);
-    }
-
-    std::chrono::steady_clock::time_point source_start;
-    if (this->profiling_enabled_)
-      source_start = std::chrono::steady_clock::now();
-
-    const std::size_t cub_item_limit =
-        static_cast<std::size_t>(std::numeric_limits<int>::max());
-
-    for (int dev = 0; dev < this->cuda_count_; dev++) {
-      utl::require(this->dev_tile_partition_[dev] == 0u, function_name,
-                   "G_tile == 1 device has a nonzero tile partition");
-
-      cudaCheck(cudaSetDevice(dev));
-
-      const unsigned int cell_partition = this->dev_cell_partition_[dev];
-      const std::size_t local_cell_count = static_cast<std::size_t>(
-          this->plan_->local_cell_count(cell_partition));
-      const std::size_t source_cell_count =
-          this->plan_->partition_sr_source_cell_idx(cell_partition).size();
-      const std::size_t source_atom_count =
-          this->workspace_->source_atom_count(dev);
-      const std::size_t owned_atom_count =
-          this->workspace_->owned_atom_count(dev);
-
-      utl::require(
-          source_cell_count == this->workspace_->sr_source_cell_capacity(dev),
-          function_name, "Source-cell count does not match workspace capacity");
-
-      utl::require(source_cell_count <= cub_item_limit, function_name,
-                   "Source-cell count exceeds CUB int range");
-
-      utl::require(local_cell_count == this->workspace_->cell_capacity(dev),
-                   function_name,
-                   "Owned-cell count does not match workspace capacity");
-
-      utl::require(
-          source_atom_count <= static_cast<std::size_t>(
-                                   std::numeric_limits<unsigned int>::max()),
-          function_name, "Source atom count exceeds unpack-kernel range");
-
-      utl::require(owned_atom_count <= source_atom_count, function_name,
-                   "Owned atom count exceeds source atom count");
-
-      utl::require(
-          static_cast<std::size_t>(this->workspace_->max_atoms_cell()[dev]) <=
-              owned_atom_count,
-          function_name,
-          "Maximum owned-cell population exceeds owned atom count");
-
-      const cudaStream_t stream = this->comp_streams_[dev];
-
-      if (source_cell_count > 0u) {
-        void *const cub_work_buffer = this->workspace_->cub_work_buffer()[dev];
-        const std::size_t cub_work_buffer_capacity =
-            this->workspace_->cub_work_buffer_size()[dev];
-
-        utl::require(cub_work_buffer != nullptr, function_name,
-                     "CUB work buffer is null");
-
-        utl::require(cub_work_buffer_capacity > 0u, function_name,
-                     "CUB work-buffer capacity is zero");
-
-        std::size_t cub_work_buffer_size = cub_work_buffer_capacity;
-
-        cudaCheck(cub::DeviceScan::ExclusiveSum(
-            cub_work_buffer, cub_work_buffer_size,
-            this->workspace_->sr_source_cell_atom_count()[dev].d_array().data(),
-            this->workspace_->sr_source_cell_atom_point()[dev].d_array().data(),
-            static_cast<int>(source_cell_count), stream));
-
-        if (local_cell_count > 0u) {
-          const std::size_t local_cell_bytes =
-              local_cell_count * sizeof(unsigned int);
-
-          cudaCheck(cudaMemcpyAsync(
-              static_cast<void *>(
-                  this->workspace_->cell_atom_count()[dev].d_array().data()),
-              static_cast<const void *>(
-                  this->workspace_->sr_source_cell_atom_count()[dev]
-                      .d_array()
-                      .data()),
-              local_cell_bytes, cudaMemcpyDeviceToDevice, stream));
-
-          cudaCheck(cudaMemcpyAsync(
-              static_cast<void *>(
-                  this->workspace_->cell_atom_point()[dev].d_array().data()),
-              static_cast<const void *>(
-                  this->workspace_->sr_source_cell_atom_point()[dev]
-                      .d_array()
-                      .data()),
-              local_cell_bytes, cudaMemcpyDeviceToDevice, stream));
-        }
-      }
-
-      if (source_atom_count > 0u) {
-        const unsigned int active_source_atom_count =
-            static_cast<unsigned int>(source_atom_count);
-
-        constexpr unsigned int num_threads = 512u;
-        const unsigned int num_blocks =
-            (active_source_atom_count + num_threads - 1u) / num_threads;
-
-        unpack_kernel<<<num_blocks, num_threads, 0, stream>>>(
-            this->workspace_->rx()[dev].d_array().data(),
-            this->workspace_->ry()[dev].d_array().data(),
-            this->workspace_->rz()[dev].d_array().data(),
-            this->workspace_->qc()[dev].d_array().data(),
-            this->workspace_->sorted_idx()[dev].d_array().data(),
-            this->workspace_->sorted_packets()[dev].d_array().data(),
-            active_source_atom_count);
-        cudaCheck(cudaGetLastError());
-      }
-
-      if (this->profiling_enabled_) {
-        this->profile_.owned_atom_replicas += owned_atom_count;
-        this->profile_.halo_atom_replicas +=
-            source_atom_count - owned_atom_count;
-      }
-    }
-
-    if (this->profiling_enabled_) {
-      // Profiling mode already synchronizes between measured phases. The
-      // normal execution path remains fully stream ordered after the
-      // descriptor boundary.
-      this->synchronize_compute_streams();
-
-      const std::chrono::steady_clock::time_point source_end =
-          std::chrono::steady_clock::now();
-
-      this->profile_.owned_halo_source_scatter_ms =
-          profile_elapsed_ms(source_start, source_end);
-    }
-
-    return;
-  }
-
-  const unsigned int natom = this->plan_->natom();
-  const unsigned int ncell_x = this->plan_->ncell_x();
-  const unsigned int ncell_y = this->plan_->ncell_y();
-  const unsigned int ncell_z = this->plan_->ncell_z();
-
-  std::vector<double> h_rx(natom);
-  std::vector<double> h_ry(natom);
-  std::vector<double> h_rz(natom);
-  std::vector<double> h_qc(natom);
-
-  cudaCheck(cudaSetDevice(0));
-  cudaCheck(cudaMemcpy(h_rx.data(), d_rx, natom * sizeof(double),
-                       cudaMemcpyDeviceToHost));
-  cudaCheck(cudaMemcpy(h_ry.data(), d_ry, natom * sizeof(double),
-                       cudaMemcpyDeviceToHost));
-  cudaCheck(cudaMemcpy(h_rz.data(), d_rz, natom * sizeof(double),
-                       cudaMemcpyDeviceToHost));
-  cudaCheck(cudaMemcpy(h_qc.data(), d_qc, natom * sizeof(double),
-                       cudaMemcpyDeviceToHost));
-
-  std::vector<std::vector<atom_packet>> cell_packets(this->plan_->ncell());
-  std::vector<std::vector<atom_packet>> partition_owned_packets(
-      this->cell_partition_count_);
-  std::vector<std::vector<atom_packet>> partition_source_packets(
-      this->cell_partition_count_);
-
-  const double inv_cell_dim_x = 1.0 / this->plan_->cell_dim_x();
-  const double inv_cell_dim_y = 1.0 / this->plan_->cell_dim_y();
-  const double inv_cell_dim_z = 1.0 / this->plan_->cell_dim_z();
-
-  for (unsigned int atom = 0; atom < natom; atom++) {
-    int cx = static_cast<int>(h_rx[atom] * inv_cell_dim_x);
-    int cy = static_cast<int>(h_ry[atom] * inv_cell_dim_y);
-    int cz = static_cast<int>(h_rz[atom] * inv_cell_dim_z);
-
-    cx = (cx >= static_cast<int>(ncell_x)) ? static_cast<int>(ncell_x - 1) : cx;
-    cy = (cy >= static_cast<int>(ncell_y)) ? static_cast<int>(ncell_y - 1) : cy;
-    cz = (cz >= static_cast<int>(ncell_z)) ? static_cast<int>(ncell_z - 1) : cz;
-
-    cx = (cx < 0) ? 0 : cx;
-    cy = (cy < 0) ? 0 : cy;
-    cz = (cz < 0) ? 0 : cz;
-
-    const unsigned int cell = (static_cast<unsigned int>(cx) * ncell_y +
-                               static_cast<unsigned int>(cy)) *
-                                  ncell_z +
-                              static_cast<unsigned int>(cz);
-
-    const atom_packet packet(atom, cell, h_rx[atom], h_ry[atom], h_rz[atom],
-                             h_qc[atom]);
-
-    cell_packets[cell].push_back(packet);
-  }
-
-  for (unsigned int cell = 0; cell < this->plan_->ncell(); cell++) {
-    std::vector<atom_packet> &packets = cell_packets[cell];
-
-    std::sort(packets.begin(), packets.end(),
-              [](const atom_packet &lhs, const atom_packet &rhs) {
-                return lhs.i < rhs.i;
-              });
-  }
-
-  for (unsigned int partition = 0; partition < this->cell_partition_count_;
-       partition++) {
-    std::vector<atom_packet> &owned_packets =
-        partition_owned_packets[partition];
-
-    const std::vector<unsigned int> &owned_cells =
-        this->plan_->partition_cell_idx(partition);
-
-    for (std::size_t i = 0; i < owned_cells.size(); i++) {
-      const unsigned int cell = owned_cells[i];
-      const std::vector<atom_packet> &cell_atoms = cell_packets[cell];
-      owned_packets.insert(owned_packets.end(), cell_atoms.begin(),
-                           cell_atoms.end());
-    }
-  }
+  // GPU 0 classifies and sorts once. The resulting owned/left/right ranges are
+  // scattered to tile-partition-0 roots and broadcast inside tile
+  // communicators.
+  this->scatter_sorted_atom_packets(d_rx, d_ry, d_rz, d_qc);
 
   if (this->profiling_enabled_) {
     const std::chrono::steady_clock::time_point assignment_end =
@@ -2637,170 +2564,147 @@ void glst_force::assign_atoms_multi_gpu(const double *d_rx, const double *d_ry,
         profile_elapsed_ms(assignment_start, assignment_end);
   }
 
-  std::chrono::steady_clock::time_point halo_start;
+  std::chrono::steady_clock::time_point source_start;
   if (this->profiling_enabled_)
-    halo_start = std::chrono::steady_clock::now();
+    source_start = std::chrono::steady_clock::now();
 
-  for (unsigned int partition = 0; partition < this->cell_partition_count_;
-       partition++) {
-    std::vector<atom_packet> &source_packets =
-        partition_source_packets[partition];
-
-    const std::vector<unsigned int> &source_cells =
-        this->plan_->partition_sr_source_cell_idx(partition);
-
-    for (std::size_t i = 0; i < source_cells.size(); i++) {
-      const unsigned int cell = source_cells[i];
-      const std::vector<atom_packet> &cell_atoms = cell_packets[cell];
-
-      source_packets.insert(source_packets.end(), cell_atoms.begin(),
-                            cell_atoms.end());
-    }
-  }
+  const std::size_t cub_item_limit =
+      static_cast<std::size_t>(std::numeric_limits<int>::max());
 
   for (int dev = 0; dev < this->cuda_count_; dev++) {
     cudaCheck(cudaSetDevice(dev));
 
     const unsigned int cell_partition = this->dev_cell_partition_[dev];
-
-    const std::vector<atom_packet> &owned_packets =
-        partition_owned_packets[cell_partition];
-    const std::vector<atom_packet> &source_packets =
-        partition_source_packets[cell_partition];
-
-    const std::size_t owned_atom_count = owned_packets.size();
-    const std::size_t source_atom_count = source_packets.size();
-
-    if (this->profiling_enabled_) {
-      this->profile_.owned_atom_replicas += owned_atom_count;
-      utl::require(source_atom_count >= owned_atom_count, function_name,
-                   "Source atom count is smaller than owned atom count");
-      this->profile_.halo_atom_replicas += source_atom_count - owned_atom_count;
-    }
-
     const std::size_t local_cell_count =
         static_cast<std::size_t>(this->plan_->local_cell_count(cell_partition));
-
-    const std::vector<unsigned int> &source_cells =
-        this->plan_->partition_sr_source_cell_idx(cell_partition);
-    const std::size_t source_cell_count = source_cells.size();
+    const std::size_t source_cell_count =
+        this->plan_->partition_sr_source_cell_idx(cell_partition).size();
+    const std::size_t source_atom_count =
+        this->workspace_->source_atom_count(dev);
+    const std::size_t owned_atom_count =
+        this->workspace_->owned_atom_count(dev);
 
     utl::require(
         source_cell_count == this->workspace_->sr_source_cell_capacity(dev),
-        function_name, "Source cell count does not match workspace capacity");
+        function_name, "Source-cell count does not match workspace capacity");
 
-    this->workspace_->ensure_atom_capacity(dev, source_atom_count);
-    this->workspace_->set_atom_counts(dev, source_atom_count, owned_atom_count);
+    utl::require(source_cell_count <= cub_item_limit, function_name,
+                 "Source-cell count exceeds CUB int range");
 
-    std::fill(this->workspace_->cell_atom_count()[dev].h_array().begin(),
-              this->workspace_->cell_atom_count()[dev].h_array().end(), 0u);
-    std::fill(this->workspace_->cell_atom_point()[dev].h_array().begin(),
-              this->workspace_->cell_atom_point()[dev].h_array().end(), 0u);
-    std::fill(
-        this->workspace_->sr_source_cell_atom_count()[dev].h_array().begin(),
-        this->workspace_->sr_source_cell_atom_count()[dev].h_array().end(), 0u);
-    std::fill(
-        this->workspace_->sr_source_cell_atom_point()[dev].h_array().begin(),
-        this->workspace_->sr_source_cell_atom_point()[dev].h_array().end(), 0u);
+    utl::require(local_cell_count == this->workspace_->cell_capacity(dev),
+                 function_name,
+                 "Owned-cell count does not match workspace capacity");
 
-    std::size_t atom_point = 0;
-    this->workspace_->max_atoms_cell()[dev] = 0;
+    utl::require(
+        local_cell_count <=
+            static_cast<std::size_t>(std::numeric_limits<unsigned int>::max()),
+        function_name, "Owned-cell count exceeds kernel argument range");
 
-    for (std::size_t source_local_cell = 0;
-         source_local_cell < source_cell_count; source_local_cell++) {
-      const unsigned int global_cell = source_cells[source_local_cell];
-      const std::vector<atom_packet> &cell_atoms = cell_packets[global_cell];
+    utl::require(
+        source_atom_count <=
+            static_cast<std::size_t>(std::numeric_limits<unsigned int>::max()),
+        function_name, "Source atom count exceeds unpack-kernel range");
 
-      utl::require(cell_atoms.size() <=
-                       static_cast<std::size_t>(
-                           std::numeric_limits<unsigned int>::max()),
-                   function_name, "Cell atom count exceeds unsigned int range");
+    utl::require(owned_atom_count <= source_atom_count, function_name,
+                 "Owned atom count exceeds source atom count");
 
-      const unsigned int point = static_cast<unsigned int>(atom_point);
-      const unsigned int count = static_cast<unsigned int>(cell_atoms.size());
+    utl::require(
+        static_cast<std::size_t>(this->workspace_->max_atoms_cell()[dev]) <=
+            owned_atom_count,
+        function_name,
+        "Maximum owned-cell population exceeds owned atom count");
 
-      this->workspace_->sr_source_cell_atom_point()[dev][source_local_cell] =
-          point;
+    utl::require(this->workspace_->atom_assignment_metadata()[dev].size() == 3,
+                 function_name, "Assignment metadata capacity is incorrect");
 
-      this->workspace_->sr_source_cell_atom_count()[dev][source_local_cell] =
-          count;
+    const cudaStream_t stream = this->comp_streams_[dev];
 
-      if (source_local_cell < local_cell_count) {
-        this->workspace_->cell_atom_point()[dev][source_local_cell] = point;
-        this->workspace_->cell_atom_count()[dev][source_local_cell] = count;
+    unsigned int *assignment_metadata =
+        this->workspace_->atom_assignment_metadata()[dev].d_array().data();
 
-        if (count > this->workspace_->max_atoms_cell()[dev])
-          this->workspace_->max_atoms_cell()[dev] = count;
-      }
+    // Every rank independently rebuilds source-cell points from the
+    // byte-identical source-cell counts it received.
+    if (source_cell_count > 0) {
+      void *const cub_work_buffer = this->workspace_->cub_work_buffer()[dev];
+      const std::size_t cub_work_buffer_capacity =
+          this->workspace_->cub_work_buffer_size()[dev];
 
-      for (std::size_t i = 0; i < cell_atoms.size(); i++) {
-        const atom_packet &packet = cell_atoms[i];
+      utl::require(cub_work_buffer != nullptr, function_name,
+                   "CUB work buffer is null");
 
-        this->workspace_->idx()[dev][atom_point] = packet.i;
-        this->workspace_->sorted_idx()[dev][atom_point] = packet.i;
-        this->workspace_->rx()[dev][atom_point] = packet.x;
-        this->workspace_->ry()[dev][atom_point] = packet.y;
-        this->workspace_->rz()[dev][atom_point] = packet.z;
-        this->workspace_->qc()[dev][atom_point] = packet.q;
-        this->workspace_->packets()[dev][atom_point] = packet;
-        this->workspace_->sorted_packets()[dev][atom_point] = packet;
+      utl::require(cub_work_buffer_capacity > 0u, function_name,
+                   "CUB work-buffer capacity is zero");
 
-        this->workspace_->atom_cell_idx()[dev][atom_point] =
-            static_cast<unsigned int>(source_local_cell);
-        this->workspace_->atom_cell_sorted_idx()[dev][atom_point] =
-            static_cast<unsigned int>(source_local_cell);
+      std::size_t cub_work_buffer_size = cub_work_buffer_capacity;
 
-        atom_point++;
-      }
+      cudaCheck(cub::DeviceScan::ExclusiveSum(
+          cub_work_buffer, cub_work_buffer_size,
+          this->workspace_->sr_source_cell_atom_count()[dev].d_array().data(),
+          this->workspace_->sr_source_cell_atom_point()[dev].d_array().data(),
+          static_cast<int>(source_cell_count), stream));
     }
 
-    utl::require(atom_point == source_atom_count, function_name,
-                 "Source cell counts do not sum to source atoms");
+    // Recompute the maximum owned-cell population locally as requested.
+    cudaCheck(cudaMemsetAsync(static_cast<void *>(assignment_metadata + 2), 0,
+                              sizeof(unsigned int), stream));
 
-    for (std::size_t i = 0; i < owned_atom_count; i++) {
-      utl::require((source_packets[i].i == owned_packets[i].i) &&
-                       (source_packets[i].cell == owned_packets[i].cell) &&
-                       (source_packets[i].x == owned_packets[i].x) &&
-                       (source_packets[i].y == owned_packets[i].y) &&
-                       (source_packets[i].z == owned_packets[i].z) &&
-                       (source_packets[i].q == owned_packets[i].q),
-                   function_name,
-                   "Source packet list does not start with owned packets");
+    if (local_cell_count > 0) {
+      const unsigned int active_local_cell_count =
+          static_cast<unsigned int>(local_cell_count);
+
+      constexpr unsigned int num_threads = 256;
+      const unsigned int num_blocks =
+          (active_local_cell_count + num_threads - 1u) / num_threads;
+
+      build_local_atom_metadata_kernel<<<num_blocks, num_threads, 0, stream>>>(
+          this->workspace_->cell_atom_count()[dev].d_array().data(),
+          this->workspace_->cell_atom_point()[dev].d_array().data(),
+          assignment_metadata,
+          this->workspace_->sr_source_cell_atom_count()[dev].d_array().data(),
+          this->workspace_->sr_source_cell_atom_point()[dev].d_array().data(),
+          active_local_cell_count);
+      cudaCheck(cudaGetLastError());
     }
 
+    // Do not communicate the individual Structure of Arrays arrays. Every rank
+    // unpacks the one packed source representation locally.
     if (source_atom_count > 0) {
-      this->workspace_->idx()[dev].transfer_to_device();
-      this->workspace_->sorted_idx()[dev].transfer_to_device();
-      this->workspace_->rx()[dev].transfer_to_device();
-      this->workspace_->ry()[dev].transfer_to_device();
-      this->workspace_->rz()[dev].transfer_to_device();
-      this->workspace_->qc()[dev].transfer_to_device();
-      this->workspace_->packets()[dev].transfer_to_device();
-      this->workspace_->sorted_packets()[dev].transfer_to_device();
-      this->workspace_->atom_cell_idx()[dev].transfer_to_device();
-      this->workspace_->atom_cell_sorted_idx()[dev].transfer_to_device();
+      const unsigned int active_source_atom_count =
+          static_cast<unsigned int>(source_atom_count);
+
+      constexpr unsigned int num_threads = 512;
+      const unsigned int num_blocks =
+          (active_source_atom_count + num_threads - 1) / num_threads;
+
+      unpack_kernel<<<num_blocks, num_threads, 0, stream>>>(
+          this->workspace_->rx()[dev].d_array().data(),
+          this->workspace_->ry()[dev].d_array().data(),
+          this->workspace_->rz()[dev].d_array().data(),
+          this->workspace_->qc()[dev].d_array().data(),
+          this->workspace_->sorted_idx()[dev].d_array().data(),
+          this->workspace_->sorted_packets()[dev].d_array().data(),
+          active_source_atom_count);
+      cudaCheck(cudaGetLastError());
     }
 
-    this->workspace_->cell_atom_count()[dev].transfer_to_device();
-    this->workspace_->cell_atom_point()[dev].transfer_to_device();
+    if (this->profiling_enabled_) {
+      this->profile_.owned_atom_replicas += owned_atom_count;
 
-    this->workspace_->sr_source_cell_atom_count()[dev].transfer_to_device();
-    this->workspace_->sr_source_cell_atom_point()[dev].transfer_to_device();
+      this->profile_.halo_atom_replicas += source_atom_count - owned_atom_count;
+    }
   }
 
   if (this->profiling_enabled_) {
+    // Profiling mode already introduces phase boundaries. Normal execution
+    // remains entirely stream/event ordered.
     this->synchronize_compute_streams();
 
-    const std::chrono::steady_clock::time_point halo_end =
+    const std::chrono::steady_clock::time_point source_end =
         std::chrono::steady_clock::now();
 
     this->profile_.owned_halo_source_scatter_ms =
-        profile_elapsed_ms(halo_start, halo_end);
+        profile_elapsed_ms(source_start, source_end);
   }
-
-#ifdef __GLST_DEBUG__
-  this->validate_atom_scatter();
-#endif
 
   return;
 }
