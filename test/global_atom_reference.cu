@@ -15,6 +15,7 @@
 #include <glst_plan.hcu>
 #include <glst_workspace.hcu>
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <cstddef>
@@ -189,61 +190,105 @@ std::vector<position> make_test_positions(void) {
   return positions;
 }
 
-reference_snapshot make_host_snapshot(const glst_force &force) {
-  const glst_plan &plan = glst_force_test_access::plan(force);
-  const glst_workspace &workspace = glst_force_test_access::workspace(force);
+reference_snapshot make_host_snapshot(const glst_plan &plan,
+                                      const std::vector<position> &positions,
+                                      const std::vector<double> &charge) {
+  struct keyed_packet {
+    atom_sort_key key;
+    atom_packet packet;
+  };
 
-  const std::size_t natom = static_cast<std::size_t>(plan.natom());
+  const std::size_t natom = positions.size();
   const std::size_t ncell = static_cast<std::size_t>(plan.ncell());
   const std::size_t ncell_x = static_cast<std::size_t>(plan.ncell_x());
   const unsigned int yz_cell_count = plan.ncell_y() * plan.ncell_z();
 
-  require(workspace.owned_atom_count(0) == natom,
-          "Host reference does not own every atom");
+  require(charge.size() == natom,
+          "Host-reference position and charge counts differ");
 
-  require(workspace.source_atom_count(0) == natom,
-          "Host reference unexpectedly contains halo atoms");
+  require(natom == static_cast<std::size_t>(plan.natom()),
+          "Host-reference atom count does not match plan");
 
-  const std::vector<atom_packet> &host_packets =
-      workspace.sorted_packets()[0].h_array();
-
-  const std::vector<unsigned int> &host_cell_count =
-      workspace.cell_atom_count()[0].h_array();
-
-  const std::vector<unsigned int> &host_cell_point =
-      workspace.cell_atom_point()[0].h_array();
-
-  require(host_packets.size() >= natom,
-          "Host packet storage is smaller than natom");
-
-  require(host_cell_count.size() == ncell,
-          "Host cell-count size does not match ncell");
-
-  require(host_cell_point.size() == ncell,
-          "Host cell-point size does not match ncell");
+  require(natom <= static_cast<std::size_t>(
+                       std::numeric_limits<unsigned int>::max()),
+          "Host-reference atom count exceeds unsigned int range");
 
   reference_snapshot snapshot;
 
   snapshot.key.resize(natom);
   snapshot.packet.resize(natom);
-  snapshot.cell_count.resize(ncell);
-  snapshot.cell_point.resize(ncell + 1u);
-  snapshot.x_plane_point.resize(ncell_x + 1u);
+  snapshot.cell_count.assign(ncell, 0u);
+  snapshot.cell_point.assign(ncell + 1u, 0u);
+  snapshot.x_plane_point.assign(ncell_x + 1u, 0u);
 
-  for (std::size_t atom = 0; atom < natom; atom++) {
-    snapshot.packet[atom] = host_packets[atom];
-    snapshot.key[atom] =
-        encode_key(host_packets[atom].cell, host_packets[atom].i);
+  std::vector<keyed_packet> sorted;
+  sorted.reserve(natom);
+
+  for (std::size_t atom = 0u; atom < natom; atom++) {
+    int cx = static_cast<int>(positions[atom].x / plan.cell_dim_x());
+    int cy = static_cast<int>(positions[atom].y / plan.cell_dim_y());
+    int cz = static_cast<int>(positions[atom].z / plan.cell_dim_z());
+
+    cx = (cx >= static_cast<int>(plan.ncell_x()))
+             ? static_cast<int>(plan.ncell_x() - 1u)
+             : cx;
+
+    cy = (cy >= static_cast<int>(plan.ncell_y()))
+             ? static_cast<int>(plan.ncell_y() - 1u)
+             : cy;
+
+    cz = (cz >= static_cast<int>(plan.ncell_z()))
+             ? static_cast<int>(plan.ncell_z() - 1u)
+             : cz;
+
+    cx = (cx < 0) ? 0 : cx;
+    cy = (cy < 0) ? 0 : cy;
+    cz = (cz < 0) ? 0 : cz;
+
+    const unsigned int global_cell =
+        (static_cast<unsigned int>(cx) * plan.ncell_y() +
+         static_cast<unsigned int>(cy)) *
+            plan.ncell_z() +
+        static_cast<unsigned int>(cz);
+
+    const unsigned int atom_index = static_cast<unsigned int>(atom);
+
+    sorted.push_back(keyed_packet{
+        encode_key(global_cell, atom_index),
+        atom_packet(atom_index, global_cell, positions[atom].x,
+                    positions[atom].y, positions[atom].z, charge[atom])});
+
+    snapshot.cell_count[global_cell]++;
   }
 
-  for (std::size_t cell = 0; cell < ncell; cell++) {
-    snapshot.cell_count[cell] = host_cell_count[cell];
-    snapshot.cell_point[cell] = host_cell_point[cell];
+  std::sort(sorted.begin(), sorted.end(),
+            [](const keyed_packet &lhs, const keyed_packet &rhs) {
+              return lhs.key < rhs.key;
+            });
+
+  for (std::size_t atom = 0u; atom < natom; atom++) {
+    snapshot.key[atom] = sorted[atom].key;
+    snapshot.packet[atom] = sorted[atom].packet;
   }
 
-  snapshot.cell_point[ncell] = plan.natom();
+  unsigned int atom_point = 0u;
 
-  for (std::size_t x = 0; x <= ncell_x; x++) {
+  for (std::size_t cell = 0u; cell < ncell; cell++) {
+    snapshot.cell_point[cell] = atom_point;
+
+    require(snapshot.cell_count[cell] <=
+                std::numeric_limits<unsigned int>::max() - atom_point,
+            "Host-reference cell prefix sum overflows unsigned int");
+
+    atom_point += snapshot.cell_count[cell];
+  }
+
+  snapshot.cell_point[ncell] = atom_point;
+
+  require(atom_point == plan.natom(),
+          "Host-reference cell counts do not sum to natom");
+
+  for (std::size_t x = 0u; x <= ncell_x; x++) {
     const std::size_t first_cell = x * static_cast<std::size_t>(yz_cell_count);
 
     snapshot.x_plane_point[x] = snapshot.cell_point[first_cell];
@@ -581,6 +626,8 @@ int main(void) {
 
     const unsigned int natom = static_cast<unsigned int>(positions.size());
 
+    std::vector<double> charge(natom, 0.0);
+
     cudaCheck(cudaSetDevice(0));
 
     cuda_container<double> rx(natom);
@@ -589,10 +636,12 @@ int main(void) {
     cuda_container<double> qc(natom);
 
     for (unsigned int atom = 0; atom < natom; atom++) {
+      charge[atom] = (atom % 2 == 0) ? 1.0 : -1.0;
+
       rx[atom] = positions[atom].x;
       ry[atom] = positions[atom].y;
       rz[atom] = positions[atom].z;
-      qc[atom] = ((atom % 2u) == 0u) ? 1.0 : -1.0;
+      qc[atom] = charge[atom];
     }
 
     rx.transfer_to_device();
@@ -616,11 +665,10 @@ int main(void) {
     require(plan.ncell_z() == 4u, "Unexpected ncell_z");
     require(plan.ncell() == 36u, "Unexpected total cell count");
 
-    // Run the unchanged production host classification.
-    force.assign_atoms(rx.d_array().data(), ry.d_array().data(),
-                       rz.d_array().data(), qc.d_array().data());
-
-    const reference_snapshot host_reference = make_host_snapshot(force);
+    // Build the old host algorithm as a test-only reference. Production
+    // assignment is not invoked and no production host mirror is required.
+    const reference_snapshot host_reference =
+        make_host_snapshot(plan, positions, charge);
 
     validate_snapshot(host_reference, positions, plan, "host reference");
 

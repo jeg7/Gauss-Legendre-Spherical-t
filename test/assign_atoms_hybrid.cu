@@ -112,6 +112,14 @@ struct position {
   double z;
 };
 
+enum class position_distribution {
+  UNIFORM,
+  SAME_PARTITION_CELL_MOVE,
+  SHIFT_X_RIGHT,
+  SHIFT_X_LEFT,
+  CONCENTRATE_LAST_X
+};
+
 struct gpu_layout {
   unsigned int cell_partition_count;
   unsigned int tile_partition_count;
@@ -240,26 +248,57 @@ std::vector<atom_site> make_atom_sites(void) {
 }
 
 std::vector<position> make_positions(const std::vector<atom_site> &sites,
-                                     const bool pair_atoms_into_odd_z_cells) {
+                                     const position_distribution distribution) {
   std::vector<position> positions;
   positions.reserve(sites.size());
 
-  for (std::size_t atom = 0; atom < sites.size(); atom++) {
+  for (std::size_t atom = 0u; atom < sites.size(); atom++) {
     const atom_site &site = sites[atom];
 
+    unsigned int target_x = site.x;
     unsigned int target_z = site.z;
-    if (pair_atoms_into_odd_z_cells && ((site.z % 2u) == 0u))
-      target_z = site.z + 1u;
+
+    switch (distribution) {
+    case position_distribution::UNIFORM:
+      break;
+
+    case position_distribution::SAME_PARTITION_CELL_MOVE:
+      // Swap z-cell pairs 0<->1 and 2<->3. X ownership never changes.
+      target_z = ((site.z % 2u) == 0u) ? site.z + 1u : site.z - 1u;
+      break;
+
+    case position_distribution::SHIFT_X_RIGHT:
+      // Moving every non-terminal x cell right crosses every internal
+      // x boundary represented by this test.
+      if (site.x + 1u < test_ncell_x)
+        target_x = site.x + 1u;
+      break;
+
+    case position_distribution::SHIFT_X_LEFT:
+      // Reverse-direction coverage for ownership and halo-plane changes.
+      if (site.x > 0u)
+        target_x = site.x - 1u;
+      break;
+
+    case position_distribution::CONCENTRATE_LAST_X:
+      // Force a partition that previously had fewer source atoms to accept a
+      // substantially larger owned/source population.
+      target_x = test_ncell_x - 1u;
+      break;
+    }
+
+    require(target_x < test_ncell_x, "Generated target x-cell is out of range");
 
     require(target_z < test_ncell_z, "Generated target z-cell is out of range");
 
-    // The parity term keeps atoms moved from adjacent z cells at distinct
-    // coordinates. Every local coordinate remains strictly inside its cell.
-    const double offset = 1.0 + 3.0 * static_cast<double>(site.atom_in_cell) +
-                          0.25 * static_cast<double>(site.z % 2u);
+    // Preserve distinct coordinates for atoms moved from different original
+    // x/z cells while keeping every coordinate strictly inside its target cell.
+    const double offset = 1.0 + 2.0 * static_cast<double>(site.atom_in_cell) +
+                          0.0625 * static_cast<double>(site.x) +
+                          0.015625 * static_cast<double>(site.z);
 
     positions.push_back(
-        position{static_cast<double>(site.x) * rcut + offset,
+        position{static_cast<double>(target_x) * rcut + offset,
                  static_cast<double>(site.y) * rcut + offset + 1.0,
                  static_cast<double>(target_z) * rcut + offset + 2.0});
   }
@@ -1119,8 +1158,7 @@ void compare_storage_snapshot(const storage_snapshot &expected,
 void run_layout(const gpu_layout &layout, const int cuda_count,
                 cuda_container<double> &rx, cuda_container<double> &ry,
                 cuda_container<double> &rz, cuda_container<double> &qc,
-                const std::vector<position> &uniform_positions,
-                const std::vector<position> &paired_positions,
+                const std::vector<atom_site> &sites,
                 const std::vector<double> &charge) {
   const unsigned long long int layout_product =
       static_cast<unsigned long long int>(layout.cell_partition_count) *
@@ -1211,32 +1249,133 @@ void run_layout(const gpu_layout &layout, const int cuda_count,
                 std::to_string(layout_slot));
   }
 
-  const std::vector<std::vector<atom_packet>> uniform_cell_packets =
-      make_cell_packets(plan, uniform_positions, charge);
+  const std::vector<position_distribution> distributions{
+      position_distribution::UNIFORM,
+      position_distribution::SAME_PARTITION_CELL_MOVE,
+      position_distribution::SHIFT_X_RIGHT, position_distribution::SHIFT_X_LEFT,
+      position_distribution::CONCENTRATE_LAST_X};
 
-  const std::vector<std::vector<atom_packet>> paired_cell_packets =
-      make_cell_packets(plan, paired_positions, charge);
+  const std::vector<std::string> distribution_names{
+      "uniform", "same_partition_cell_move", "shift_x_right", "shift_x_left",
+      "concentrate_last_x"};
 
-  const std::vector<partition_reference> uniform_reference =
-      make_partition_reference(plan, uniform_cell_packets);
+  require(distributions.size() == distribution_names.size(),
+          layout_label + ": distribution metadata sizes differ");
 
-  const std::vector<partition_reference> paired_reference =
-      make_partition_reference(plan, paired_cell_packets);
+  std::vector<std::vector<position>> position_cases;
+  std::vector<std::vector<partition_reference>> reference_cases;
+
+  position_cases.reserve(distributions.size());
+  reference_cases.reserve(distributions.size());
+
+  for (std::size_t case_index = 0u; case_index < distributions.size();
+       case_index++) {
+    position_cases.push_back(make_positions(sites, distributions[case_index]));
+
+    require(position_cases.back().size() ==
+                static_cast<std::size_t>(test_natom),
+            layout_label + ": generated input atom count is incorrect");
+
+    const std::vector<std::vector<atom_packet>> cell_packets =
+        make_cell_packets(plan, position_cases.back(), charge);
+
+    reference_cases.push_back(make_partition_reference(plan, cell_packets));
+  }
+
+  constexpr std::size_t uniform_case = 0u;
+  constexpr std::size_t same_partition_case = 1u;
+  constexpr std::size_t shift_right_case = 2u;
+  constexpr std::size_t concentrated_case = 4u;
+
+  std::size_t same_partition_cell_moves = 0u;
+  std::size_t cross_partition_moves = 0u;
+  std::size_t halo_plane_transitions = 0u;
+
+  for (std::size_t atom = 0u; atom < static_cast<std::size_t>(test_natom);
+       atom++) {
+    const unsigned int original_cell =
+        global_cell_for_position(plan, position_cases[uniform_case][atom]);
+
+    const unsigned int same_partition_cell = global_cell_for_position(
+        plan, position_cases[same_partition_case][atom]);
+
+    if ((same_partition_cell != original_cell) &&
+        (plan.cell_partition_idx(same_partition_cell) ==
+         plan.cell_partition_idx(original_cell))) {
+      same_partition_cell_moves++;
+    }
+
+    const unsigned int shifted_cell =
+        global_cell_for_position(plan, position_cases[shift_right_case][atom]);
+
+    const unsigned int original_partition =
+        plan.cell_partition_idx(original_cell);
+
+    const unsigned int shifted_partition =
+        plan.cell_partition_idx(shifted_cell);
+
+    if (shifted_partition != original_partition) {
+      cross_partition_moves++;
+
+      const std::vector<unsigned int> &shifted_partition_halo =
+          plan.partition_halo_cell_idx(shifted_partition);
+
+      if (std::find(shifted_partition_halo.begin(),
+                    shifted_partition_halo.end(),
+                    original_cell) != shifted_partition_halo.end()) {
+        halo_plane_transitions++;
+      }
+    }
+  }
+
+  require(same_partition_cell_moves > 0u,
+          layout_label +
+              ": test does not move atoms between cells in one partition");
+
+  if (layout.cell_partition_count > 1u) {
+    require(cross_partition_moves > 0u,
+            layout_label + ": test does not move atoms across cell partitions");
+
+    require(halo_plane_transitions > 0u,
+            layout_label +
+                ": test does not move atoms into or out of halo planes");
+
+    const unsigned int last_x_global_cell =
+        ((plan.ncell_x() - 1u) * plan.ncell_y()) * plan.ncell_z();
+
+    const unsigned int target_partition =
+        plan.cell_partition_idx(last_x_global_cell);
+
+    require(
+        reference_cases[concentrated_case][target_partition].source_atom_count >
+            reference_cases[uniform_case][target_partition].source_atom_count,
+        layout_label +
+            ": concentrated distribution does not grow the target partition's "
+            "source population");
+  }
 
   storage_snapshot stable_storage;
   bool stable_storage_initialized = false;
 
-  for (unsigned int repeat = 0u; repeat < repeat_count; repeat++) {
-    const bool use_paired_positions = ((repeat % 2u) != 0u);
+  // The first complete pass establishes the maximum capacity needed by every
+  // distribution. All later passes must reuse the same device and CUB storage.
+  const std::size_t establishment_assignment_count = position_cases.size();
 
-    const std::vector<position> &positions =
-        use_paired_positions ? paired_positions : uniform_positions;
+  const std::size_t total_assignment_count =
+      establishment_assignment_count +
+      static_cast<std::size_t>(repeat_count) * position_cases.size();
+
+  for (std::size_t assignment = 0u; assignment < total_assignment_count;
+       assignment++) {
+    const std::size_t case_index = assignment % position_cases.size();
+    const std::size_t pass_index = assignment / position_cases.size();
+
+    const std::vector<position> &positions = position_cases[case_index];
 
     const std::vector<partition_reference> &reference =
-        use_paired_positions ? paired_reference : uniform_reference;
+        reference_cases[case_index];
 
-    const std::string distribution_name =
-        use_paired_positions ? "paired" : "uniform";
+    const std::string &distribution_name = distribution_names[case_index];
 
     upload_input(rx, ry, rz, qc, positions, charge);
 
@@ -1261,7 +1400,8 @@ void run_layout(const gpu_layout &layout, const int cuda_count,
               layout_label + ": observed partition has no host reference");
 
       const std::string label =
-          layout_label + ", repeat=" + std::to_string(repeat) +
+          layout_label + ", assignment=" + std::to_string(assignment) +
+          ", pass=" + std::to_string(pass_index) +
           ", distribution=" + distribution_name +
           ", device=" + std::to_string(dev) +
           ", cell_partition=" + std::to_string(cell_partition) +
@@ -1271,36 +1411,39 @@ void run_layout(const gpu_layout &layout, const int cuda_count,
                                  label);
     }
 
-    const std::string repeat_label = layout_label +
-                                     ", repeat=" + std::to_string(repeat) +
-                                     ", distribution=" + distribution_name;
+    const std::string assignment_label =
+        layout_label + ", assignment=" + std::to_string(assignment) +
+        ", pass=" + std::to_string(pass_index) +
+        ", distribution=" + distribution_name;
 
-    validate_owner_coverage(observed, plan, test_natom, repeat_label);
+    validate_owner_coverage(observed, plan, test_natom, assignment_label);
 
     for (unsigned int cell_partition = 0u;
          cell_partition < layout.cell_partition_count; cell_partition++) {
       compare_tile_rank_snapshots(
           observed, cell_partition, layout.tile_partition_count,
-          repeat_label + ", cell_partition=" + std::to_string(cell_partition));
+          assignment_label +
+              ", cell_partition=" + std::to_string(cell_partition));
     }
 
     const storage_snapshot current_storage =
         take_storage_snapshot(workspace, cuda_count);
 
-    if (!stable_storage_initialized) {
+    if (assignment + 1u == establishment_assignment_count) {
       stable_storage = current_storage;
       stable_storage_initialized = true;
-    } else {
-      compare_storage_snapshot(stable_storage, current_storage, repeat_label);
+    } else if (assignment >= establishment_assignment_count) {
+      compare_storage_snapshot(stable_storage, current_storage,
+                               assignment_label);
     }
   }
 
   require(stable_storage_initialized,
-          layout_label + ": no storage snapshot was recorded");
+          layout_label + ": no stable storage snapshot was recorded");
 
   std::cout << "assign_atoms_hybrid: PASSED " << layout_label << ", "
-            << repeat_count << " alternating deterministic assignments"
-            << std::endl;
+            << position_cases.size() << " moving distributions, "
+            << repeat_count << " stable deterministic passes" << std::endl;
 
   return;
 }
@@ -1323,16 +1466,8 @@ int main(void) {
 
     const std::vector<double> charge = make_charges(sites.size());
 
-    const std::vector<position> uniform_positions =
-        make_positions(sites, false);
-
-    const std::vector<position> paired_positions = make_positions(sites, true);
-
-    require(uniform_positions.size() == static_cast<std::size_t>(test_natom),
-            "Uniform input atom count is incorrect");
-
-    require(paired_positions.size() == static_cast<std::size_t>(test_natom),
-            "Paired input atom count is incorrect");
+    require(sites.size() == static_cast<std::size_t>(test_natom),
+            "Generated atom-site count is incorrect");
 
     cudaCheck(cudaSetDevice(0));
 
@@ -1359,8 +1494,8 @@ int main(void) {
 
     for (std::size_t layout_index = 0u; layout_index < layouts.size();
          layout_index++) {
-      run_layout(layouts[layout_index], cuda_count, rx, ry, rz, qc,
-                 uniform_positions, paired_positions, charge);
+      run_layout(layouts[layout_index], cuda_count, rx, ry, rz, qc, sites,
+                 charge);
     }
 
     std::cout << "assign_atoms_hybrid: PASSED " << layouts.size()

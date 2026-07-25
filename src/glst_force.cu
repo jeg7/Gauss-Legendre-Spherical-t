@@ -23,6 +23,7 @@
 #include <array>
 #include <chrono>
 #include <cstddef>
+#include <cstring>
 #include <iostream>
 #include <limits>
 #include <string>
@@ -2357,15 +2358,87 @@ void glst_force::validate_atom_scatter(void) const {
   constexpr std::string_view function_name =
       "glst_force::validate_atom_scatter";
 
-  const unsigned int natom = this->plan_->natom();
+  struct atom_scatter_snapshot {
+    unsigned int cell_partition = 0u;
+    std::size_t owned_atom_count = 0u;
+    std::size_t source_atom_count = 0u;
+    unsigned int max_atoms_cell = 0u;
 
-  std::vector<unsigned int> replica_count(natom, 0);
+    std::vector<atom_packet> packet;
+    std::vector<unsigned int> source_cell_atom_count;
+    std::vector<unsigned int> source_cell_atom_point;
+  };
+
+  utl::require(this->plan_ != nullptr, function_name,
+               "Plan is not initialized");
+
+  utl::require(this->workspace_ != nullptr, function_name,
+               "Workspace is not initialized");
+
+  const unsigned int natom = this->plan_->natom();
+  const std::size_t device_count = static_cast<std::size_t>(this->cuda_count_);
+
+  utl::require(this->dev_cell_partition_.size() == device_count, function_name,
+               "Device cell-partition metadata size is incorrect");
+
+  utl::require(this->dev_tile_partition_.size() == device_count, function_name,
+               "Device tile-partition metadata size is incorrect");
+
+  // Production assignment is stream/event ordered. Debug validation introduces
+  // one synchronization only after the complete assignment pipeline.
+  this->synchronize_compute_streams();
+
+  std::vector<atom_scatter_snapshot> snapshots(device_count);
+  std::vector<unsigned int> replica_count(natom, 0u);
 
   for (int dev = 0; dev < this->cuda_count_; dev++) {
-    const unsigned int expected_cell_partition = this->dev_cell_partition_[dev];
+    const unsigned int cell_partition = this->dev_cell_partition_[dev];
 
-    const std::vector<atom_packet> &packets =
-        this->workspace_->sorted_packets()[dev].h_array();
+    utl::require(cell_partition < this->cell_partition_count_, function_name,
+                 "Device cell partition is out of range");
+
+    const std::vector<unsigned int> &owned_cells =
+        this->plan_->partition_cell_idx(cell_partition);
+
+    const std::vector<unsigned int> &left_cells =
+        this->plan_->partition_left_halo_cell_idx(cell_partition);
+
+    const std::vector<unsigned int> &right_cells =
+        this->plan_->partition_right_halo_cell_idx(cell_partition);
+
+    const std::vector<unsigned int> &source_cells =
+        this->plan_->partition_sr_source_cell_idx(cell_partition);
+
+    const std::size_t expected_source_cell_count =
+        owned_cells.size() + left_cells.size() + right_cells.size();
+
+    utl::require(source_cells.size() == expected_source_cell_count,
+                 function_name,
+                 "Source-cell list size does not equal owned plus halo cells");
+
+    std::size_t source_cell_offset = 0u;
+
+    for (std::size_t i = 0u; i < owned_cells.size(); i++) {
+      utl::require(source_cells[source_cell_offset + i] == owned_cells[i],
+                   function_name,
+                   "Source-cell list does not begin with owned cells");
+    }
+
+    source_cell_offset += owned_cells.size();
+
+    for (std::size_t i = 0u; i < left_cells.size(); i++) {
+      utl::require(
+          source_cells[source_cell_offset + i] == left_cells[i], function_name,
+          "Source-cell list does not place left halo after owned cells");
+    }
+
+    source_cell_offset += left_cells.size();
+
+    for (std::size_t i = 0u; i < right_cells.size(); i++) {
+      utl::require(source_cells[source_cell_offset + i] == right_cells[i],
+                   function_name,
+                   "Source-cell list does not place right halo last");
+    }
 
     const std::size_t owned_atom_count =
         this->workspace_->owned_atom_count(dev);
@@ -2379,157 +2452,202 @@ void glst_force::validate_atom_scatter(void) const {
                  "Owned atom count exceeds source atom count");
 
     utl::require(source_atom_count <= atom_capacity, function_name,
-                 "Source atom count exceeds atom_capacity");
+                 "Source atom count exceeds atom capacity");
 
-    utl::require(packets.size() == atom_capacity, function_name,
-                 "Packet storage size does not match atom capacity");
+    utl::require(source_cells.size() ==
+                     this->workspace_->sr_source_cell_atom_count()[dev].size(),
+                 function_name, "Source-cell count storage size is incorrect");
 
-    for (std::size_t i = 0; i < source_atom_count; i++) {
-      const atom_packet &packet = packets[i];
+    utl::require(source_cells.size() ==
+                     this->workspace_->sr_source_cell_atom_point()[dev].size(),
+                 function_name, "Source-cell point storage size is incorrect");
 
-      utl::require(packet.i < natom, function_name,
-                   "Original atom index is out of range");
+    atom_scatter_snapshot &snapshot = snapshots[static_cast<std::size_t>(dev)];
 
-      utl::require(packet.cell < this->plan_->ncell(), function_name,
-                   "Global cell index is out of range");
+    snapshot.cell_partition = cell_partition;
+    snapshot.owned_atom_count = owned_atom_count;
+    snapshot.source_atom_count = source_atom_count;
+    snapshot.max_atoms_cell = this->workspace_->max_atoms_cell()[dev];
 
-      const unsigned int observed_cell_partition =
-          this->plan_->cell_partition_idx(packet.cell);
+    snapshot.packet.resize(source_atom_count);
+    snapshot.source_cell_atom_count.resize(source_cells.size());
+    snapshot.source_cell_atom_point.resize(source_cells.size());
 
-      if (i < owned_atom_count) {
-        utl::require(observed_cell_partition == expected_cell_partition,
-                     function_name,
-                     "Owned atom is stored on the wrong cell partition");
+    cudaCheck(cudaSetDevice(dev));
 
-        replica_count[packet.i]++;
-      } else {
-        utl::require(observed_cell_partition != expected_cell_partition,
-                     function_name,
-                     "Halo atom is owned by the target partition");
-      }
+    // These copies exist only in a __GLST_DEBUG__ caller. Release assignment
+    // performs no atom-sized D2H transfer.
+    if (source_atom_count > 0u) {
+      cudaCheck(cudaMemcpy(
+          static_cast<void *>(snapshot.packet.data()),
+          static_cast<const void *>(
+              this->workspace_->sorted_packets()[dev].d_array().data()),
+          source_atom_count * sizeof(atom_packet), cudaMemcpyDeviceToHost));
     }
 
-    const std::vector<unsigned int> &source_cells =
-        this->plan_->partition_sr_source_cell_idx(expected_cell_partition);
+    if (!source_cells.empty()) {
+      const std::size_t metadata_bytes =
+          source_cells.size() * sizeof(unsigned int);
 
-    const std::size_t owned_cell_count = static_cast<std::size_t>(
-        this->plan_->local_cell_count(expected_cell_partition));
+      cudaCheck(cudaMemcpy(
+          static_cast<void *>(snapshot.source_cell_atom_count.data()),
+          static_cast<const void *>(
+              this->workspace_->sr_source_cell_atom_count()[dev]
+                  .d_array()
+                  .data()),
+          metadata_bytes, cudaMemcpyDeviceToHost));
 
-    std::size_t observed_source_atom_count = 0;
-    std::size_t observed_owned_atom_count = 0;
+      cudaCheck(cudaMemcpy(
+          static_cast<void *>(snapshot.source_cell_atom_point.data()),
+          static_cast<const void *>(
+              this->workspace_->sr_source_cell_atom_point()[dev]
+                  .d_array()
+                  .data()),
+          metadata_bytes, cudaMemcpyDeviceToHost));
+    }
 
-    utl::require(
-        (source_cells.size() ==
-         this->workspace_->sr_source_cell_atom_count()[dev].h_array().size()) &&
-            (source_cells.size() ==
-             this->workspace_->sr_source_cell_atom_point()[dev]
-                 .h_array()
-                 .size()),
-        function_name, "Source cell metadata size mismatch");
+    std::size_t expected_atom_point = 0u;
+    std::size_t observed_owned_atom_count = 0u;
 
-    for (std::size_t source_local_cell = 0;
+    for (std::size_t source_local_cell = 0u;
          source_local_cell < source_cells.size(); source_local_cell++) {
       const unsigned int expected_cell = source_cells[source_local_cell];
 
-      const unsigned int point =
-          this->workspace_->sr_source_cell_atom_point()[dev][source_local_cell];
+      const std::size_t point = static_cast<std::size_t>(
+          snapshot.source_cell_atom_point[source_local_cell]);
 
-      const unsigned int count =
-          this->workspace_->sr_source_cell_atom_count()[dev][source_local_cell];
+      const std::size_t count = static_cast<std::size_t>(
+          snapshot.source_cell_atom_count[source_local_cell]);
 
-      observed_source_atom_count += static_cast<std::size_t>(count);
+      utl::require(point == expected_atom_point, function_name,
+                   "Source-cell atom points are not a contiguous prefix sum");
 
-      if (source_local_cell < owned_cell_count)
-        observed_owned_atom_count += static_cast<std::size_t>(count);
+      utl::require(point <= source_atom_count, function_name,
+                   "Source-cell atom point exceeds source atom count");
 
-      utl::require(static_cast<std::size_t>(point) +
-                           static_cast<std::size_t>(count) <=
-                       source_atom_count,
-                   function_name, "Source cell atom range is out of bounds");
+      utl::require(count <= source_atom_count - point, function_name,
+                   "Source-cell atom range exceeds source atom count");
 
-      unsigned int last_atom = 0;
+      const bool is_owned_cell = source_local_cell < owned_cells.size();
 
-      for (unsigned int j = 0; j < count; j++) {
-        const atom_packet &packet = packets[point + j];
+      if (is_owned_cell)
+        observed_owned_atom_count += count;
 
-        utl::require(
-            packet.cell == expected_cell, function_name,
-            "Source cell range contains an atom from the wrong global cell");
+      unsigned int previous_atom = 0u;
 
-        if (j > 0) {
-          utl::require(packet.i > last_atom, function_name,
-                       "Source cell atom order is not deterministic");
+      for (std::size_t i = 0u; i < count; i++) {
+        const atom_packet &packet = snapshot.packet[point + i];
+
+        utl::require(packet.i < natom, function_name,
+                     "Original atom index is out of range");
+
+        utl::require(packet.cell == expected_cell, function_name,
+                     "Source-cell range contains an atom from another cell");
+
+        const unsigned int packet_cell_partition =
+            this->plan_->cell_partition_idx(packet.cell);
+
+        if (is_owned_cell) {
+          utl::require(packet_cell_partition == cell_partition, function_name,
+                       "Owned atom is stored on the wrong cell partition");
+
+          replica_count[packet.i]++;
+        } else {
+          utl::require(packet_cell_partition != cell_partition, function_name,
+                       "Halo atom is owned by the target cell partition");
         }
 
-        last_atom = packet.i;
+        if (i > 0u) {
+          utl::require(packet.i > previous_atom, function_name,
+                       "Atoms within a cell are not ordered by original index");
+        }
+
+        previous_atom = packet.i;
       }
+
+      expected_atom_point += count;
     }
 
-    utl::require(observed_source_atom_count == source_atom_count, function_name,
-                 "Source cell counts do not sum to source atoms");
+    utl::require(expected_atom_point == source_atom_count, function_name,
+                 "Source-cell counts do not sum to source atom count");
 
     utl::require(observed_owned_atom_count == owned_atom_count, function_name,
-                 "Owned source cell counts do not sum to owned atoms");
+                 "Owned-cell counts do not sum to owned atom count");
   }
 
-  for (unsigned int atom = 0; atom < natom; atom++) {
+  for (unsigned int atom = 0u; atom < natom; atom++) {
     utl::require(replica_count[atom] == this->tile_partition_count_,
-                 function_name, "Atom replica count does not equal G_tile");
+                 function_name,
+                 "Owned atom replica count does not equal G_tile");
   }
 
-  for (unsigned int cell_partition = 0;
-       cell_partition < this->cell_partition_count_; cell_partition++) {
-    int first_dev = -1;
+  std::vector<int> first_dev_by_partition(this->cell_partition_count_, -1);
 
-    for (int dev = 0; dev < this->cuda_count_; dev++) {
-      if (this->dev_cell_partition_[dev] != cell_partition)
-        continue;
+  for (int dev = 0; dev < this->cuda_count_; dev++) {
+    const unsigned int cell_partition = this->dev_cell_partition_[dev];
 
-      if (first_dev < 0) {
-        first_dev = dev;
-        continue;
-      }
+    int &first_dev = first_dev_by_partition[cell_partition];
 
-      const std::size_t lhs_owned_atom_count =
-          this->workspace_->owned_atom_count(first_dev);
-
-      const std::size_t rhs_owned_atom_count =
-          this->workspace_->owned_atom_count(dev);
-
-      utl::require(
-          lhs_owned_atom_count == rhs_owned_atom_count, function_name,
-          "Tile ranks in a cell partition have different owned atom counts");
-
-      const std::size_t lhs_source_atom_count =
-          this->workspace_->source_atom_count(first_dev);
-
-      const std::size_t rhs_source_atom_count =
-          this->workspace_->source_atom_count(dev);
-
-      utl::require(
-          lhs_source_atom_count == rhs_source_atom_count, function_name,
-          "Tile ranks in a cell partition have different source atom counts");
-
-      const std::vector<atom_packet> &lhs =
-          this->workspace_->sorted_packets()[first_dev].h_array();
-
-      const std::vector<atom_packet> &rhs =
-          this->workspace_->sorted_packets()[dev].h_array();
-
-      utl::require((lhs_source_atom_count <= lhs.size()) &&
-                       (rhs_source_atom_count <= rhs.size()),
-                   function_name,
-                   "Tile-rank source atom count exceeds packet storage");
-
-      for (std::size_t i = 0; i < lhs_source_atom_count; i++) {
-        utl::require(
-            (lhs[i].i == rhs[i].i) && (lhs[i].cell == rhs[i].cell) &&
-                (lhs[i].x == rhs[i].x) && (lhs[i].y == rhs[i].y) &&
-                (lhs[i].z == rhs[i].z) && (lhs[i].q == rhs[i].q),
-            function_name,
-            "Tile ranks in a cell partition have different atom ordering");
-      }
+    if (first_dev < 0) {
+      first_dev = dev;
+      continue;
     }
+
+    const atom_scatter_snapshot &lhs =
+        snapshots[static_cast<std::size_t>(first_dev)];
+
+    const atom_scatter_snapshot &rhs = snapshots[static_cast<std::size_t>(dev)];
+
+    utl::require(lhs.owned_atom_count == rhs.owned_atom_count, function_name,
+                 "Tile ranks have different owned atom counts");
+
+    utl::require(lhs.source_atom_count == rhs.source_atom_count, function_name,
+                 "Tile ranks have different source atom counts");
+
+    utl::require(lhs.max_atoms_cell == rhs.max_atoms_cell, function_name,
+                 "Tile ranks have different maximum cell populations");
+
+    utl::require(lhs.packet.size() == rhs.packet.size(), function_name,
+                 "Tile ranks have different packet-vector sizes");
+
+    utl::require(lhs.source_cell_atom_count.size() ==
+                     rhs.source_cell_atom_count.size(),
+                 function_name,
+                 "Tile ranks have different source-cell count-vector sizes");
+
+    utl::require(lhs.source_cell_atom_point.size() ==
+                     rhs.source_cell_atom_point.size(),
+                 function_name,
+                 "Tile ranks have different source-cell point-vector sizes");
+
+    utl::require(lhs.packet.empty() ||
+                     std::memcmp(static_cast<const void *>(lhs.packet.data()),
+                                 static_cast<const void *>(rhs.packet.data()),
+                                 lhs.packet.size() * sizeof(atom_packet)) == 0,
+                 function_name,
+                 "Tile ranks do not contain byte-identical packet ordering");
+
+    utl::require(
+        lhs.source_cell_atom_count.empty() ||
+            std::memcmp(
+                static_cast<const void *>(lhs.source_cell_atom_count.data()),
+                static_cast<const void *>(rhs.source_cell_atom_count.data()),
+                lhs.source_cell_atom_count.size() * sizeof(unsigned int)) == 0,
+        function_name, "Tile ranks have different source-cell atom counts");
+
+    utl::require(
+        lhs.source_cell_atom_point.empty() ||
+            std::memcmp(
+                static_cast<const void *>(lhs.source_cell_atom_point.data()),
+                static_cast<const void *>(rhs.source_cell_atom_point.data()),
+                lhs.source_cell_atom_point.size() * sizeof(unsigned int)) == 0,
+        function_name, "Tile ranks have different source-cell atom points");
+  }
+
+  for (unsigned int cell_partition = 0u;
+       cell_partition < this->cell_partition_count_; cell_partition++) {
+    utl::require(first_dev_by_partition[cell_partition] >= 0, function_name,
+                 "Cell partition has no device");
   }
 
   return;
@@ -2705,6 +2823,10 @@ void glst_force::assign_atoms_multi_gpu(const double *d_rx, const double *d_ry,
     this->profile_.owned_halo_source_scatter_ms =
         profile_elapsed_ms(source_start, source_end);
   }
+
+#ifdef __GLST_DEBUG__
+  this->validate_atom_scatter();
+#endif
 
   return;
 }
