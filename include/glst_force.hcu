@@ -164,6 +164,13 @@ private:
   void destroy_nccl_topology(void);
   void print_nccl_topology(std::ostream &os) const;
 
+  static void select_automatic_gpu_layout(
+      unsigned int &cell_partition_count, unsigned int &tile_partition_count,
+      std::size_t &estimated_peak_bytes, std::string &reason,
+      const glst_plan &plan, const int device_count,
+      const GLST_SF_EXCHANGE_MODE sf_exchange_mode,
+      const std::vector<std::size_t> &free_memory_bytes);
+
   void init_gpu_layout(const int device_count);
   void cells2dev(void);
 
@@ -211,6 +218,11 @@ private:
 
   bool profiling_enabled_;
   glst_profile profile_;
+
+  std::size_t gpu_layout_min_free_bytes_;
+  std::size_t gpu_layout_memory_budget_bytes_;
+  std::size_t gpu_layout_estimated_peak_bytes_;
+  std::string gpu_layout_reason_;
 
   bool gpu_layout_user_set_;
   bool cuda_initialized_;

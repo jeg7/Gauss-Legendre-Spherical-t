@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstring>
 #include <iostream>
@@ -32,6 +33,8 @@
 // Make the raw-byte NCCL tranfer an explicit compile-time requirement.
 static_assert(std::is_trivially_copyable<atom_packet>::value,
               "atom_packet must remain trivially copyable");
+
+static constexpr double gpu_layout_memory_budget_fraction = 0.80;
 
 static double
 profile_elapsed_ms(const std::chrono::steady_clock::time_point &start,
@@ -48,7 +51,9 @@ glst_force::glst_force(void)
       cuda_count_(-1), dev_cell_idx_(), comp_streams_(), comm_streams_(),
       comp_events_(), comm_events_(), nccl_devs_(), nccl_comms_(),
       cell_comm_devs_(), tile_comm_devs_(), cell_comms_(), tile_comms_(),
-      profiling_enabled_(false), profile_(), gpu_layout_user_set_(false),
+      profiling_enabled_(false), profile_(), gpu_layout_min_free_bytes_(0),
+      gpu_layout_memory_budget_bytes_(0), gpu_layout_estimated_peak_bytes_(0),
+      gpu_layout_reason_(""), gpu_layout_user_set_(false),
       cuda_initialized_(false) {}
 
 glst_force::glst_force(const unsigned int natom, const double tol,
@@ -340,14 +345,32 @@ void glst_force::init(const unsigned int natom, const double tol,
                       const double box_dim_z, const double rcut) {
   constexpr std::string_view function_name = "glst_force::init";
 
-  this->init_cuda_resources();
+  // Manual layouts can still be validated before the more expensive plan
+  // construction. Automatic layout selection requires the completed global
+  // cell, cubature, and tile metadata.
+  if (this->gpu_layout_user_set_)
+    this->init_cuda_resources();
 
   this->plan_ = std::make_unique<glst_plan>();
   this->plan_->init_cells(natom, box_dim_x, box_dim_y, box_dim_z, rcut);
-  this->plan_->init_cell_partitions(this->cell_partition_count_);
+
+  // init_alpha_groups() constructs distributed-prefix metadata, so it requires
+  // a valid cell partition first. Automatic selection begins with one temporary
+  // partition and replaces it after the layout has been selected.
+  const unsigned int initial_cell_partition_count =
+      (this->gpu_layout_user_set_) ? this->cell_partition_count_ : 1;
+
+  this->plan_->init_cell_partitions(initial_cell_partition_count);
   this->plan_->init_alpha_groups(tol);
   this->plan_->init_cubature(tol);
   this->plan_->init_tile_schedule(2048);
+
+  if (!this->gpu_layout_user_set_)
+    this->init_cuda_resources();
+
+  if (this->plan_->cell_partition_count() != this->cell_partition_count_)
+    this->plan_->init_cell_partitions(this->cell_partition_count_);
+
   this->plan_->init_tile_partitions(this->tile_partition_count_);
 
   unsigned int max_partition_x_count = 0;
@@ -459,6 +482,35 @@ void glst_force::init(const unsigned int natom, const double tol,
     break;
   }
   std::cout << "           Number of GPUs: " << this->cuda_count_ << std::endl;
+  std::cout << "       GPU layout policy: "
+            << (this->gpu_layout_user_set_ ? "MANUAL" : "AUTOMATIC")
+            << std::endl;
+
+  if (!this->gpu_layout_user_set_) {
+    const double min_free_mib =
+        static_cast<double>(this->gpu_layout_min_free_bytes_) /
+        (1024.0 * 1024.0);
+
+    const double budget_mib =
+        static_cast<double>(this->gpu_layout_memory_budget_bytes_) /
+        (1024.0 * 1024.0);
+
+    const double estimated_mib =
+        static_cast<double>(this->gpu_layout_estimated_peak_bytes_) /
+        (1024.0 * 1024.0);
+
+    std::cout << "        Minimum free GPU memory: " << min_free_mib << " MiB"
+              << std::endl;
+
+    std::cout << "           Layout memory budget: " << budget_mib << " MiB"
+              << std::endl;
+
+    std::cout << "    Estimated added GLST memory: " << estimated_mib << " MiB"
+              << std::endl;
+  }
+
+  std::cout << "    GPU layout rationale: " << this->gpu_layout_reason_
+            << std::endl;
   std::cout << "          Execution mode: " << mode_name << std::endl;
   std::cout << "         Cell partitions: " << this->cell_partition_count_
             << std::endl;
@@ -5406,23 +5458,447 @@ void glst_force::print_nccl_topology(std::ostream &os) const {
   return;
 }
 
+void glst_force::select_automatic_gpu_layout(
+    unsigned int &cell_partition_count, unsigned int &tile_partition_count,
+    std::size_t &estimated_peak_bytes, std::string &reason,
+    const glst_plan &plan, const int device_count,
+    const GLST_SF_EXCHANGE_MODE sf_exchange_mode,
+    const std::vector<std::size_t> &free_memory_bytes) {
+  constexpr std::string_view function_name =
+      "glst_force::select_automatic_gpu_layout";
+
+  // Atom positions are normally close to uniformly distributed for the target
+  // molecular systems, but halos and local density fluctuations require
+  // additional capacity beyond the uniform-density estimate.
+  constexpr double source_atom_headroom = 1.25;
+
+  // Above this atom count per cell partition, prefer another spatial partition
+  // even when the allocation would technically fit.
+  constexpr std::size_t target_atoms_per_cell_partition = 4 * 1024 * 1024;
+
+  // Avoid creating tile ranks with too little work when a more spatial layout
+  // can use the same devices.
+  constexpr unsigned int minimum_tiles_per_tile_partition = 2;
+
+  utl::require(device_count >= 1, function_name,
+               "device_count must be positive");
+
+  utl::require(free_memory_bytes.size() ==
+                   static_cast<std::size_t>(device_count),
+               function_name, "free-memory count does not match device_count");
+
+  utl::require(plan.natom() > 0, function_name, "natom is 0");
+
+  utl::require((plan.ncell_x() > 0) && (plan.ncell_y() > 0) &&
+                   (plan.ncell_z() > 0),
+               function_name, "cell dimensions are invalid");
+
+  utl::require(plan.max_tile_nodes() > 0, function_name, "max_tile_nodes is 0");
+
+  utl::require(plan.tile_count() > 0, function_name, "tile_count is 0");
+
+  struct layout_candidate {
+    unsigned int cell_partitions = 1;
+    unsigned int tile_partitions = 1;
+    std::size_t estimated_peak_bytes = 0;
+    bool fits_memory_budget = false;
+  };
+
+  const std::size_t natom = static_cast<std::size_t>(plan.natom());
+  const std::size_t ncell_x = static_cast<std::size_t>(plan.ncell_x());
+  const std::size_t ncell_y = static_cast<std::size_t>(plan.ncell_y());
+  const std::size_t ncell_z = static_cast<std::size_t>(plan.ncell_z());
+
+  const std::size_t yz_cell_count = ncell_y * ncell_z;
+  const std::size_t ncell = ncell_x * yz_cell_count;
+
+  const std::size_t max_tile_nodes =
+      static_cast<std::size_t>(plan.max_tile_nodes());
+
+  std::vector<layout_candidate> candidates;
+
+  for (unsigned int candidate_cell_partitions = 1;
+       candidate_cell_partitions <= static_cast<unsigned int>(device_count);
+       candidate_cell_partitions++) {
+    if (static_cast<unsigned int>(device_count) % candidate_cell_partitions !=
+        0)
+      continue;
+
+    // Empty x-slab partitions do not improve either memory or performance.
+    if (static_cast<std::size_t>(candidate_cell_partitions) > ncell_x)
+      continue;
+
+    const unsigned int candidate_tile_partitions =
+        static_cast<unsigned int>(device_count) / candidate_cell_partitions;
+
+    const std::size_t min_local_x_count =
+        ncell_x / static_cast<std::size_t>(candidate_cell_partitions);
+
+    const std::size_t max_local_x_count =
+        (ncell_x + static_cast<std::size_t>(candidate_cell_partitions) - 1) /
+        static_cast<std::size_t>(candidate_cell_partitions);
+
+    unsigned int halo_x_count = 0;
+
+    if (candidate_cell_partitions == 2)
+      halo_x_count = 1;
+    else if (candidate_cell_partitions > 2)
+      halo_x_count = 2;
+
+    const std::size_t max_source_x_count = std::min(
+        ncell_x, max_local_x_count + static_cast<std::size_t>(halo_x_count));
+
+    double estimated_source_atom_count = std::ceil(
+        static_cast<double>(natom) * static_cast<double>(max_source_x_count) /
+        static_cast<double>(ncell_x) * source_atom_headroom);
+
+    if (estimated_source_atom_count > static_cast<double>(natom))
+      estimated_source_atom_count = static_cast<double>(natom);
+
+    const double max_local_cell_count = static_cast<double>(max_local_x_count) *
+                                        static_cast<double>(yz_cell_count);
+
+    const double max_source_cell_count =
+        static_cast<double>(max_source_x_count) *
+        static_cast<double>(yz_cell_count);
+
+    const double local_tile_entry_count =
+        max_local_cell_count * static_cast<double>(max_tile_nodes);
+
+    const double prefix_plane_entry_count = static_cast<double>(yz_cell_count) *
+                                            static_cast<double>(max_tile_nodes);
+
+    double local_atom_bytes = 0.0;
+    double local_metadata_bytes = 0.0;
+    double local_cub_reserve_bytes = 0.0;
+
+    if (device_count == 1) {
+      // idx, sorted_idx, atom_cell_idx, atom_cell_sorted_idx, packets,
+      // sorted_packets, rx/ry/rz/qc, and fx/fy/fz/en.
+      local_atom_bytes =
+          estimated_source_atom_count *
+          static_cast<double>(4 * sizeof(unsigned int) +
+                              2 * sizeof(atom_packet) + 8 * sizeof(double));
+
+      local_metadata_bytes = static_cast<double>(ncell) *
+                             static_cast<double>(2 * sizeof(unsigned int));
+
+      // Conservative reserve for the larger of the single-GPU packet and value
+      // radix-sort workspaces.
+      local_cub_reserve_bytes =
+          static_cast<double>(natom) *
+          static_cast<double>(sizeof(atom_sort_key) + sizeof(atom_packet));
+    } else {
+      // source_packets, sorted_idx, rx/ry/rz/qc, and fx/fy/fz/en.
+      local_atom_bytes =
+          estimated_source_atom_count *
+          static_cast<double>(sizeof(atom_packet) + sizeof(unsigned int) +
+                              8 * sizeof(double));
+
+      local_metadata_bytes =
+          max_source_cell_count * static_cast<double>(2 * sizeof(unsigned int));
+
+      // Local multi-GPU CUB use is primarily the source-cell prefix scan.
+      local_cub_reserve_bytes =
+          max_source_cell_count * static_cast<double>(sizeof(unsigned int));
+    }
+
+    double tile_buffer_bytes = 0.0;
+    double prefix_slot_bytes = 0.0;
+
+    if (sf_exchange_mode == GLST_SF_EXCHANGE_MODE::FULL_GLOBAL_ALLREDUCE) {
+      const double global_tile_entry_count =
+          static_cast<double>(ncell) * static_cast<double>(max_tile_nodes);
+
+      // Complex global S_tile plus complex local rmt_sum.
+      tile_buffer_bytes = 2.0 *
+                          (global_tile_entry_count + local_tile_entry_count) *
+                          static_cast<double>(sizeof(double));
+    } else if (candidate_cell_partitions == 1) {
+      // Complex local S_tile plus complex local rmt_sum. There is no
+      // inter-cell-partition exchange buffer.
+      tile_buffer_bytes =
+          4.0 * local_tile_entry_count * static_cast<double>(sizeof(double));
+    } else if (sf_exchange_mode ==
+               GLST_SF_EXCHANGE_MODE::LOCAL_CHUNK_BROADCAST) {
+      const std::size_t exchange_chunk_x_count = (max_local_x_count + 1) / 2;
+
+      const double exchange_tile_entry_count =
+          static_cast<double>(exchange_chunk_x_count) *
+          prefix_plane_entry_count;
+
+      tile_buffer_bytes = 2.0 *
+                          (local_tile_entry_count + exchange_tile_entry_count +
+                           local_tile_entry_count) *
+                          static_cast<double>(sizeof(double));
+    } else {
+      // Each local x plane contributes at most four prefix-plane candidates for
+      // one alpha group. Uneven x-slab partitions can make the smaller
+      // partition require more imported planes than the larger partition.
+      const std::size_t max_partition_imported_prefix_x_count =
+          std::min(ncell_x - max_local_x_count, 4 * max_local_x_count);
+
+      const std::size_t min_partition_imported_prefix_x_count =
+          std::min(ncell_x - min_local_x_count, 4 * min_local_x_count);
+
+      const std::size_t imported_prefix_x_count =
+          std::max(max_partition_imported_prefix_x_count,
+                   min_partition_imported_prefix_x_count);
+
+      const double imported_prefix_entry_count =
+          static_cast<double>(imported_prefix_x_count) *
+          prefix_plane_entry_count;
+
+      const double partition_total_entry_count =
+          static_cast<double>(candidate_cell_partitions) *
+          prefix_plane_entry_count;
+
+      // Complex local S_tile, imported planes, partition totals, one prefix
+      // base plane, and local rmt_sum.
+      tile_buffer_bytes =
+          2.0 *
+          (local_tile_entry_count + imported_prefix_entry_count +
+           partition_total_entry_count + prefix_plane_entry_count +
+           local_tile_entry_count) *
+          static_cast<double>(sizeof(double));
+
+      prefix_slot_bytes = static_cast<double>(plan.ngroup()) *
+                          static_cast<double>(ncell_x) *
+                          static_cast<double>(sizeof(unsigned int));
+    }
+
+    double gpu_zero_only_bytes = 0.0;
+
+    if (device_count > 1) {
+      // GPU 0 owns two global sort-key arrays and two global packet arrays. Add
+      // one key+packet per atom as a conservative radix-sort workspace reserve.
+      gpu_zero_only_bytes = static_cast<double>(natom) *
+                            static_cast<double>(3 * sizeof(atom_sort_key) +
+                                                3 * sizeof(atom_packet));
+
+      // global_cell_atom_count, global_cell_atom_point,
+      // global_x_plane_atom_point, and global_max_atoms_cell.
+      gpu_zero_only_bytes += static_cast<double>(2 * ncell + 1 + ncell_x + 1 +
+                                                 candidate_cell_partitions) *
+                             static_cast<double>(sizeof(unsigned int));
+    }
+
+    const double local_required_bytes =
+        local_atom_bytes + local_metadata_bytes + local_cub_reserve_bytes +
+        tile_buffer_bytes + prefix_slot_bytes;
+
+    const double gpu_zero_required_bytes =
+        local_required_bytes + gpu_zero_only_bytes;
+
+    const double peak_required_bytes =
+        std::max(local_required_bytes, gpu_zero_required_bytes);
+
+    layout_candidate candidate;
+    candidate.cell_partitions = candidate_cell_partitions;
+    candidate.tile_partitions = candidate_tile_partitions;
+
+    if (peak_required_bytes >=
+        static_cast<double>(std::numeric_limits<std::size_t>::max())) {
+      candidate.estimated_peak_bytes = std::numeric_limits<std::size_t>::max();
+    } else {
+      candidate.estimated_peak_bytes =
+          static_cast<std::size_t>(std::ceil(peak_required_bytes));
+    }
+
+    candidate.fits_memory_budget = true;
+
+    for (int dev = 0; dev < device_count; dev++) {
+      const double required_bytes =
+          (dev == 0) ? gpu_zero_required_bytes : local_required_bytes;
+
+      const double budget_bytes = static_cast<double>(free_memory_bytes[dev]) *
+                                  gpu_layout_memory_budget_fraction;
+
+      if (required_bytes > budget_bytes) {
+        candidate.fits_memory_budget = false;
+        break;
+      }
+    }
+
+    candidates.push_back(candidate);
+  }
+
+  utl::require(!candidates.empty(), function_name,
+               "No valid G_cell divisor is <= ncell_x");
+
+  unsigned int minimum_memory_cell_partitions = 0;
+
+  for (std::size_t i = 0; i < candidates.size(); i++) {
+    if (candidates[i].fits_memory_budget) {
+      minimum_memory_cell_partitions = candidates[i].cell_partitions;
+      break;
+    }
+  }
+
+  // The estimates are deliberately conservative. When every factorization
+  // exceeds the soft 80% budget, select the smallest estimated footprint and
+  // allow the real workspace allocation to remain authoritative.
+  if (minimum_memory_cell_partitions == 0) {
+    const layout_candidate *fallback = &(candidates[0]);
+
+    for (std::size_t i = 1; i < candidates.size(); i++) {
+      if (candidates[i].estimated_peak_bytes < fallback->estimated_peak_bytes)
+        fallback = &(candidates[i]);
+    }
+
+    cell_partition_count = fallback->cell_partitions;
+    tile_partition_count = fallback->tile_partitions;
+    estimated_peak_bytes = fallback->estimated_peak_bytes;
+    reason = "no factorization satisfied the 80% free-memory budget; selected "
+             "the minimum-estimated-memory fallback " +
+             std::to_string(cell_partition_count) + " x " +
+             std::to_string(tile_partition_count);
+
+    return;
+  }
+
+  const std::size_t atom_partition_requirement =
+      (natom + target_atoms_per_cell_partition - 1) /
+      target_atoms_per_cell_partition;
+
+  unsigned int minimum_cell_partitions = minimum_memory_cell_partitions;
+
+  if (atom_partition_requirement >
+      static_cast<std::size_t>(minimum_cell_partitions)) {
+    minimum_cell_partitions = static_cast<unsigned int>(std::min(
+        atom_partition_requirement, static_cast<std::size_t>(device_count)));
+  }
+
+  const layout_candidate *selected = nullptr;
+
+  // First preference: Satisfy memory/atom requirements while leaving at least
+  // two tiles for each tile partition.
+  for (std::size_t i = 0; i < candidates.size(); i++) {
+    const layout_candidate &candidate = candidates[i];
+
+    if ((!candidate.fits_memory_budget) ||
+        (candidate.cell_partitions < minimum_cell_partitions)) {
+      continue;
+    }
+
+    const std::size_t required_tile_count =
+        static_cast<std::size_t>(minimum_tiles_per_tile_partition) *
+        static_cast<std::size_t>(candidate.tile_partitions);
+
+    if (static_cast<std::size_t>(plan.tile_count()) >= required_tile_count) {
+      selected = &candidate;
+      break;
+    }
+  }
+
+  // Second preference: At least one tile per tile rank.
+  if (selected == nullptr) {
+    for (std::size_t i = 0; i < candidates.size(); i++) {
+      const layout_candidate &candidate = candidates[i];
+
+      if ((!candidate.fits_memory_budget) ||
+          (candidate.cell_partitions < minimum_cell_partitions)) {
+        continue;
+      }
+
+      if (plan.tile_count() >= candidate.tile_partitions) {
+        selected = &candidate;
+        break;
+      }
+    }
+  }
+
+  // Third preference: Satisfy memory and atom requirements even when the tile
+  // schedule is too small to fully occupy all tile ranks.
+  if (selected == nullptr) {
+    for (std::size_t i = 0; i < candidates.size(); i++) {
+      const layout_candidate &candidate = candidates[i];
+
+      if ((candidate.fits_memory_budget) &&
+          (candidate.cell_partitions >= minimum_cell_partitions)) {
+        selected = &candidate;
+        break;
+      }
+    }
+  }
+
+  // ncell_x can prevent reaching the preferred atom-partition count. In that
+  // case, use the largest memory-fitting spatial factor.
+  if (selected == nullptr) {
+    for (std::size_t i = 0; i < candidates.size(); i++) {
+      if (candidates[i].fits_memory_budget)
+        selected = &(candidates[i]);
+    }
+  }
+
+  utl::require(selected != nullptr, function_name,
+               "Could not select a memory-fitting GPU layout");
+
+  cell_partition_count = selected->cell_partitions;
+  tile_partition_count = selected->tile_partitions;
+  estimated_peak_bytes = selected->estimated_peak_bytes;
+  reason = "memory requires G_cell >= " +
+           std::to_string(minimum_memory_cell_partitions) + ", the " +
+           std::to_string(target_atoms_per_cell_partition) +
+           "-atom target requires G_cell >= " +
+           std::to_string(atom_partition_requirement) + "; selected " +
+           std::to_string(cell_partition_count) + " x " +
+           std::to_string(tile_partition_count) + " for " +
+           std::to_string(plan.tile_count()) + " tiles and " +
+           std::to_string(plan.tot_num_nodes()) + " cubature nodes";
+
+  return;
+}
+
 void glst_force::init_gpu_layout(const int device_count) {
   constexpr std::string_view function_name = "glst_force::init_gpu_layout";
 
   utl::require(device_count >= 1, function_name,
                "Could not find any CUDA capable devices");
 
+  this->gpu_layout_min_free_bytes_ = 0;
+  this->gpu_layout_memory_budget_bytes_ = 0;
+  this->gpu_layout_estimated_peak_bytes_ = 0;
+  this->gpu_layout_reason_.clear();
+
   unsigned int cell_partition_count = this->cell_partition_count_;
   unsigned int tile_partition_count = this->tile_partition_count_;
 
   if (!this->gpu_layout_user_set_) {
-    if (device_count == 1) {
-      cell_partition_count = 1;
-      tile_partition_count = 1;
-    } else {
-      cell_partition_count = static_cast<unsigned int>(device_count);
-      tile_partition_count = 1;
+    utl::require(this->plan_ != nullptr, function_name,
+                 "Automatic GPU layout requires initialized plan");
+    std::vector<std::size_t> free_memory_bytes(device_count, 0);
+
+    this->gpu_layout_min_free_bytes_ = std::numeric_limits<std::size_t>::max();
+
+    for (int dev = 0; dev < device_count; dev++) {
+      cudaCheck(cudaSetDevice(dev));
+
+      std::size_t free_bytes = 0;
+      std::size_t total_bytes = 0;
+
+      cudaCheck(cudaMemGetInfo(&free_bytes, &total_bytes));
+
+      utl::require(total_bytes >= free_bytes, function_name,
+                   "CUDA reported free memory larger than total memory");
+
+      free_memory_bytes[dev] = free_bytes;
+
+      if (free_bytes < this->gpu_layout_min_free_bytes_)
+        this->gpu_layout_min_free_bytes_ = free_bytes;
     }
+
+    this->gpu_layout_memory_budget_bytes_ = static_cast<std::size_t>(
+        static_cast<double>(this->gpu_layout_min_free_bytes_) *
+        gpu_layout_memory_budget_fraction);
+
+    glst_force::select_automatic_gpu_layout(
+        cell_partition_count, tile_partition_count,
+        this->gpu_layout_estimated_peak_bytes_, this->gpu_layout_reason_,
+        *(this->plan_), device_count, this->sf_exchange_mode_,
+        free_memory_bytes);
+  } else {
+    this->gpu_layout_reason_ = "explicit set_gpu_layout_override";
   }
 
   const unsigned long long int product =
@@ -5430,12 +5906,12 @@ void glst_force::init_gpu_layout(const int device_count) {
       static_cast<unsigned long long int>(tile_partition_count);
 
   if (product != static_cast<unsigned long long int>(device_count)) {
-    utl::throw_error(function_name,
-                     "GLST_CELL_PARTITION * GLST_TILE_PARTITION must equal the "
-                     "visible CUDA device count; observed " +
-                         std::to_string(cell_partition_count) + " * " +
-                         std::to_string(tile_partition_count) +
-                         " != " + std::to_string(device_count));
+    utl::throw_error(
+        function_name,
+        "G_cell * G_tile must equal the visible CUDA device count; observed " +
+            std::to_string(cell_partition_count) + " * " +
+            std::to_string(tile_partition_count) +
+            " != " + std::to_string(device_count));
   }
 
   this->cuda_count_ = device_count;

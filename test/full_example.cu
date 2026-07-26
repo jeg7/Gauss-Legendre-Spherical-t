@@ -35,6 +35,10 @@ public:
   static const glst_profile &profile(const glst_force &force) {
     return force.profile_;
   }
+
+  static unsigned int tile_partition_count(const glst_force &force) {
+    return force.tile_partition_count_;
+  }
 };
 
 int main(int argc, char **argv) {
@@ -44,17 +48,17 @@ int main(int argc, char **argv) {
   // Input check and error catch
   if ((!cutoff_mode) && (!cell_mode)) {
     std::cout << "Usage: " << argv[0]
-              << " [system] [tol] [box_dim] [rcut] [G_cell] [G_tile] "
-                 "[warmup_iterations] [benchmark_iterations] "
+              << " [system] [tol] [box_dim] [rcut] [G_cell|0:auto] "
+                 "[G_tile|0:auto] [warmup_iterations] [benchmark_iterations] "
                  "[profile_iterations] [run_coulomb:0|1] [output_file|-]"
               << std::endl;
     std::cout << "OR" << std::endl;
-    std::cout
-        << "       " << argv[0]
-        << " [sys] [tol] [box_dim] [ncell_x] [ncell_y] [ncell_z] [G_cell] "
-           "[G_tile] [warmup_iterations] [benchmark_iterations] "
-           "[profile_iterations] [run_coulomb:0|1] [output_file|-]"
-        << std::endl;
+    std::cout << "       " << argv[0]
+              << " [sys] [tol] [box_dim] [ncell_x] [ncell_y] [ncell_z] "
+                 "[G_cell|0:auto] [G_tile|0:auto] [warmup_iterations] "
+                 "[benchmark_iterations] [profile_iterations] "
+                 "[run_coulomb:0|1] [output_file|-]"
+              << std::endl;
     return EXIT_FAILURE;
   }
 
@@ -101,8 +105,8 @@ int main(int argc, char **argv) {
       rcut = (rczd < rcut) ? rczd : rcut;
     }
 
-    cell_partition_count = parse_uint_arg(argv[arg++], "G_cell", false);
-    tile_partition_count = parse_uint_arg(argv[arg++], "G_tile", false);
+    cell_partition_count = parse_uint_arg(argv[arg++], "G_cell", true);
+    tile_partition_count = parse_uint_arg(argv[arg++], "G_tile", true);
 
     warmup_iterations = parse_uint_arg(argv[arg++], "warmup_iterations", true);
     benchmark_iterations =
@@ -144,17 +148,30 @@ int main(int argc, char **argv) {
   int cuda_count = 0;
   cudaCheck(cudaGetDeviceCount(&cuda_count));
 
-  const unsigned long long int requested_device_count =
-      static_cast<unsigned long long int>(cell_partition_count) *
-      static_cast<unsigned long long int>(tile_partition_count);
+  const bool automatic_gpu_layout =
+      (cell_partition_count == 0) && (tile_partition_count == 0);
 
-  if (requested_device_count !=
-      static_cast<unsigned long long int>(cuda_count)) {
-    std::cerr << "Invalid GPU layout: G_cell * G_tile must equal the visible "
-                 "CUDA device count; observed "
-              << cell_partition_count << " * " << tile_partition_count
-              << " != " << cuda_count << std::endl;
+  if ((cell_partition_count == 0) != (tile_partition_count == 0)) {
+    std::cerr << "Invalid GPU layout: G_cell and G_tile must either both be "
+                 "positive or both be 0 for automatic selection"
+              << std::endl;
+
     return EXIT_FAILURE;
+  }
+
+  if (!automatic_gpu_layout) {
+    const unsigned long long int requested_device_count =
+        static_cast<unsigned long long int>(cell_partition_count) *
+        static_cast<unsigned long long int>(tile_partition_count);
+
+    if (requested_device_count !=
+        static_cast<unsigned long long int>(cuda_count)) {
+      std::cerr << "Invalid GPU layout: G_cell * G_tile must equal the visible "
+                   "CUDA device count; observed "
+                << cell_partition_count << " * " << tile_partition_count
+                << " != " << cuda_count << std::endl;
+      return EXIT_FAILURE;
+    }
   }
 
   std::cout << "BENCH_INPUT";
@@ -169,8 +186,13 @@ int main(int argc, char **argv) {
   }
 
   std::cout << " visible_gpus=" << cuda_count;
-  std::cout << " g_cell=" << cell_partition_count;
-  std::cout << " g_tile=" << tile_partition_count;
+  if (automatic_gpu_layout) {
+    std::cout << " g_cell=auto";
+    std::cout << " g_tile=auto";
+  } else {
+    std::cout << " g_cell=" << cell_partition_count;
+    std::cout << " g_tile=" << tile_partition_count;
+  }
   std::cout << " warmup_iterations=" << warmup_iterations;
   std::cout << " benchmark_iterations=" << benchmark_iterations;
   std::cout << " profile_iterations=" << profile_iterations;
@@ -196,11 +218,15 @@ int main(int argc, char **argv) {
       en_glst(natom);
 
   auto glst = std::make_unique<glst_force>();
-  glst->set_gpu_layout(cell_partition_count, tile_partition_count);
+  if (!automatic_gpu_layout)
+    glst->set_gpu_layout(cell_partition_count, tile_partition_count);
   // glst->set_sf_exchange_mode(GLST_SF_EXCHANGE_MODE::FULL_GLOBAL_ALLREDUCE);
   // glst->set_sf_exchange_mode(GLST_SF_EXCHANGE_MODE::LOCAL_CHUNK_BROADCAST);
   glst->set_sf_exchange_mode(GLST_SF_EXCHANGE_MODE::DISTRIBUTED_PREFIX);
   glst->init(natom, tol, box_dim_x, box_dim_y, box_dim_z, rcut);
+
+  const unsigned int selected_tile_partition_count =
+      glst_force_test_access::tile_partition_count(*glst);
 
   glst_force_test_access::enable_profiling(*glst, false);
 
@@ -282,7 +308,7 @@ int main(int argc, char **argv) {
       cub_work_buffer_growth_events += profile.cub_work_buffer_growth_events;
 
       if ((iter > 0) && ((profile.atom_storage_growth_events != 0) ||
-                         (cub_work_buffer_growth_events != 0))) {
+                         (profile.cub_work_buffer_growth_events != 0))) {
         throw std::runtime_error("Storage allocation occurred after the first "
                                  "repeated profiling calculation");
       }
@@ -359,7 +385,7 @@ int main(int argc, char **argv) {
       }
     }
 
-    if (tile_partition_count > 1) {
+    if (selected_tile_partition_count > 1) {
       std::cout
           << "Profiling phase timings serialize tile partitions; use the "
              "non-instrumented Total GLST Runtime for end-to-end performance."
