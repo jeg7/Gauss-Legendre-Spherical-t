@@ -382,15 +382,16 @@ void glst_force::init(const unsigned int natom, const double tol,
       use_full_sf_buffer, use_distributed_prefix,
       this->sf_exchange_chunk_x_count_);
 
-  for (int dev = 0; dev < this->cuda_count_; dev++) {
-    cudaCheck(cudaSetDevice(dev));
+  if (this->execution_mode_ == GLST_EXECUTION_MODE::SINGLE_GPU_TILED) {
+    cudaCheck(cudaSetDevice(0));
 
-    const std::size_t atom_capacity = this->workspace_->atom_capacity(dev);
+    const std::size_t atom_capacity = this->workspace_->atom_capacity(0);
+
     for (std::size_t i = 0; i < atom_capacity; i++)
-      this->workspace_->idx()[dev][i] = static_cast<unsigned int>(i);
+      this->workspace_->idx()[0][i] = static_cast<unsigned int>(i);
 
     if (atom_capacity > 0)
-      this->workspace_->idx()[dev].transfer_to_device();
+      this->workspace_->idx()[0].transfer_to_device();
   }
 
   // Layout validation
@@ -874,6 +875,8 @@ __global__ static void calc_sr_ef_inter_kernel(
 }
 
 void glst_force::calc_sr_ef(void) {
+  constexpr std::string_view function_name = "glst_force::calc_sr_ef";
+
   for (int dev = 0; dev < this->cuda_count_; dev++) {
     if ((this->execution_mode_ != GLST_EXECUTION_MODE::SINGLE_GPU_TILED) &&
         (this->dev_tile_partition_[dev] != 0)) {
@@ -903,19 +906,23 @@ void glst_force::calc_sr_ef(void) {
     const unsigned int left_halo_cell_count = static_cast<unsigned int>(
         this->plan_->partition_left_halo_cell_idx(cell_partition).size());
 
-    const unsigned int *source_cell_atom_point = nullptr;
-    const unsigned int *source_cell_atom_count = nullptr;
+    const unsigned int *cell_atom_point = nullptr;
+    const unsigned int *cell_atom_count = nullptr;
 
     if (this->execution_mode_ == GLST_EXECUTION_MODE::SINGLE_GPU_TILED) {
-      source_cell_atom_point =
+      cell_atom_point =
           this->workspace_->cell_atom_point()[dev].d_array().data();
-      source_cell_atom_count =
+      cell_atom_count =
           this->workspace_->cell_atom_count()[dev].d_array().data();
     } else {
-      source_cell_atom_point =
-          this->workspace_->sr_source_cell_atom_point()[dev].d_array().data();
-      source_cell_atom_count =
-          this->workspace_->sr_source_cell_atom_count()[dev].d_array().data();
+      utl::require(static_cast<std::size_t>(owned_cell_count) <=
+                       this->workspace_->sr_source_cell_capacity(dev),
+                   function_name,
+                   "Owned-cell count exceeds source-cell metadata capacity");
+      cell_atom_point =
+          this->workspace_->sr_source_cell_atom_point()[dev].data();
+      cell_atom_count =
+          this->workspace_->sr_source_cell_atom_count()[dev].data();
     }
 
     constexpr dim3 num_threads(64, 1, 1);
@@ -931,10 +938,8 @@ void glst_force::calc_sr_ef(void) {
             this->workspace_->rx()[dev].d_array().data(),
             this->workspace_->ry()[dev].d_array().data(),
             this->workspace_->rz()[dev].d_array().data(),
-            this->workspace_->qc()[dev].d_array().data(),
-            this->workspace_->cell_atom_point()[dev].d_array().data(),
-            this->workspace_->cell_atom_count()[dev].d_array().data(),
-            this->dev_cell_idx_[dev].d_array().data(),
+            this->workspace_->qc()[dev].d_array().data(), cell_atom_point,
+            cell_atom_count, this->dev_cell_idx_[dev].d_array().data(),
             static_cast<unsigned int>(this->dev_cell_idx_[dev].size()),
             first_global_cell);
 
@@ -949,10 +954,8 @@ void glst_force::calc_sr_ef(void) {
             this->workspace_->rx()[dev].d_array().data(),
             this->workspace_->ry()[dev].d_array().data(),
             this->workspace_->rz()[dev].d_array().data(),
-            this->workspace_->qc()[dev].d_array().data(),
-            this->workspace_->cell_atom_point()[dev].d_array().data(),
-            this->workspace_->cell_atom_count()[dev].d_array().data(),
-            source_cell_atom_point, source_cell_atom_count,
+            this->workspace_->qc()[dev].d_array().data(), cell_atom_point,
+            cell_atom_count, cell_atom_point, cell_atom_count,
             this->dev_cell_idx_[dev].d_array().data(),
             static_cast<unsigned int>(this->dev_cell_idx_[dev].size()),
             first_global_cell, owned_cell_count, x_point, x_count,
@@ -1520,40 +1523,6 @@ __global__ static void finalize_global_atom_points_kernel(
   return;
 }
 
-__global__ static void write_atom_assignment_metadata_kernel(
-    unsigned int *__restrict__ metadata, const unsigned int source_atom_count,
-    const unsigned int owned_atom_count, const unsigned int max_atoms_cell) {
-  if ((blockIdx.x == 0) && (threadIdx.x == 0)) {
-    metadata[0] = source_atom_count;
-    metadata[1] = owned_atom_count;
-    metadata[2] = max_atoms_cell;
-  }
-
-  return;
-}
-
-__global__ static void build_local_atom_metadata_kernel(
-    unsigned int *__restrict__ local_cell_atom_count,
-    unsigned int *__restrict__ local_cell_atom_point,
-    unsigned int *__restrict__ assignment_metadata,
-    const unsigned int *__restrict__ source_cell_atom_count,
-    const unsigned int *__restrict__ source_cell_atom_point,
-    const unsigned int local_cell_count) {
-  const unsigned int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  const unsigned int stride = gridDim.x * blockDim.x;
-
-  for (unsigned int local_cell = idx; local_cell < local_cell_count;
-       local_cell += stride) {
-    const unsigned int count = source_cell_atom_count[local_cell];
-
-    local_cell_atom_count[local_cell] = count;
-    local_cell_atom_point[local_cell] = source_cell_atom_point[local_cell];
-    atomicMax(&assignment_metadata[2], count);
-  }
-
-  return;
-}
-
 void glst_force::build_global_atom_reference(const double *d_rx,
                                              const double *d_ry,
                                              const double *d_rz,
@@ -2059,7 +2028,7 @@ void glst_force::scatter_sorted_atom_packets(const double *d_rx,
     }
   }
 
-  // No assignment communication may overwrite a rank's packet or metadata
+  // No assignment communication may overwrite a rank's packet or source-cell
   // buffers until preceeding compute work on that rank has finished.
   for (int dev = 0; dev < this->cuda_count_; dev++) {
     cudaCheck(cudaSetDevice(dev));
@@ -2076,29 +2045,6 @@ void glst_force::scatter_sorted_atom_packets(const double *d_rx,
 
   const unsigned int *global_cell_atom_count =
       this->workspace_->global_cell_atom_count().data();
-
-  for (unsigned int partition = 0; partition < this->cell_partition_count_;
-       partition++) {
-    const int root_dev = root_devs[partition];
-
-    const atom_partition_range &range = partition_range[partition];
-
-    unsigned int *metadata =
-        this->workspace_->atom_assignment_metadata()[root_dev].d_array().data();
-
-    utl::require(
-        this->workspace_->atom_assignment_metadata()[root_dev].size() == 3,
-        function_name, "Root assignment metadata capacity is incorrect");
-
-    cudaCheck(cudaSetDevice(root_dev));
-
-    write_atom_assignment_metadata_kernel<<<1, 1, 0,
-                                            this->comm_streams_[root_dev]>>>(
-        metadata, static_cast<unsigned int>(range.source_atom_count),
-        static_cast<unsigned int>(range.owned_atom_count),
-        partition_max_atoms_cell[partition]);
-    cudaCheck(cudaGetLastError());
-  }
 
   // Cell partition 0 is local to GPU 0. Use ordinary asynchronous D2D copies,
   // preserving the exact [owned][left][right] destination order.
@@ -2120,7 +2066,7 @@ void glst_force::scatter_sorted_atom_packets(const double *d_rx,
         range.owned_atom_count, range.left_atom_count, range.right_atom_count};
 
     atom_packet *destination =
-        this->workspace_->sorted_packets()[root_dev].d_array().data();
+        this->workspace_->source_packets()[root_dev].data();
 
     cudaCheck(cudaSetDevice(root_dev));
 
@@ -2143,9 +2089,7 @@ void glst_force::scatter_sorted_atom_packets(const double *d_rx,
     }
 
     unsigned int *destination_cell_count =
-        this->workspace_->sr_source_cell_atom_count()[root_dev]
-            .d_array()
-            .data();
+        this->workspace_->sr_source_cell_atom_count()[root_dev].data();
 
     for (std::size_t segment = 0;
          segment < cell_segment_count[partition].size(); segment++) {
@@ -2208,7 +2152,7 @@ void glst_force::scatter_sorted_atom_packets(const double *d_rx,
                                                        range.right_atom_count};
 
       atom_packet *destination =
-          this->workspace_->sorted_packets()[root_dev].d_array().data();
+          this->workspace_->source_packets()[root_dev].data();
 
       for (std::size_t segment = 0; segment < packet_count.size(); segment++) {
         if (packet_count[segment] == 0u)
@@ -2239,9 +2183,7 @@ void glst_force::scatter_sorted_atom_packets(const double *d_rx,
       }
 
       unsigned int *destination_cell_count =
-          this->workspace_->sr_source_cell_atom_count()[root_dev]
-              .d_array()
-              .data();
+          this->workspace_->sr_source_cell_atom_count()[root_dev].data();
 
       for (std::size_t segment = 0;
            segment < cell_segment_count[partition].size(); segment++) {
@@ -2309,18 +2251,11 @@ void glst_force::scatter_sorted_atom_packets(const double *d_rx,
 
         cudaCheck(cudaSetDevice(dev));
 
-        unsigned int *metadata =
-            this->workspace_->atom_assignment_metadata()[dev].d_array().data();
-        atom_packet *packet =
-            this->workspace_->sorted_packets()[dev].d_array().data();
+        atom_packet *packet = this->workspace_->source_packets()[dev].data();
         unsigned int *source_cell_atom_count =
-            this->workspace_->sr_source_cell_atom_count()[dev].d_array().data();
+            this->workspace_->sr_source_cell_atom_count()[dev].data();
 
         // Communicator rank 0 is tile partition 0.
-        ncclCheck(ncclBroadcast(static_cast<const void *>(metadata),
-                                static_cast<void *>(metadata), 3, ncclUint32, 0,
-                                tile_comms[rank], this->comm_streams_[dev]));
-
         if (packet_byte_count > 0) {
           ncclCheck(ncclBroadcast(static_cast<const void *>(packet),
                                   static_cast<void *>(packet),
@@ -2478,11 +2413,11 @@ void glst_force::validate_atom_scatter(void) const {
     // These copies exist only in a __GLST_DEBUG__ caller. Release assignment
     // performs no atom-sized D2H transfer.
     if (source_atom_count > 0u) {
-      cudaCheck(cudaMemcpy(
-          static_cast<void *>(snapshot.packet.data()),
-          static_cast<const void *>(
-              this->workspace_->sorted_packets()[dev].d_array().data()),
-          source_atom_count * sizeof(atom_packet), cudaMemcpyDeviceToHost));
+      cudaCheck(cudaMemcpy(static_cast<void *>(snapshot.packet.data()),
+                           static_cast<const void *>(
+                               this->workspace_->source_packets()[dev].data()),
+                           source_atom_count * sizeof(atom_packet),
+                           cudaMemcpyDeviceToHost));
     }
 
     if (!source_cells.empty()) {
@@ -2492,17 +2427,13 @@ void glst_force::validate_atom_scatter(void) const {
       cudaCheck(cudaMemcpy(
           static_cast<void *>(snapshot.source_cell_atom_count.data()),
           static_cast<const void *>(
-              this->workspace_->sr_source_cell_atom_count()[dev]
-                  .d_array()
-                  .data()),
+              this->workspace_->sr_source_cell_atom_count()[dev].data()),
           metadata_bytes, cudaMemcpyDeviceToHost));
 
       cudaCheck(cudaMemcpy(
           static_cast<void *>(snapshot.source_cell_atom_point.data()),
           static_cast<const void *>(
-              this->workspace_->sr_source_cell_atom_point()[dev]
-                  .d_array()
-                  .data()),
+              this->workspace_->sr_source_cell_atom_point()[dev].data()),
           metadata_bytes, cudaMemcpyDeviceToHost));
     }
 
@@ -2732,13 +2663,7 @@ void glst_force::assign_atoms_multi_gpu(const double *d_rx, const double *d_ry,
         function_name,
         "Maximum owned-cell population exceeds owned atom count");
 
-    utl::require(this->workspace_->atom_assignment_metadata()[dev].size() == 3,
-                 function_name, "Assignment metadata capacity is incorrect");
-
     const cudaStream_t stream = this->comp_streams_[dev];
-
-    unsigned int *assignment_metadata =
-        this->workspace_->atom_assignment_metadata()[dev].d_array().data();
 
     // Every rank independently rebuilds source-cell points from the
     // byte-identical source-cell counts it received.
@@ -2757,31 +2682,9 @@ void glst_force::assign_atoms_multi_gpu(const double *d_rx, const double *d_ry,
 
       cudaCheck(cub::DeviceScan::ExclusiveSum(
           cub_work_buffer, cub_work_buffer_size,
-          this->workspace_->sr_source_cell_atom_count()[dev].d_array().data(),
-          this->workspace_->sr_source_cell_atom_point()[dev].d_array().data(),
+          this->workspace_->sr_source_cell_atom_count()[dev].data(),
+          this->workspace_->sr_source_cell_atom_point()[dev].data(),
           static_cast<int>(source_cell_count), stream));
-    }
-
-    // Recompute the maximum owned-cell population locally as requested.
-    cudaCheck(cudaMemsetAsync(static_cast<void *>(assignment_metadata + 2), 0,
-                              sizeof(unsigned int), stream));
-
-    if (local_cell_count > 0) {
-      const unsigned int active_local_cell_count =
-          static_cast<unsigned int>(local_cell_count);
-
-      constexpr unsigned int num_threads = 256;
-      const unsigned int num_blocks =
-          (active_local_cell_count + num_threads - 1u) / num_threads;
-
-      build_local_atom_metadata_kernel<<<num_blocks, num_threads, 0, stream>>>(
-          this->workspace_->cell_atom_count()[dev].d_array().data(),
-          this->workspace_->cell_atom_point()[dev].d_array().data(),
-          assignment_metadata,
-          this->workspace_->sr_source_cell_atom_count()[dev].d_array().data(),
-          this->workspace_->sr_source_cell_atom_point()[dev].d_array().data(),
-          active_local_cell_count);
-      cudaCheck(cudaGetLastError());
     }
 
     // Do not communicate the individual Structure of Arrays arrays. Every rank
@@ -2800,7 +2703,7 @@ void glst_force::assign_atoms_multi_gpu(const double *d_rx, const double *d_ry,
           this->workspace_->rz()[dev].d_array().data(),
           this->workspace_->qc()[dev].d_array().data(),
           this->workspace_->sorted_idx()[dev].d_array().data(),
-          this->workspace_->sorted_packets()[dev].d_array().data(),
+          this->workspace_->source_packets()[dev].data(),
           active_source_atom_count);
       cudaCheck(cudaGetLastError());
     }
@@ -2905,6 +2808,25 @@ void glst_force::calc_sf_tile(const unsigned int tile) {
     if (local_cell_count == 0)
       continue;
 
+    const unsigned int *cell_atom_point = nullptr;
+    const unsigned int *cell_atom_count = nullptr;
+
+    if (this->execution_mode_ == GLST_EXECUTION_MODE::SINGLE_GPU_TILED) {
+      cell_atom_point =
+          this->workspace_->cell_atom_point()[dev].d_array().data();
+      cell_atom_count =
+          this->workspace_->cell_atom_count()[dev].d_array().data();
+    } else {
+      utl::require(static_cast<std::size_t>(local_cell_count) <=
+                       this->workspace_->sr_source_cell_capacity(dev),
+                   function_name,
+                   "Owned-cell count exceeds source-cell metadata capacity");
+      cell_atom_point =
+          this->workspace_->sr_source_cell_atom_point()[dev].data();
+      cell_atom_count =
+          this->workspace_->sr_source_cell_atom_count()[dev].data();
+    }
+
     constexpr dim3 num_threads(128, 1, 1);
     const dim3 num_blocks((nc + num_threads.x - 1) / num_threads.x,
                           std::min(65535u, local_cell_count), 1);
@@ -2918,10 +2840,8 @@ void glst_force::calc_sf_tile(const unsigned int tile) {
             this->workspace_->rx()[dev].d_array().data(),
             this->workspace_->ry()[dev].d_array().data(),
             this->workspace_->rz()[dev].d_array().data(),
-            this->workspace_->qc()[dev].d_array().data(),
-            this->workspace_->cell_atom_point()[dev].d_array().data(),
-            this->workspace_->cell_atom_count()[dev].d_array().data(),
-            local_cell_count, sf_cell_point);
+            this->workspace_->qc()[dev].d_array().data(), cell_atom_point,
+            cell_atom_count, local_cell_count, sf_cell_point);
 
     cudaCheck(cudaGetLastError());
   }
@@ -4978,6 +4898,25 @@ void glst_force::calc_lr_ef_tile(const unsigned int tile) {
     if (max_atoms_cell == 0)
       continue;
 
+    const unsigned int *cell_atom_point = nullptr;
+    const unsigned int *cell_atom_count = nullptr;
+
+    if (this->execution_mode_ == GLST_EXECUTION_MODE::SINGLE_GPU_TILED) {
+      cell_atom_point =
+          this->workspace_->cell_atom_point()[dev].d_array().data();
+      cell_atom_count =
+          this->workspace_->cell_atom_count()[dev].d_array().data();
+    } else {
+      utl::require(static_cast<std::size_t>(local_cell_count) <=
+                       this->workspace_->sr_source_cell_capacity(dev),
+                   function_name,
+                   "Owned-cell count exceeds source-cell metadata capacity");
+      cell_atom_point =
+          this->workspace_->sr_source_cell_atom_point()[dev].data();
+      cell_atom_count =
+          this->workspace_->sr_source_cell_atom_count()[dev].data();
+    }
+
     constexpr dim3 num_threads(64, 1, 1);
     const dim3 num_blocks((max_atoms_cell + num_threads.x - 1) / num_threads.x,
                           std::min(65535u, local_cell_count), 1);
@@ -4991,10 +4930,8 @@ void glst_force::calc_lr_ef_tile(const unsigned int tile) {
             this->workspace_->rx()[dev].d_array().data(),
             this->workspace_->ry()[dev].d_array().data(),
             this->workspace_->rz()[dev].d_array().data(),
-            this->workspace_->qc()[dev].d_array().data(),
-            this->workspace_->cell_atom_point()[dev].d_array().data(),
-            this->workspace_->cell_atom_count()[dev].d_array().data(),
-            this->plan_->x()[dev].d_array().data() + off,
+            this->workspace_->qc()[dev].d_array().data(), cell_atom_point,
+            cell_atom_count, this->plan_->x()[dev].d_array().data() + off,
             this->plan_->y()[dev].d_array().data() + off,
             this->plan_->z()[dev].d_array().data() + off,
             this->workspace_->rmt_sum_re()[dev].d_array().data(),

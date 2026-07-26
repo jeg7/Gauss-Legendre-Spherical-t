@@ -48,17 +48,17 @@ glst_workspace::glst_workspace(void)
       owned_atom_count_(), source_atom_count_(), atom_storage_growth_count_(),
       cub_work_buffer_growth_count_(), sr_source_cell_capacity_(),
       partition_atom_range_(), idx_(), sorted_idx_(), rx_(), ry_(), rz_(),
-      qc_(), packets_(), sorted_packets_(), atom_cell_idx_(),
+      qc_(), packets_(), sorted_packets_(), source_packets_(), atom_cell_idx_(),
       atom_cell_sorted_idx_(), global_sort_key_in_(), global_sort_key_out_(),
       global_packet_in_(), global_packet_out_(), global_cell_atom_count_(),
       global_cell_atom_point_(), global_x_plane_atom_point_(),
-      global_max_atoms_cell_(), atom_assignment_metadata_(), fx_(), fy_(),
-      fz_(), en_(), cell_atom_point_(), cell_atom_count_(), max_atoms_cell_(),
-      sr_source_cell_atom_point_(), sr_source_cell_atom_count_(), sf_re_(),
-      sf_im_(), sf_exchange_re_(), sf_exchange_im_(),
-      prefix_partition_total_re_(), prefix_partition_total_im_(),
-      prefix_base_re_(), prefix_base_im_(), prefix_plane_slot_(), rmt_sum_re_(),
-      rmt_sum_im_(), cub_work_buffer_(), cub_work_buffer_size_() {}
+      global_max_atoms_cell_(), fx_(), fy_(), fz_(), en_(), cell_atom_point_(),
+      cell_atom_count_(), max_atoms_cell_(), sr_source_cell_atom_point_(),
+      sr_source_cell_atom_count_(), sf_re_(), sf_im_(), sf_exchange_re_(),
+      sf_exchange_im_(), prefix_partition_total_re_(),
+      prefix_partition_total_im_(), prefix_base_re_(), prefix_base_im_(),
+      prefix_plane_slot_(), rmt_sum_re_(), rmt_sum_im_(), cub_work_buffer_(),
+      cub_work_buffer_size_() {}
 
 glst_workspace::glst_workspace(const glst_plan &plan, const int device_count)
     : glst_workspace() {
@@ -272,6 +272,11 @@ glst_workspace::sorted_packets(void) const {
   return this->sorted_packets_;
 }
 
+const std::vector<device_vector<atom_packet>> &
+glst_workspace::source_packets(void) const {
+  return this->source_packets_;
+}
+
 const std::vector<cuda_container<unsigned int>> &
 glst_workspace::atom_cell_idx(void) const {
   return this->atom_cell_idx_;
@@ -321,11 +326,6 @@ glst_workspace::global_max_atoms_cell(void) const {
   return this->global_max_atoms_cell_;
 }
 
-const std::vector<cuda_container<unsigned int>> &
-glst_workspace::atom_assignment_metadata(void) const {
-  return this->atom_assignment_metadata_;
-}
-
 const std::vector<cuda_container<double>> &glst_workspace::fx(void) const {
   return this->fx_;
 }
@@ -356,12 +356,12 @@ const std::vector<unsigned int> &glst_workspace::max_atoms_cell(void) const {
   return this->max_atoms_cell_;
 }
 
-const std::vector<cuda_container<unsigned int>> &
+const std::vector<device_vector<unsigned int>> &
 glst_workspace::sr_source_cell_atom_point(void) const {
   return this->sr_source_cell_atom_point_;
 }
 
-const std::vector<cuda_container<unsigned int>> &
+const std::vector<device_vector<unsigned int>> &
 glst_workspace::sr_source_cell_atom_count(void) const {
   return this->sr_source_cell_atom_count_;
 }
@@ -464,6 +464,10 @@ std::vector<cuda_container<atom_packet>> &glst_workspace::sorted_packets(void) {
   return this->sorted_packets_;
 }
 
+std::vector<device_vector<atom_packet>> &glst_workspace::source_packets(void) {
+  return this->source_packets_;
+}
+
 std::vector<cuda_container<unsigned int>> &glst_workspace::atom_cell_idx(void) {
   return this->atom_cell_idx_;
 }
@@ -505,11 +509,6 @@ device_vector<unsigned int> &glst_workspace::global_max_atoms_cell(void) {
   return this->global_max_atoms_cell_;
 }
 
-std::vector<cuda_container<unsigned int>> &
-glst_workspace::atom_assignment_metadata(void) {
-  return this->atom_assignment_metadata_;
-}
-
 std::vector<cuda_container<double>> &glst_workspace::fx(void) {
   return this->fx_;
 }
@@ -540,12 +539,12 @@ std::vector<unsigned int> &glst_workspace::max_atoms_cell(void) {
   return this->max_atoms_cell_;
 }
 
-std::vector<cuda_container<unsigned int>> &
+std::vector<device_vector<unsigned int>> &
 glst_workspace::sr_source_cell_atom_point(void) {
   return this->sr_source_cell_atom_point_;
 }
 
-std::vector<cuda_container<unsigned int>> &
+std::vector<device_vector<unsigned int>> &
 glst_workspace::sr_source_cell_atom_count(void) {
   return this->sr_source_cell_atom_count_;
 }
@@ -768,7 +767,10 @@ void glst_workspace::init(const glst_plan &plan,
             ? 0
             : plan.partition_halo_cell_idx(cell_partition).size();
 
-    const std::size_t sr_source_cell_count = local_cell_count + halo_cell_count;
+    const std::size_t sr_source_cell_count =
+        (device_count == 1) ? 0
+                            : checked_add(local_cell_count, halo_cell_count,
+                                          "Short-range source cell cap");
 
     std::size_t local_atom_capacity = global_natom;
 
@@ -869,6 +871,7 @@ void glst_workspace::init(const glst_plan &plan,
   this->qc_.resize(device_count);
   this->packets_.resize(device_count);
   this->sorted_packets_.resize(device_count);
+  this->source_packets_.resize(device_count);
   this->atom_cell_idx_.resize(device_count);
   this->atom_cell_sorted_idx_.resize(device_count);
 
@@ -876,8 +879,6 @@ void glst_workspace::init(const glst_plan &plan,
   this->fy_.resize(device_count);
   this->fz_.resize(device_count);
   this->en_.resize(device_count);
-
-  this->atom_assignment_metadata_.resize(device_count);
 
   this->cell_atom_point_.resize(device_count);
   this->cell_atom_count_.resize(device_count);
@@ -900,30 +901,49 @@ void glst_workspace::init(const glst_plan &plan,
   for (int dev = 0; dev < device_count; dev++) {
     cudaCheck(cudaSetDevice(dev));
 
-    this->idx_[dev].resize(this->atom_capacity_[dev]);
-    this->sorted_idx_[dev].resize(this->atom_capacity_[dev]);
-    this->rx_[dev].resize(this->atom_capacity_[dev]);
-    this->ry_[dev].resize(this->atom_capacity_[dev]);
-    this->rz_[dev].resize(this->atom_capacity_[dev]);
-    this->qc_[dev].resize(this->atom_capacity_[dev]);
-    this->packets_[dev].resize(this->atom_capacity_[dev]);
-    this->sorted_packets_[dev].resize(this->atom_capacity_[dev]);
-    this->atom_cell_idx_[dev].resize(this->atom_capacity_[dev]);
-    this->atom_cell_sorted_idx_[dev].resize(this->atom_capacity_[dev]);
+    const std::size_t atom_capacity = this->atom_capacity_[dev];
+    const std::size_t cell_capacity = this->cell_capacity_[dev];
+    const std::size_t sr_source_cell_capacity =
+        this->sr_source_cell_capacity_[dev];
 
-    this->fx_[dev].resize(this->atom_capacity_[dev]);
-    this->fy_[dev].resize(this->atom_capacity_[dev]);
-    this->fz_[dev].resize(this->atom_capacity_[dev]);
-    this->en_[dev].resize(this->atom_capacity_[dev]);
+    // Single-GPU assignment uses the existing local CUB packet sort. Multi-GPU
+    // assignment instead receives one packed source representation.
+    if (device_count == 1) {
+      this->idx_[dev].resize(atom_capacity);
+      this->packets_[dev].resize(atom_capacity);
+      this->sorted_packets_[dev].resize(atom_capacity);
+      this->atom_cell_idx_[dev].resize(atom_capacity);
+      this->atom_cell_sorted_idx_[dev].resize(atom_capacity);
+    } else {
+      this->source_packets_[dev].resize(atom_capacity);
+    }
 
-    this->atom_assignment_metadata_[dev].resize(3);
+    // These arrays are required in both single- and multi-GPU paths.
+    //
+    // sorted_idx preserves the original atom index after the sorted packet is
+    // unpacked. The Structure of Arrays values feed structure-factor and force
+    // kernels.
+    this->sorted_idx_[dev].resize(atom_capacity);
+    this->rx_[dev].resize(atom_capacity);
+    this->ry_[dev].resize(atom_capacity);
+    this->rz_[dev].resize(atom_capacity);
+    this->qc_[dev].resize(atom_capacity);
 
-    this->cell_atom_point_[dev].resize(this->cell_capacity_[dev]);
-    this->cell_atom_count_[dev].resize(this->cell_capacity_[dev]);
-    this->sr_source_cell_atom_point_[dev].resize(
-        this->sr_source_cell_capacity_[dev]);
-    this->sr_source_cell_atom_count_[dev].resize(
-        this->sr_source_cell_capacity_[dev]);
+    this->fx_[dev].resize(atom_capacity);
+    this->fy_[dev].resize(atom_capacity);
+    this->fz_[dev].resize(atom_capacity);
+    this->en_[dev].resize(atom_capacity);
+
+    // Single-GPU retains its existing global cell metadata. Multi-GPU stores
+    // only the owned-plus-halo source metadata; the owned cells are its prefix.
+    if (device_count == 1) {
+      this->cell_atom_point_[dev].resize(cell_capacity);
+      this->cell_atom_count_[dev].resize(cell_capacity);
+    } else {
+      this->sr_source_cell_atom_point_[dev].resize(sr_source_cell_capacity);
+      this->sr_source_cell_atom_count_[dev].resize(sr_source_cell_capacity);
+    }
+
     this->max_atoms_cell_[dev] = 0;
 
     this->sf_re_[dev].resize(this->sf_tile_buffer_capacity_[dev]);
@@ -1028,18 +1048,26 @@ void glst_workspace::ensure_atom_capacity(
         growth_quantum;
   }
 
+  const unsigned int device_count =
+      static_cast<unsigned int>(this->atom_capacity_.size());
+
   cudaCheck(cudaSetDevice(dev));
 
-  this->idx_[dev].resize(new_capacity);
+  if (device_count == 1) {
+    this->idx_[dev].resize(new_capacity);
+    this->packets_[dev].resize(new_capacity);
+    this->sorted_packets_[dev].resize(new_capacity);
+    this->atom_cell_idx_[dev].resize(new_capacity);
+    this->atom_cell_sorted_idx_[dev].resize(new_capacity);
+  } else {
+    this->source_packets_[dev].resize(new_capacity);
+  }
+
   this->sorted_idx_[dev].resize(new_capacity);
   this->rx_[dev].resize(new_capacity);
   this->ry_[dev].resize(new_capacity);
   this->rz_[dev].resize(new_capacity);
   this->qc_[dev].resize(new_capacity);
-  this->packets_[dev].resize(new_capacity);
-  this->sorted_packets_[dev].resize(new_capacity);
-  this->atom_cell_idx_[dev].resize(new_capacity);
-  this->atom_cell_sorted_idx_[dev].resize(new_capacity);
 
   this->fx_[dev].resize(new_capacity);
   this->fy_[dev].resize(new_capacity);
@@ -1053,7 +1081,12 @@ void glst_workspace::ensure_atom_capacity(
 
   this->atom_storage_growth_count_[dev]++;
 
-  this->ensure_cub_capacity_for_device(dev, true);
+  // Single-GPU atom growth changes the size of the local radix-sort problem.
+  // Multi-GPU atom growth does not: Its per-rank CUB use is a source-cell scan,
+  // whose capacity is fixed by geometry, while GPU 0's global sort is fixed at
+  // natom.
+  if (device_count == 1)
+    this->ensure_cub_capacity_for_device(dev, true);
 
   return;
 }
@@ -1115,6 +1148,7 @@ void glst_workspace::clear(void) {
   this->qc_.clear();
   this->packets_.clear();
   this->sorted_packets_.clear();
+  this->source_packets_.clear();
   this->atom_cell_idx_.clear();
   this->atom_cell_sorted_idx_.clear();
 
@@ -1128,8 +1162,6 @@ void glst_workspace::clear(void) {
   this->global_cell_atom_point_.clear();
   this->global_x_plane_atom_point_.clear();
   this->global_max_atoms_cell_.clear();
-
-  this->atom_assignment_metadata_.clear();
 
   this->fx_.clear();
   this->fy_.clear();
@@ -1175,27 +1207,24 @@ void glst_workspace::ensure_cub_capacity_for_device(
                    this->cub_work_buffer_size_.size(),
                function_name, "CUB work-buffer-size device index out of range");
 
-  cudaCheck(cudaSetDevice(dev));
-
-  const std::size_t atom_capacity = this->atom_capacity_[dev];
-
   utl::require(
       static_cast<std::size_t>(dev) < this->sr_source_cell_capacity_.size(),
       function_name, "Short-range source-cell device index out of range");
 
+  cudaCheck(cudaSetDevice(dev));
+
+  const std::size_t atom_capacity = this->atom_capacity_[dev];
   const std::size_t source_cell_capacity = this->sr_source_cell_capacity_[dev];
 
-  const bool has_global_classification_scratch =
-      ((dev == 0) && (!this->global_sort_key_in_.empty()));
-
-  if ((atom_capacity == 0) && (source_cell_capacity == 0) &&
-      (!has_global_classification_scratch))
-    return;
+  const unsigned int device_count =
+      static_cast<unsigned int>(this->atom_capacity_.size());
 
   void *tmp = nullptr;
   std::size_t required_size = 0;
 
-  if (atom_capacity > 0) {
+  // A workspace containing exactly one device uses the existing single-GPU
+  // local packet sort and final result-gather sorts.
+  if ((device_count == 1) && (atom_capacity > 0)) {
     utl::require(atom_capacity <=
                      static_cast<std::size_t>(std::numeric_limits<int>::max()),
                  function_name, "Atom capacity exceeds CUB int range");
@@ -1203,37 +1232,36 @@ void glst_workspace::ensure_cub_capacity_for_device(
     const int num_items = static_cast<int>(atom_capacity);
 
     // Determine storage requirements for CUB functions
-    std::size_t index_sort_size = 0;
     std::size_t value_sort_size = 0;
     std::size_t packet_sort_size = 0;
 
-    cub::DeviceRadixSort::SortPairs(
-        tmp, index_sort_size, this->atom_cell_idx_[dev].d_array().data(),
-        this->atom_cell_sorted_idx_[dev].d_array().data(),
-        this->idx_[dev].d_array().data(),
-        this->sorted_idx_[dev].d_array().data(), num_items);
+    // get_ef():
+    //    original-index keys + double values.
+    //
+    // fx_ and fy_ provide valid input/output pointers with the same double type
+    // as each of the four actual result sorts.
+    cudaCheck(cub::DeviceRadixSort::SortPairs(
+        tmp, value_sort_size, this->sorted_idx_[dev].d_array().data(),
+        this->idx_[dev].d_array().data(), this->fx_[dev].d_array().data(),
+        this->fy_[dev].d_array().data(), num_items));
 
-    cub::DeviceRadixSort::SortPairs(
-        tmp, value_sort_size, this->atom_cell_idx_[dev].d_array().data(),
-        this->atom_cell_sorted_idx_[dev].d_array().data(),
-        this->fx_[dev].d_array().data(), this->fy_[dev].d_array().data(),
-        num_items);
-
-    cub::DeviceRadixSort::SortPairs(
+    // assign_atoms_single_gpu():
+    //    cell index keys + atom_packet values.
+    cudaCheck(cub::DeviceRadixSort::SortPairs(
         tmp, packet_sort_size, this->atom_cell_idx_[dev].d_array().data(),
         this->atom_cell_sorted_idx_[dev].d_array().data(),
         this->packets_[dev].d_array().data(),
-        this->sorted_packets_[dev].d_array().data(), num_items);
+        this->sorted_packets_[dev].d_array().data(), num_items, 0,
+        static_cast<int>(8 * sizeof(unsigned int))));
 
-    required_size = index_sort_size;
-
-    if (value_sort_size > required_size)
-      required_size = value_sort_size;
+    required_size = value_sort_size;
 
     if (packet_sort_size > required_size)
       required_size = packet_sort_size;
   }
 
+  // Multi-GPU ranks rebuild owned-plus-halo source-cell points by scanning the
+  // communicated source-cell counts. In single-GPU mode this capacity is zero.
   if (source_cell_capacity > 0) {
     utl::require(source_cell_capacity <=
                      static_cast<std::size_t>(std::numeric_limits<int>::max()),
@@ -1244,15 +1272,16 @@ void glst_workspace::ensure_cub_capacity_for_device(
 
     cudaCheck(cub::DeviceScan::ExclusiveSum(
         tmp, source_cell_scan_size,
-        this->sr_source_cell_atom_count_[dev].d_array().data(),
-        this->sr_source_cell_atom_point_[dev].d_array().data(),
+        this->sr_source_cell_atom_count_[dev].data(),
+        this->sr_source_cell_atom_point_[dev].data(),
         static_cast<int>(source_cell_capacity)));
 
     if (source_cell_scan_size > required_size)
       required_size = source_cell_scan_size;
   }
 
-  if (has_global_classification_scratch) {
+  // Global multi-GPU classification storage exists only on GPU 0.
+  if ((dev == 0) && (!this->global_sort_key_in_.empty())) {
     const std::size_t global_atom_count = this->global_sort_key_in_.size();
     const std::size_t global_cell_count = this->global_cell_atom_count_.size();
 
@@ -1309,6 +1338,8 @@ void glst_workspace::ensure_cub_capacity_for_device(
         tmp, global_scan_size, this->global_cell_atom_count_.data(),
         this->global_cell_atom_point_.data(), global_cell_items));
 
+    // Query for the complete global cell count. The runtime reductions operate
+    // on partition subranges no larger than this.
     cudaCheck(cub::DeviceReduce::Max(
         tmp, global_reduce_size, this->global_cell_atom_count_.data(),
         this->global_max_atoms_cell_.data(), global_cell_items));
@@ -1323,6 +1354,11 @@ void glst_workspace::ensure_cub_capacity_for_device(
       required_size = global_reduce_size;
   }
 
+  // A multi-GPU rank can legitimately require no CUB storage when it owns no
+  // source cells and is not GPU 0.
+  if (required_size == 0)
+    return;
+
   if ((this->cub_work_buffer_[dev] != nullptr) &&
       (required_size <= this->cub_work_buffer_size_[dev])) {
     return;
@@ -1336,11 +1372,9 @@ void glst_workspace::ensure_cub_capacity_for_device(
     this->cub_work_buffer_[dev] = nullptr;
     this->cub_work_buffer_size_[dev] = 0;
   }
+  cudaCheck(cudaMalloc(&(this->cub_work_buffer_[dev]), required_size));
 
-  if (required_size > 0) {
-    cudaCheck(cudaMalloc(&(this->cub_work_buffer_[dev]), required_size));
-    this->cub_work_buffer_size_[dev] = required_size;
-  }
+  this->cub_work_buffer_size_[dev] = required_size;
 
   if (count_growth_event)
     this->cub_work_buffer_growth_count_[dev]++;

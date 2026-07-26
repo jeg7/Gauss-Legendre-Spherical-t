@@ -94,11 +94,6 @@ constexpr double box_dim_y = static_cast<double>(test_ncell_y) * rcut;
 constexpr double box_dim_z = static_cast<double>(test_ncell_z) * rcut;
 constexpr double tol = 1.0e-6;
 
-constexpr std::size_t source_atom_count_metadata_index = 0u;
-constexpr std::size_t owned_atom_count_metadata_index = 1u;
-constexpr std::size_t max_atoms_cell_metadata_index = 2u;
-constexpr std::size_t atom_assignment_metadata_count = 3u;
-
 struct atom_site {
   unsigned int x;
   unsigned int y;
@@ -147,7 +142,6 @@ struct partition_snapshot {
   std::size_t source_atom_count = 0;
   unsigned int max_atoms_cell = 0u;
 
-  std::vector<unsigned int> assignment_metadata;
   std::vector<unsigned int> source_cell_atom_count;
   std::vector<unsigned int> source_cell_atom_point;
   std::vector<unsigned int> owned_cell_atom_count;
@@ -167,17 +161,14 @@ struct device_storage_snapshot {
   std::size_t cub_growth_count = 0;
   std::size_t cub_size = 0;
 
-  const void *sorted_packet = nullptr;
+  const void *source_packet = nullptr;
   const void *sorted_idx = nullptr;
   const void *rx = nullptr;
   const void *ry = nullptr;
   const void *rz = nullptr;
   const void *qc = nullptr;
-  const void *cell_atom_count = nullptr;
-  const void *cell_atom_point = nullptr;
   const void *source_cell_atom_count = nullptr;
   const void *source_cell_atom_point = nullptr;
-  const void *assignment_metadata = nullptr;
   const void *cub = nullptr;
 };
 
@@ -521,13 +512,8 @@ partition_snapshot read_partition_snapshot(const glst_force &force,
   require(source_cell_count == workspace.sr_source_cell_capacity(dev),
           "Observed source-cell count does not match workspace capacity");
 
-  require(static_cast<std::size_t>(dev) <
-              workspace.atom_assignment_metadata().size(),
-          "Assignment-metadata device index is out of range");
-
-  require(workspace.atom_assignment_metadata()[dev].size() ==
-              atom_assignment_metadata_count,
-          "Assignment-metadata capacity is incorrect");
+  require(local_cell_count <= source_cell_count,
+          "Owned-cell count exceeds source-cell count");
 
   snapshot.owned_atom_count = workspace.owned_atom_count(dev);
   snapshot.source_atom_count = workspace.source_atom_count(dev);
@@ -539,10 +525,9 @@ partition_snapshot read_partition_snapshot(const glst_force &force,
   require(snapshot.source_atom_count <= workspace.atom_capacity(dev),
           "Observed source atom count exceeds workspace capacity");
 
-  snapshot.assignment_metadata.resize(atom_assignment_metadata_count);
-
   snapshot.source_cell_atom_count.resize(source_cell_count);
   snapshot.source_cell_atom_point.resize(source_cell_count);
+
   snapshot.owned_cell_atom_count.resize(local_cell_count);
   snapshot.owned_cell_atom_point.resize(local_cell_count);
 
@@ -555,13 +540,6 @@ partition_snapshot read_partition_snapshot(const glst_force &force,
 
   cudaCheck(cudaSetDevice(dev));
 
-  cudaCheck(cudaMemcpy(
-      static_cast<void *>(snapshot.assignment_metadata.data()),
-      static_cast<const void *>(
-          workspace.atom_assignment_metadata()[dev].d_array().data()),
-      atom_assignment_metadata_count * sizeof(unsigned int),
-      cudaMemcpyDeviceToHost));
-
   if (snapshot.source_atom_count > 0u) {
     const std::size_t packet_bytes =
         snapshot.source_atom_count * sizeof(atom_packet);
@@ -571,10 +549,10 @@ partition_snapshot read_partition_snapshot(const glst_force &force,
 
     const std::size_t value_bytes = snapshot.source_atom_count * sizeof(double);
 
-    cudaCheck(cudaMemcpy(static_cast<void *>(snapshot.packet.data()),
-                         static_cast<const void *>(
-                             workspace.sorted_packets()[dev].d_array().data()),
-                         packet_bytes, cudaMemcpyDeviceToHost));
+    cudaCheck(cudaMemcpy(
+        static_cast<void *>(snapshot.packet.data()),
+        static_cast<const void *>(workspace.source_packets()[dev].data()),
+        packet_bytes, cudaMemcpyDeviceToHost));
 
     cudaCheck(cudaMemcpy(
         static_cast<void *>(snapshot.sorted_idx.data()),
@@ -606,35 +584,30 @@ partition_snapshot read_partition_snapshot(const glst_force &force,
     const std::size_t source_cell_bytes =
         source_cell_count * sizeof(unsigned int);
 
-    cudaCheck(cudaMemcpy(
-        static_cast<void *>(snapshot.source_cell_atom_count.data()),
-        static_cast<const void *>(
-            workspace.sr_source_cell_atom_count()[dev].d_array().data()),
-        source_cell_bytes, cudaMemcpyDeviceToHost));
-
-    cudaCheck(cudaMemcpy(
-        static_cast<void *>(snapshot.source_cell_atom_point.data()),
-        static_cast<const void *>(
-            workspace.sr_source_cell_atom_point()[dev].d_array().data()),
-        source_cell_bytes, cudaMemcpyDeviceToHost));
-  }
-
-  if (local_cell_count > 0u) {
-    const std::size_t local_cell_bytes =
-        local_cell_count * sizeof(unsigned int);
+    cudaCheck(
+        cudaMemcpy(static_cast<void *>(snapshot.source_cell_atom_count.data()),
+                   static_cast<const void *>(
+                       workspace.sr_source_cell_atom_count()[dev].data()),
+                   source_cell_bytes, cudaMemcpyDeviceToHost));
 
     cudaCheck(
-        cudaMemcpy(static_cast<void *>(snapshot.owned_cell_atom_count.data()),
+        cudaMemcpy(static_cast<void *>(snapshot.source_cell_atom_point.data()),
                    static_cast<const void *>(
-                       workspace.cell_atom_count()[dev].d_array().data()),
-                   local_cell_bytes, cudaMemcpyDeviceToHost));
-
-    cudaCheck(
-        cudaMemcpy(static_cast<void *>(snapshot.owned_cell_atom_point.data()),
-                   static_cast<const void *>(
-                       workspace.cell_atom_point()[dev].d_array().data()),
-                   local_cell_bytes, cudaMemcpyDeviceToHost));
+                       workspace.sr_source_cell_atom_point()[dev].data()),
+                   source_cell_bytes, cudaMemcpyDeviceToHost));
   }
+
+  // Multi-GPU source-cell order is:
+  //
+  //   owned cells, left-halo cells, right-halo cells
+  //
+  // Therefore, the owned metadata is exactly the first
+  // local_cell_count entries of the source metadata.
+  std::copy_n(snapshot.source_cell_atom_count.begin(), local_cell_count,
+              snapshot.owned_cell_atom_count.begin());
+
+  std::copy_n(snapshot.source_cell_atom_point.begin(), local_cell_count,
+              snapshot.owned_cell_atom_point.begin());
 
   return snapshot;
 }
@@ -660,21 +633,6 @@ void compare_partition_snapshot(const partition_reference &expected,
       expected.owned_atom_count <=
           static_cast<std::size_t>(std::numeric_limits<unsigned int>::max()),
       label + ": expected owned atom count exceeds unsigned int range");
-
-  require(observed.assignment_metadata.size() == atom_assignment_metadata_count,
-          label + ": assignment metadata count differs");
-
-  require(observed.assignment_metadata[source_atom_count_metadata_index] ==
-              static_cast<unsigned int>(expected.source_atom_count),
-          label + ": device source atom count differs");
-
-  require(observed.assignment_metadata[owned_atom_count_metadata_index] ==
-              static_cast<unsigned int>(expected.owned_atom_count),
-          label + ": device owned atom count differs");
-
-  require(observed.assignment_metadata[max_atoms_cell_metadata_index] ==
-              expected.max_atoms_cell,
-          label + ": locally reduced maximum cell population differs");
 
   require(observed.source_cell_atom_count == expected.source_cell_atom_count,
           label + ": source cell atom counts differ");
@@ -847,9 +805,6 @@ void compare_tile_rank_snapshots(
     require(rank.max_atoms_cell == root.max_atoms_cell,
             prefix + ": max_atoms_cell differs");
 
-    require(rank.assignment_metadata.size() == root.assignment_metadata.size(),
-            prefix + ": assignment metadata sizes differ");
-
     require(rank.source_cell_atom_count.size() ==
                 root.source_cell_atom_count.size(),
             prefix + ": source cell-count sizes differ");
@@ -879,12 +834,6 @@ void compare_tile_rank_snapshots(
     require(rank.rz.size() == root.rz.size(), prefix + ": rz sizes differ");
 
     require(rank.qc.size() == root.qc.size(), prefix + ": qc sizes differ");
-
-    require(
-        raw_bytes_equal(root.assignment_metadata.data(),
-                        rank.assignment_metadata.data(),
-                        root.assignment_metadata.size() * sizeof(unsigned int)),
-        prefix + ": assignment metadata is not byte-identical");
 
     require(raw_bytes_equal(root.source_cell_atom_count.data(),
                             rank.source_cell_atom_count.data(),
@@ -999,9 +948,17 @@ storage_snapshot take_storage_snapshot(const glst_workspace &workspace,
               static_cast<std::size_t>(cuda_count),
           "CUB work-buffer-size count does not match device count");
 
-  require(workspace.atom_assignment_metadata().size() ==
+  require(workspace.source_packets().size() ==
               static_cast<std::size_t>(cuda_count),
-          "Assignment-metadata device count does not match device count");
+          "Source-packet device count does not match device count");
+
+  require(workspace.sr_source_cell_atom_count().size() ==
+              static_cast<std::size_t>(cuda_count),
+          "Source cell-count device count does not match device count");
+
+  require(workspace.sr_source_cell_atom_point().size() ==
+              static_cast<std::size_t>(cuda_count),
+          "Source cell-point device count does not match device count");
 
   for (int dev = 0; dev < cuda_count; dev++) {
     device_storage_snapshot &device = snapshot.device[dev];
@@ -1011,81 +968,100 @@ storage_snapshot take_storage_snapshot(const glst_workspace &workspace,
     device.cub_growth_count = workspace.cub_work_buffer_growth_count(dev);
     device.cub_size = workspace.cub_work_buffer_size()[dev];
 
-    device.sorted_packet = static_cast<const void *>(
-        workspace.sorted_packets()[dev].d_array().data());
+    device.source_packet =
+        static_cast<const void *>(workspace.source_packets()[dev].data());
+
     device.sorted_idx =
         static_cast<const void *>(workspace.sorted_idx()[dev].d_array().data());
+
     device.rx = static_cast<const void *>(workspace.rx()[dev].d_array().data());
+
     device.ry = static_cast<const void *>(workspace.ry()[dev].d_array().data());
+
     device.rz = static_cast<const void *>(workspace.rz()[dev].d_array().data());
+
     device.qc = static_cast<const void *>(workspace.qc()[dev].d_array().data());
 
-    device.cell_atom_count = static_cast<const void *>(
-        workspace.cell_atom_count()[dev].d_array().data());
-    device.cell_atom_point = static_cast<const void *>(
-        workspace.cell_atom_point()[dev].d_array().data());
     device.source_cell_atom_count = static_cast<const void *>(
-        workspace.sr_source_cell_atom_count()[dev].d_array().data());
-    device.source_cell_atom_point = static_cast<const void *>(
-        workspace.sr_source_cell_atom_point()[dev].d_array().data());
+        workspace.sr_source_cell_atom_count()[dev].data());
 
-    device.assignment_metadata = static_cast<const void *>(
-        workspace.atom_assignment_metadata()[dev].d_array().data());
+    device.source_cell_atom_point = static_cast<const void *>(
+        workspace.sr_source_cell_atom_point()[dev].data());
 
     device.cub = workspace.cub_work_buffer()[dev];
 
-    require(device.sorted_packet != nullptr,
-            "Sorted-packet storage pointer is null");
-    require(device.sorted_idx != nullptr,
-            "Sorted-index storage pointer is null");
-    require(device.rx != nullptr, "rx storage pointer is null");
-    require(device.ry != nullptr, "ry storage pointer is null");
-    require(device.rz != nullptr, "rz storage pointer is null");
-    require(device.qc != nullptr, "qc storage pointer is null");
-    require(device.cell_atom_count != nullptr,
-            "Owned cell-count pointer is null");
-    require(device.cell_atom_point != nullptr,
-            "Owned cell-point pointer is null");
-    require(device.source_cell_atom_count != nullptr,
-            "Source cell-count pointer is null");
-    require(device.source_cell_atom_point != nullptr,
-            "Source cell-point pointer is null");
-    require(device.assignment_metadata != nullptr,
-            "Assignment metadata pointer is null");
-    require(device.cub != nullptr, "CUB work-buffer pointer is null");
+    if (device.atom_capacity > 0u) {
+      require(device.source_packet != nullptr,
+              "Source-packet storage pointer is null");
+
+      require(device.sorted_idx != nullptr,
+              "Sorted-index storage pointer is null");
+
+      require(device.rx != nullptr, "rx storage pointer is null");
+      require(device.ry != nullptr, "ry storage pointer is null");
+      require(device.rz != nullptr, "rz storage pointer is null");
+      require(device.qc != nullptr, "qc storage pointer is null");
+    }
+
+    if (workspace.sr_source_cell_capacity(dev) > 0u) {
+      require(device.source_cell_atom_count != nullptr,
+              "Source cell-count pointer is null");
+
+      require(device.source_cell_atom_point != nullptr,
+              "Source cell-point pointer is null");
+    }
+
+    // GPU 0 owns global classification CUB work. Every other rank in this
+    // test owns source cells and therefore requires source-cell scan work.
+    if ((dev == 0) || (workspace.sr_source_cell_capacity(dev) > 0u))
+      require(device.cub != nullptr, "CUB work-buffer pointer is null");
   }
 
   snapshot.global_sort_key_in =
       static_cast<const void *>(workspace.global_sort_key_in().data());
+
   snapshot.global_sort_key_out =
       static_cast<const void *>(workspace.global_sort_key_out().data());
+
   snapshot.global_packet_in =
       static_cast<const void *>(workspace.global_packet_in().data());
+
   snapshot.global_packet_out =
       static_cast<const void *>(workspace.global_packet_out().data());
+
   snapshot.global_cell_atom_count =
       static_cast<const void *>(workspace.global_cell_atom_count().data());
+
   snapshot.global_cell_atom_point =
       static_cast<const void *>(workspace.global_cell_atom_point().data());
+
   snapshot.global_x_plane_atom_point =
       static_cast<const void *>(workspace.global_x_plane_atom_point().data());
+
   snapshot.global_max_atoms_cell =
       static_cast<const void *>(workspace.global_max_atoms_cell().data());
 
   require(snapshot.global_sort_key_in != nullptr,
           "Global input-key pointer is null");
+
   require(snapshot.global_sort_key_out != nullptr,
           "Global output-key pointer is null");
+
   require(snapshot.global_packet_in != nullptr,
           "Global input-packet pointer is null");
+
   require(snapshot.global_packet_out != nullptr,
           "Global output-packet pointer is null");
+
   require(snapshot.global_cell_atom_count != nullptr,
           "Global cell-count pointer is null");
+
   require(snapshot.global_cell_atom_point != nullptr,
           "Global cell-point pointer is null");
+
   require(snapshot.global_x_plane_atom_point != nullptr,
           "Global x-plane-point pointer is null");
+
   require(snapshot.global_max_atoms_cell != nullptr,
           "Global max-atoms pointer is null");
 
@@ -1113,24 +1089,23 @@ void compare_storage_snapshot(const storage_snapshot &expected,
     require(rhs.cub_size == lhs.cub_size,
             prefix + "CUB work-buffer size changed");
 
-    require(rhs.sorted_packet == lhs.sorted_packet,
-            prefix + "sorted-packet pointer changed");
+    require(rhs.source_packet == lhs.source_packet,
+            prefix + "source-packet pointer changed");
+
     require(rhs.sorted_idx == lhs.sorted_idx,
             prefix + "sorted-index pointer changed");
+
     require(rhs.rx == lhs.rx, prefix + "rx pointer changed");
     require(rhs.ry == lhs.ry, prefix + "ry pointer changed");
     require(rhs.rz == lhs.rz, prefix + "rz pointer changed");
     require(rhs.qc == lhs.qc, prefix + "qc pointer changed");
-    require(rhs.cell_atom_count == lhs.cell_atom_count,
-            prefix + "owned cell-count pointer changed");
-    require(rhs.cell_atom_point == lhs.cell_atom_point,
-            prefix + "owned cell-point pointer changed");
+
     require(rhs.source_cell_atom_count == lhs.source_cell_atom_count,
             prefix + "source cell-count pointer changed");
+
     require(rhs.source_cell_atom_point == lhs.source_cell_atom_point,
             prefix + "source cell-point pointer changed");
-    require(rhs.assignment_metadata == lhs.assignment_metadata,
-            prefix + "assignment metadata pointer changed");
+
     require(rhs.cub == lhs.cub, prefix + "CUB work-buffer pointer changed");
   }
 

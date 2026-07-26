@@ -82,6 +82,7 @@ public:
   const std::vector<cuda_container<double>> &qc(void) const;
   const std::vector<cuda_container<atom_packet>> &packets(void) const;
   const std::vector<cuda_container<atom_packet>> &sorted_packets(void) const;
+  const std::vector<device_vector<atom_packet>> &source_packets(void) const;
   const std::vector<cuda_container<unsigned int>> &atom_cell_idx(void) const;
   const std::vector<cuda_container<unsigned int>> &
   atom_cell_sorted_idx(void) const;
@@ -97,9 +98,6 @@ public:
   const device_vector<unsigned int> &global_x_plane_atom_point(void) const;
   const device_vector<unsigned int> &global_max_atoms_cell(void) const;
 
-  const std::vector<cuda_container<unsigned int>> &
-  atom_assignment_metadata(void) const;
-
   const std::vector<cuda_container<double>> &fx(void) const;
   const std::vector<cuda_container<double>> &fy(void) const;
   const std::vector<cuda_container<double>> &fz(void) const;
@@ -108,9 +106,9 @@ public:
   const std::vector<cuda_container<unsigned int>> &cell_atom_point(void) const;
   const std::vector<cuda_container<unsigned int>> &cell_atom_count(void) const;
   const std::vector<unsigned int> &max_atoms_cell(void) const;
-  const std::vector<cuda_container<unsigned int>> &
+  const std::vector<device_vector<unsigned int>> &
   sr_source_cell_atom_point(void) const;
-  const std::vector<cuda_container<unsigned int>> &
+  const std::vector<device_vector<unsigned int>> &
   sr_source_cell_atom_count(void) const;
 
   const std::vector<cuda_container<double>> &sf_re(void) const;
@@ -141,6 +139,7 @@ public:
   std::vector<cuda_container<double>> &qc(void);
   std::vector<cuda_container<atom_packet>> &packets(void);
   std::vector<cuda_container<atom_packet>> &sorted_packets(void);
+  std::vector<device_vector<atom_packet>> &source_packets(void);
   std::vector<cuda_container<unsigned int>> &atom_cell_idx(void);
   std::vector<cuda_container<unsigned int>> &atom_cell_sorted_idx(void);
 
@@ -155,8 +154,6 @@ public:
   device_vector<unsigned int> &global_x_plane_atom_point(void);
   device_vector<unsigned int> &global_max_atoms_cell(void);
 
-  std::vector<cuda_container<unsigned int>> &atom_assignment_metadata(void);
-
   std::vector<cuda_container<double>> &fx(void);
   std::vector<cuda_container<double>> &fy(void);
   std::vector<cuda_container<double>> &fz(void);
@@ -165,8 +162,8 @@ public:
   std::vector<cuda_container<unsigned int>> &cell_atom_point(void);
   std::vector<cuda_container<unsigned int>> &cell_atom_count(void);
   std::vector<unsigned int> &max_atoms_cell(void);
-  std::vector<cuda_container<unsigned int>> &sr_source_cell_atom_point(void);
-  std::vector<cuda_container<unsigned int>> &sr_source_cell_atom_count(void);
+  std::vector<device_vector<unsigned int>> &sr_source_cell_atom_point(void);
+  std::vector<device_vector<unsigned int>> &sr_source_cell_atom_count(void);
 
   std::vector<cuda_container<double>> &sf_re(void);
   std::vector<cuda_container<double>> &sf_im(void);
@@ -229,11 +226,7 @@ private:
 
   std::vector<atom_partition_range> partition_atom_range_;
 
-  // Atom arrays are allocated to atom_capacity_.
-  //
-  // Source-array entries [0, source_atom_count_) are active. The owned target
-  // atoms occupy [0, owned_atom_count_), followed by short-range halo sources.
-  // Force/energy arrays are writable only in [0, owned_atom_count_).
+  // Single-GPU atom-sort storage. Entries remain empty in multi-GPU modes.
   std::vector<cuda_container<unsigned int>> idx_;
   std::vector<cuda_container<unsigned int>> sorted_idx_;
   std::vector<cuda_container<double>> rx_;
@@ -244,6 +237,10 @@ private:
   std::vector<cuda_container<atom_packet>> sorted_packets_;
   std::vector<cuda_container<unsigned int>> atom_cell_idx_;
   std::vector<cuda_container<unsigned int>> atom_cell_sorted_idx_;
+
+  // Multi-GPU packed source representation. Entries remain empty in single-GPU
+  // mode. This has no unnecessary host mirror.
+  std::vector<device_vector<atom_packet>> source_packets_;
 
   // Global atom-classification scratch. These singular device_vector objects
   // are allocated only on CUDA device 0 when device_count > 1.
@@ -261,22 +258,21 @@ private:
   // allocated only on GPU 0 with the other global classification buffers.
   device_vector<unsigned int> global_max_atoms_cell_;
 
-  // Per-rank assignment metadata:
-  // [source_atom_count, owned_atom_count, max_atoms_cell].
-  std::vector<cuda_container<unsigned int>> atom_assignment_metadata_;
-
   std::vector<cuda_container<double>> fx_;
   std::vector<cuda_container<double>> fy_;
   std::vector<cuda_container<double>> fz_;
   std::vector<cuda_container<double>> en_;
 
-  // Local cell arrays: Size cell_capacity_.
-  // In multi-GPU x-slab mode, these are indexed by local cell id.
+  // Single-GPU cell metadata. Multi-GPU kernels use the owned prefix of the
+  // short-range source metadata instead.
   std::vector<cuda_container<unsigned int>> cell_atom_point_;
   std::vector<cuda_container<unsigned int>> cell_atom_count_;
   std::vector<unsigned int> max_atoms_cell_;
-  std::vector<cuda_container<unsigned int>> sr_source_cell_atom_point_;
-  std::vector<cuda_container<unsigned int>> sr_source_cell_atom_count_;
+
+  // Multi-GPU owned-plus-halo source metadata. Source-cell order is
+  // [owned][left halo][right halo].
+  std::vector<device_vector<unsigned int>> sr_source_cell_atom_point_;
+  std::vector<device_vector<unsigned int>> sr_source_cell_atom_count_;
 
   // Tile-sized GLST buffers.
   //
