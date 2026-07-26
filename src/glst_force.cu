@@ -5476,9 +5476,11 @@ void glst_force::select_automatic_gpu_layout(
   // even when the allocation would technically fit.
   constexpr std::size_t target_atoms_per_cell_partition = 4 * 1024 * 1024;
 
-  // Avoid creating tile ranks with too little work when a more spatial layout
-  // can use the same devices.
-  constexpr unsigned int minimum_tiles_per_tile_partition = 2;
+  // Require four max-sized tiles' worth of actual cubature-node work on every
+  // tile partition before preferring tile decomposition. Tile count alone is
+  // insufficient because tiles cannot cross alpha-group boundaries and may be
+  // only partially filled.
+  const unsigned int minimum_tile_node_factor = 4;
 
   utl::require(device_count >= 1, function_name,
                "device_count must be positive");
@@ -5500,6 +5502,7 @@ void glst_force::select_automatic_gpu_layout(
   struct layout_candidate {
     unsigned int cell_partitions = 1;
     unsigned int tile_partitions = 1;
+    std::size_t minimum_tile_partition_node_count = 0;
     std::size_t estimated_peak_bytes = 0;
     bool fits_memory_budget = false;
   };
@@ -5514,6 +5517,9 @@ void glst_force::select_automatic_gpu_layout(
 
   const std::size_t max_tile_nodes =
       static_cast<std::size_t>(plan.max_tile_nodes());
+
+  const std::size_t minimum_tile_nodes_per_tile_partition =
+      minimum_tile_node_factor * max_tile_nodes;
 
   std::vector<layout_candidate> candidates;
 
@@ -5530,6 +5536,19 @@ void glst_force::select_automatic_gpu_layout(
 
     const unsigned int candidate_tile_partitions =
         static_cast<unsigned int>(device_count) / candidate_cell_partitions;
+
+    std::vector<std::size_t> tile_partition_node_count(
+        candidate_tile_partitions, 0);
+
+    for (unsigned int tile = 0; tile < plan.tile_count(); tile++) {
+      const unsigned int tile_partition = tile % candidate_tile_partitions;
+
+      tile_partition_node_count[tile_partition] +=
+          static_cast<std::size_t>(plan.tile_node_count(tile));
+    }
+
+    const std::size_t minimum_tile_partition_node_count = *std::min_element(
+        tile_partition_node_count.begin(), tile_partition_node_count.end());
 
     const std::size_t min_local_x_count =
         ncell_x / static_cast<std::size_t>(candidate_cell_partitions);
@@ -5696,6 +5715,8 @@ void glst_force::select_automatic_gpu_layout(
     layout_candidate candidate;
     candidate.cell_partitions = candidate_cell_partitions;
     candidate.tile_partitions = candidate_tile_partitions;
+    candidate.minimum_tile_partition_node_count =
+        minimum_tile_partition_node_count;
 
     if (peak_required_bytes >=
         static_cast<double>(std::numeric_limits<std::size_t>::max())) {
@@ -5771,8 +5792,9 @@ void glst_force::select_automatic_gpu_layout(
 
   const layout_candidate *selected = nullptr;
 
-  // First preference: Satisfy memory/atom requirements while leaving at least
-  // two tiles for each tile partition.
+  // First preference: Satisfy memory/atom requirements while leaving enough
+  // actual cubature-node work on every tile partition. Candidates are ordered
+  // by increasing G_cell, so this chooses the largest useful G_tile.
   for (std::size_t i = 0; i < candidates.size(); i++) {
     const layout_candidate &candidate = candidates[i];
 
@@ -5781,44 +5803,27 @@ void glst_force::select_automatic_gpu_layout(
       continue;
     }
 
-    const std::size_t required_tile_count =
-        static_cast<std::size_t>(minimum_tiles_per_tile_partition) *
-        static_cast<std::size_t>(candidate.tile_partitions);
-
-    if (static_cast<std::size_t>(plan.tile_count()) >= required_tile_count) {
+    if (candidate.minimum_tile_partition_node_count >=
+        minimum_tile_nodes_per_tile_partition) {
       selected = &candidate;
       break;
     }
   }
 
-  // Second preference: At least one tile per tile rank.
+  // Second preference: If no candidate has enough cubature-node work on every
+  // tile partition, maximize spatial decomposition. This avoids tile-reduction
+  // overhead when the long-range cubature is too small to benefit from G_tile.
   if (selected == nullptr) {
-    for (std::size_t i = 0; i < candidates.size(); i++) {
-      const layout_candidate &candidate = candidates[i];
+    for (std::size_t i = candidates.size(); i > 0; i--) {
+      const layout_candidate &candidate = candidates[i - 1];
 
       if ((!candidate.fits_memory_budget) ||
           (candidate.cell_partitions < minimum_cell_partitions)) {
         continue;
       }
 
-      if (plan.tile_count() >= candidate.tile_partitions) {
-        selected = &candidate;
-        break;
-      }
-    }
-  }
-
-  // Third preference: Satisfy memory and atom requirements even when the tile
-  // schedule is too small to fully occupy all tile ranks.
-  if (selected == nullptr) {
-    for (std::size_t i = 0; i < candidates.size(); i++) {
-      const layout_candidate &candidate = candidates[i];
-
-      if ((candidate.fits_memory_budget) &&
-          (candidate.cell_partitions >= minimum_cell_partitions)) {
-        selected = &candidate;
-        break;
-      }
+      selected = &candidate;
+      break;
     }
   }
 
@@ -5845,7 +5850,11 @@ void glst_force::select_automatic_gpu_layout(
            std::to_string(cell_partition_count) + " x " +
            std::to_string(tile_partition_count) + " for " +
            std::to_string(plan.tile_count()) + " tiles and " +
-           std::to_string(plan.tot_num_nodes()) + " cubature nodes";
+           std::to_string(plan.tot_num_nodes()) +
+           " cubature nodes; minimum tile-partition work is " +
+           std::to_string(selected->minimum_tile_partition_node_count) +
+           " nodes with a target of " +
+           std::to_string(minimum_tile_nodes_per_tile_partition);
 
   return;
 }
